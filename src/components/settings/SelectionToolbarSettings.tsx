@@ -1348,15 +1348,20 @@ export function SelectionToolbarSettings() {
           />
         </div>
         <Divider style={{ margin: 0 }} />
-        <div style={{ padding: '12px 0 4px' }}>
-          <div>{t('settings.selectionToolbar.resultPinnedByDefault')}</div>
-          <div style={{ color: token.colorTextDescription, fontSize: 12 }}>
-            {t('settings.selectionToolbar.resultPinnedByDefaultHint')}
+        <div style={{ alignItems: 'center', display: 'flex', gap: 12, justifyContent: 'space-between', padding: '12px 0 4px' }}>
+          <div style={{ minWidth: 0 }}>
+            <div>{t('settings.selectionToolbar.resultPinnedByDefault')}</div>
+            <div style={{ color: token.colorTextDescription, fontSize: 12 }}>
+              {t('settings.selectionToolbar.resultPinnedByDefaultHint')}
+            </div>
+            {pinningChoice !== 'custom' && (
+              <div style={{ color: token.colorTextDescription, fontSize: 12, marginTop: 4 }}>
+                {t('settings.selectionToolbar.resultPinningLockedHint')}
+              </div>
+            )}
           </div>
-          <Segmented
-            block
+          <Select<SelectionToolbarResultPinningChoice>
             aria-label={t('settings.selectionToolbar.resultPinnedByDefault')}
-            style={{ marginTop: 10 }}
             options={[
               {
                 value: 'keep',
@@ -1371,17 +1376,10 @@ export function SelectionToolbarSettings() {
                 label: t('settings.selectionToolbar.resultPinningCustom'),
               },
             ]}
+            style={{ flex: '0 0 auto', width: 200 }}
             value={pinningChoice}
-            onChange={(value) => persist(withSelectionToolbarPinningChoice(
-              settings,
-              value as SelectionToolbarResultPinningChoice,
-            ))}
+            onChange={(value) => persist(withSelectionToolbarPinningChoice(settings, value))}
           />
-          {pinningChoice !== 'custom' && (
-            <div style={{ color: token.colorTextDescription, fontSize: 12, marginTop: 8 }}>
-              {t('settings.selectionToolbar.resultPinningLockedHint')}
-            </div>
-          )}
         </div>
       </SettingsGroup>
 

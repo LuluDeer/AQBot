@@ -305,7 +305,10 @@ describe('SelectionToolbarSettings', () => {
     const user = userEvent.setup();
     render(<SelectionToolbarSettings />);
 
-    await user.click(screen.getByText('settings.selectionToolbar.resultPinningKeepAll'));
+    fireEvent.mouseDown(screen.getByRole('combobox', {
+      name: 'settings.selectionToolbar.resultPinnedByDefault',
+    }));
+    await user.click(await screen.findByText('settings.selectionToolbar.resultPinningKeepAll'));
 
     await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledWith({
       selection_toolbar: expect.objectContaining({
@@ -323,7 +326,10 @@ describe('SelectionToolbarSettings', () => {
     const user = userEvent.setup();
     render(<SelectionToolbarSettings />);
 
-    await user.click(screen.getByText('settings.selectionToolbar.resultPinningCustom'));
+    fireEvent.mouseDown(screen.getByRole('combobox', {
+      name: 'settings.selectionToolbar.resultPinnedByDefault',
+    }));
+    await user.click(await screen.findByText('settings.selectionToolbar.resultPinningCustom'));
 
     await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledWith({
       selection_toolbar: expect.objectContaining({
