@@ -504,7 +504,11 @@ fn local_tool_call_id(response_id: Option<&str>, index: usize) -> String {
     }
 }
 
-fn normalize_response_tool_call_id(id: Option<&str>, response_id: Option<&str>, index: usize) -> String {
+fn normalize_response_tool_call_id(
+    id: Option<&str>,
+    response_id: Option<&str>,
+    index: usize,
+) -> String {
     id.map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
@@ -647,7 +651,9 @@ fn convert_messages(
             match msg.role.as_str() {
                 "tool" => OpenAIMessage {
                     role: "tool".to_string(),
-                    content: Some(serde_json::Value::String(extract_text_content(&msg.content))),
+                    content: Some(serde_json::Value::String(extract_text_content(
+                        &msg.content,
+                    ))),
                     reasoning_content: None,
                     tool_calls: None,
                     tool_call_id: msg.tool_call_id.clone(),
@@ -669,12 +675,16 @@ fn convert_messages(
                                             serde_json::Value::String(part.r#type.clone()),
                                         );
                                         if let Some(text) = &part.text {
-                                            value.insert("text".to_string(), serde_json::Value::String(text.clone()));
+                                            value.insert(
+                                                "text".to_string(),
+                                                serde_json::Value::String(text.clone()),
+                                            );
                                         }
                                         if let Some(image_url) = &part.image_url {
                                             value.insert(
                                                 "image_url".to_string(),
-                                                serde_json::to_value(image_url).unwrap_or(serde_json::Value::Null),
+                                                serde_json::to_value(image_url)
+                                                    .unwrap_or(serde_json::Value::Null),
                                             );
                                         }
                                         serde_json::Value::Object(value)
@@ -690,7 +700,7 @@ fn convert_messages(
                         tool_calls: serialized_tool_calls,
                         tool_call_id: None,
                     }
-                },
+                }
                 _ => {
                     let content = match &msg.content {
                         ChatContent::Text(text) => serde_json::Value::String(text.clone()),
@@ -704,12 +714,16 @@ fn convert_messages(
                                         serde_json::Value::String(part.r#type.clone()),
                                     );
                                     if let Some(text) = &part.text {
-                                        value.insert("text".to_string(), serde_json::Value::String(text.clone()));
+                                        value.insert(
+                                            "text".to_string(),
+                                            serde_json::Value::String(text.clone()),
+                                        );
                                     }
                                     if let Some(image_url) = &part.image_url {
                                         value.insert(
                                             "image_url".to_string(),
-                                            serde_json::to_value(image_url).unwrap_or(serde_json::Value::Null),
+                                            serde_json::to_value(image_url)
+                                                .unwrap_or(serde_json::Value::Null),
                                         );
                                     }
                                     serde_json::Value::Object(value)
@@ -745,10 +759,7 @@ fn normalized_max_completion_tokens<P: OpenAICompatPolicy>(
     })
 }
 
-fn merge_model_extra_body(
-    extra: &mut Map<String, Value>,
-    custom: Option<&Map<String, Value>>,
-) {
+fn merge_model_extra_body(extra: &mut Map<String, Value>, custom: Option<&Map<String, Value>>) {
     let Some(custom) = custom else {
         return;
     };
@@ -977,6 +988,7 @@ mod tests {
             provider_id: "provider-1".to_string(),
             base_url: Some(base_url),
             api_path: Some("/v1/chat/completions".to_string()),
+            aws_region: None,
             proxy_config: None,
             custom_headers: None,
         };
@@ -1106,6 +1118,19 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_max_serializes_as_top_level_reasoning_effort_for_chat_completions() {
+        let mut request = base_chat_request("gpt-5.6");
+        request.thinking_level = Some("max".to_string());
+        request.reasoning_profile = Some("openai_reasoning_effort".to_string());
+
+        let body = build_request(&OpenAIPolicy, &request, &request.messages, false);
+        let serialized = serde_json::to_value(body).expect("request json");
+
+        assert_eq!(serialized["reasoning_effort"], json!("max"));
+        assert!(serialized.get("reasoning").is_none());
+    }
+
+    #[test]
     fn openai_policy_ignores_nonofficial_reasoning_profile_body_fields() {
         let mut request = base_chat_request("gpt-4o");
         request.thinking_level = Some("high".to_string());
@@ -1169,7 +1194,10 @@ mod tests {
             serialized["messages"][0]["reasoning_content"],
             json!("hidden thinking")
         );
-        assert_eq!(serialized["messages"][0]["tool_calls"][0]["id"], json!("call-1"));
+        assert_eq!(
+            serialized["messages"][0]["tool_calls"][0]["id"],
+            json!("call-1")
+        );
     }
 
     #[test]
@@ -1195,7 +1223,10 @@ mod tests {
         let body = build_request(&DeepSeekPolicy, &request, &request.messages, true);
         let serialized = serde_json::to_value(body).expect("request json");
 
-        assert_eq!(serialized["messages"][0]["content"], json!("visible answer"));
+        assert_eq!(
+            serialized["messages"][0]["content"],
+            json!("visible answer")
+        );
         assert!(serialized["messages"][0].get("reasoning_content").is_none());
         assert!(serialized["messages"][0].get("tool_calls").is_none());
     }
@@ -1273,9 +1304,11 @@ mod tests {
         .expect("response");
         let message = response.choices[0].message.as_ref().unwrap();
 
-        let tool_calls =
-            normalize_response_tool_calls(message.tool_calls.as_ref().unwrap(), response.id.as_deref())
-                .unwrap();
+        let tool_calls = normalize_response_tool_calls(
+            message.tool_calls.as_ref().unwrap(),
+            response.id.as_deref(),
+        )
+        .unwrap();
 
         assert_eq!(tool_calls[0].id, "call_aqbot_resp-abc_0");
         assert_eq!(tool_calls[0].function.name, "read_file");
@@ -1651,7 +1684,7 @@ where
                                 .message
                                 .as_ref()
                                 .and_then(|message| message.tool_calls.as_ref())
-                    });
+                        });
                     if let Some(tc_deltas) = tool_call_deltas {
                         for tc in tc_deltas {
                             merge_stream_tool_call_delta(&mut pending_tool_calls, tc);
@@ -1826,38 +1859,22 @@ where
             models
                 .into_iter()
                 .map(|m| {
-                    let model_type = ModelType::detect(&m.id);
-                    let mut caps = match model_type {
-                        ModelType::Chat => vec![ModelCapability::TextChat],
-                        ModelType::Embedding => vec![],
-                        ModelType::Image => vec![],
-                        ModelType::Rerank => vec![],
-                        ModelType::Voice => vec![ModelCapability::RealtimeVoice],
-                    };
-                    let id_lower = m.id.to_lowercase();
-                    if id_lower.contains("gpt-4o")
-                        || id_lower.contains("gpt-4-turbo")
-                        || id_lower.contains("claude")
-                        || id_lower.contains("vision")
-                    {
-                        caps.push(ModelCapability::Vision);
-                    }
-                    if id_lower.starts_with("o1")
-                        || id_lower.starts_with("o3")
-                        || id_lower.starts_with("o4")
-                    {
-                        caps.push(ModelCapability::Reasoning);
-                    }
+                    let (model_type, capabilities) =
+                        infer_model_type_and_capabilities(&m.id, &m.id);
                     Model {
                         provider_id: ctx.provider_id.clone(),
                         model_id: m.id.clone(),
                         name: m.id,
                         group_name: None,
                         model_type,
-                        capabilities: caps,
-                        max_tokens: None,
+                        capabilities,
+                        context_window: None,
+                        max_output_tokens: None,
                         enabled: true,
                         param_overrides: None,
+                        image_config: None,
+                        metadata_state: None,
+                        aliases: Vec::new(),
                     }
                 })
                 .collect()

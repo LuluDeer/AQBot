@@ -4,6 +4,7 @@ export { SettingsSelect } from './SettingsSelect';
 export { ProviderSettings } from './ProviderSettings';
 export { ProviderList } from './ProviderList';
 export { GeneralSettings } from './GeneralSettings';
+export { LocalModelsSettings } from './LocalModelsSettings';
 export { DisplaySettings } from './DisplaySettings';
 export { ProxySettings } from './ProxySettings';
 export { ShortcutSettings } from './ShortcutSettings';
@@ -16,3 +17,5 @@ export { default as MemorySettings } from './MemorySettings';
 
 export { default as BackupCenter } from './BackupCenter';
 export { StorageSpaceManager } from './StorageSpaceManager';
+export { SelectionToolbarSettings } from './SelectionToolbarSettings';
+export { AcpAgentSettings } from './AcpAgentSettings';

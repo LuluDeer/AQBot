@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { isTauri } from '@/lib/invoke';
+import { useEffect, useState } from 'react';
+import { invoke, isTauri } from '@/lib/invoke';
 import { useSettingsStore } from '@/stores';
 import {
   SHORTCUT_ACTIONS,
@@ -10,12 +10,21 @@ import {
 } from '@/lib/shortcuts';
 import { executeShortcutAction } from '@/lib/shortcutActions';
 import type { GlobalShortcutDiagnostic, GlobalShortcutStatus } from '@/stores/settingsStore';
+import { getCurrentWindowLabel } from '@/lib/windowKind';
 
 export function useGlobalShortcutManager() {
   const settings = useSettingsStore((s) => s.settings);
+  const settingsReady = useSettingsStore((s) => s.settingsMeta.status === 'ready');
+  const [settingsLoaded, setSettingsLoaded] = useState(settingsReady);
+  const canRegister = settingsReady || settingsLoaded;
   const setGlobalShortcutStatus = useSettingsStore((s) => s.setGlobalShortcutStatus);
 
   useEffect(() => {
+    if (settingsReady) setSettingsLoaded(true);
+  }, [settingsReady]);
+
+  useEffect(() => {
+    if (!canRegister || getCurrentWindowLabel() !== 'main') return;
     const diagnostics: GlobalShortcutDiagnostic[] = [];
     const pushDiagnostic = (
       entry: Omit<GlobalShortcutDiagnostic, 'timestamp'>,
@@ -115,10 +124,59 @@ export function useGlobalShortcutManager() {
         });
         if (cancelled) return;
 
-        for (const action of SHORTCUT_ACTIONS) {
-          if (!isGlobalShortcutAction(action)) continue;
-          const binding = getShortcutBinding(settings, action);
+        const registrations: Array<{
+          action: ShortcutAction | 'selectionToolbar';
+          binding: string;
+          execute: () => Promise<void>;
+        } | {
+          action: 'selectionToolbarScreenshot';
+          binding: string;
+          execute?: never;
+        }> = SHORTCUT_ACTIONS
+          .filter(isGlobalShortcutAction)
+          .map((action) => ({
+            action,
+            binding: getShortcutBinding(settings, action),
+            execute: () => executeShortcutAction(action as ShortcutAction),
+          }));
+        if (
+          settings.selection_toolbar.enabled
+          && settings.selection_toolbar.trigger_mode === 'shortcut'
+        ) {
+          registrations.push({
+            action: 'selectionToolbar',
+            binding: settings.selection_toolbar.trigger_shortcut,
+            execute: () => invoke('selection_toolbar_trigger'),
+          });
+        }
+        if (settings.selection_toolbar.enabled) {
+          registrations.push({
+            action: 'selectionToolbarScreenshot',
+            binding: settings.selection_toolbar.screenshot_shortcut,
+          });
+        }
+
+        for (const registration of registrations) {
+          const { action, binding, execute } = registration;
+          if (!binding.trim()) {
+            pushDiagnostic({
+              phase: 'register',
+              level: 'info',
+              action,
+              message: 'Skipping global shortcut registration (cleared/disabled).',
+            });
+            continue;
+          }
           const accelerator = toTauriAccelerator(binding);
+          if (!accelerator.trim()) {
+            pushDiagnostic({
+              phase: 'register',
+              level: 'info',
+              action,
+              message: 'Skipping global shortcut registration (empty accelerator).',
+            });
+            continue;
+          }
           pushDiagnostic({
             phase: 'register',
             level: 'info',
@@ -127,23 +185,45 @@ export function useGlobalShortcutManager() {
             message: 'Attempting to register global shortcut.',
           });
           try {
-            await register(accelerator, async (event) => {
-              if (event.state !== 'Pressed') return;
-              pushDiagnostic({
-                phase: 'register',
-                level: 'info',
-                action,
-                shortcut: accelerator,
-                message: 'Global shortcut callback fired.',
+            if (action === 'selectionToolbarScreenshot') {
+              await invoke('selection_toolbar_register_screenshot_shortcut', { shortcut: accelerator });
+            } else {
+              await register(accelerator, async (event) => {
+                if (event.state !== 'Pressed') return;
+                pushDiagnostic({
+                  phase: 'register',
+                  level: 'info',
+                  action,
+                  shortcut: accelerator,
+                  message: 'Global shortcut callback fired.',
+                });
+                console.info('[shortcut-global-hit]', {
+                  action,
+                  accelerator,
+                  eventShortcut: event.shortcut,
+                  state: event.state,
+                });
+                try {
+                  await execute();
+                } catch (error) {
+                  const reason = String(error);
+                  pushDiagnostic({
+                    phase: 'trigger',
+                    level: 'warn',
+                    action,
+                    shortcut: accelerator,
+                    reason,
+                    message: 'Global shortcut action failed.',
+                  });
+                  updateStatus({
+                    enabled: true,
+                    registered: [...registered],
+                    failed: [...failed],
+                  });
+                  console.warn(`Global shortcut action failed for ${action} (${accelerator}):`, error);
+                }
               });
-              console.info('[shortcut-global-hit]', {
-                action,
-                accelerator,
-                eventShortcut: event.shortcut,
-                state: event.state,
-              });
-              await executeShortcutAction(action as ShortcutAction);
-            });
+            }
             const verifyRegistered = await isRegistered(accelerator);
             if (!verifyRegistered) {
               const reason = 'register returned without error but isRegistered returned false';
@@ -233,5 +313,5 @@ export function useGlobalShortcutManager() {
           });
       }
     };
-  }, [settings, setGlobalShortcutStatus]);
+  }, [settings, canRegister, setGlobalShortcutStatus]);
 }

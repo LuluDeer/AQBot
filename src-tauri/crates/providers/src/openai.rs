@@ -58,6 +58,8 @@ impl ProviderAdapter for OpenAIAdapter {
     }
 
     async fn list_models(&self, ctx: &ProviderRequestContext) -> Result<Vec<Model>> {
+        // Keep every /models entry. Image-family parameter profiles are resolved
+        // later; they must not decide whether a remote model is visible.
         self.inner.list_models(ctx).await
     }
 

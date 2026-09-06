@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { Message } from '@/types';
 import {
   getMessageVersionGroupKey,
+  getModelVersionGroupKey,
   getLatestVersionsByModel,
   hasMultipleModelVersions,
   applyMultiModelStreamError,
@@ -10,6 +11,7 @@ import {
   mergeAssistantVersionGroup,
   mergeAssistantVersionsAfterSwitch,
   resolvePendingDisplayVersionSelection,
+  plannedVersionIndexForTarget,
   selectDisplayVersionsByModel,
   selectRenderableVersionSet,
   selectNextAssistantVersion,
@@ -52,6 +54,16 @@ describe('chatMultiModel helpers', () => {
     ]);
 
     expect(latest.map((message) => message.id)).toEqual(['error-1', 'error-2', 'model-2']);
+  });
+
+  it('groups identical model ids separately for different providers', () => {
+    const providerA = makeMessage({ id: 'provider-a', provider_id: 'provider-a', model_id: 'shared-model' });
+    const providerB = makeMessage({ id: 'provider-b', provider_id: 'provider-b', model_id: 'shared-model' });
+
+    expect(getModelVersionGroupKey('provider-a', 'shared-model')).toBe('provider-a:shared-model');
+    expect(getMessageVersionGroupKey(providerA)).not.toBe(getMessageVersionGroupKey(providerB));
+    expect(getLatestVersionsByModel([providerA, providerB])).toEqual([providerA, providerB]);
+    expect(hasMultipleModelVersions([providerA, providerB])).toBe(true);
   });
 
   it('keeps the current active answer visible while adding a new model response', () => {
@@ -290,6 +302,30 @@ describe('chatMultiModel helpers', () => {
     expect(selectNextAssistantVersion([fallback, deleted], deleted.id)?.id).toBe('fallback');
   });
 
+  it('prefers another version from the same provider and model after deletion', () => {
+    const sameTarget = makeMessage({
+      id: 'same-target',
+      provider_id: 'provider-a',
+      model_id: 'shared-model',
+      version_index: 0,
+    });
+    const providerCollision = makeMessage({
+      id: 'provider-collision',
+      provider_id: 'provider-b',
+      model_id: 'shared-model',
+      version_index: 9,
+    });
+    const deleted = makeMessage({
+      id: 'deleted',
+      provider_id: 'provider-a',
+      model_id: 'shared-model',
+      version_index: 1,
+    });
+
+    expect(selectNextAssistantVersion([sameTarget, providerCollision, deleted], deleted.id)?.id)
+      .toBe('same-target');
+  });
+
   it('merges a complete version group back after an active-only message refresh', () => {
     const user = makeMessage({
       id: 'user-1',
@@ -392,5 +428,117 @@ describe('chatMultiModel helpers', () => {
 
     expect(selectRenderableVersionSet([active, remaining], [active, remaining, deleted]).map((message) => message.id))
       .toEqual(['active', 'remaining']);
+  });
+
+  it('keeps every authoritative snapshot version while overlaying matching live content', () => {
+    const snapshotA = makeMessage({
+      id: 'answer-a',
+      content: 'persisted-a',
+      model_id: 'model-a',
+      is_active: true,
+    });
+    const snapshotB = makeMessage({
+      id: 'answer-b',
+      content: 'persisted-b',
+      model_id: 'model-b',
+      is_active: false,
+    });
+    const liveA = { ...snapshotA, content: 'streaming-a', status: 'partial' as const };
+
+    expect(selectRenderableVersionSet([snapshotA, snapshotB], [liveA])).toEqual([
+      liveA,
+      snapshotB,
+    ]);
+  });
+
+  it('only appends live versions that are explicitly pending', () => {
+    const snapshotA = makeMessage({ id: 'answer-a', model_id: 'model-a' });
+    const pendingB = makeMessage({ id: 'temp-answer-b', model_id: 'model-b', status: 'partial' });
+    const unrelatedC = makeMessage({ id: 'stale-answer-c', model_id: 'model-c' });
+
+    expect(selectRenderableVersionSet(
+      [snapshotA],
+      [snapshotA, pendingB, unrelatedC],
+      new Set([pendingB.id]),
+    ).map((message) => message.id)).toEqual(['answer-a', 'temp-answer-b']);
+  });
+
+  it('keeps model cards in slot order even when later versions arrive first', () => {
+    const modelA = makeMessage({
+      id: 'a1',
+      model_id: 'model-a',
+      provider_id: 'provider-a',
+      version_index: 0,
+      created_at: 30,
+    });
+    const modelC = makeMessage({
+      id: 'c1',
+      model_id: 'model-c',
+      provider_id: 'provider-c',
+      version_index: 2,
+      created_at: 10,
+    });
+    const modelB = makeMessage({
+      id: 'b1',
+      model_id: 'model-b',
+      provider_id: 'provider-b',
+      version_index: 1,
+      created_at: 20,
+    });
+
+    expect(selectDisplayVersionsByModel([modelA, modelC, modelB]).map((message) => message.model_id))
+      .toEqual(['model-a', 'model-b', 'model-c']);
+  });
+
+  it('does not move a model card when that model later gets a higher version', () => {
+    const modelAOld = makeMessage({
+      id: 'a1',
+      model_id: 'model-a',
+      provider_id: 'provider-a',
+      version_index: 0,
+      is_active: false,
+      created_at: 1,
+    });
+    const modelB = makeMessage({
+      id: 'b1',
+      model_id: 'model-b',
+      provider_id: 'provider-b',
+      version_index: 1,
+      is_active: true,
+      created_at: 2,
+    });
+    const modelC = makeMessage({
+      id: 'c1',
+      model_id: 'model-c',
+      provider_id: 'provider-c',
+      version_index: 2,
+      is_active: false,
+      created_at: 3,
+    });
+    const modelANew = makeMessage({
+      id: 'a2',
+      model_id: 'model-a',
+      provider_id: 'provider-a',
+      version_index: 3,
+      is_active: false,
+      created_at: 4,
+    });
+
+    expect(selectDisplayVersionsByModel(
+      [modelANew, modelC, modelB, modelAOld],
+      modelB.id,
+    ).map((message) => message.id)).toEqual(['a2', 'b1', 'c1']);
+  });
+
+  it('maps companion targets to their frozen send-time slots', () => {
+    const targets = [
+      { providerId: 'provider-a', modelId: 'model-a' },
+      { providerId: 'provider-b', modelId: 'model-b' },
+      { providerId: 'provider-c', modelId: 'model-c' },
+    ];
+
+    expect(plannedVersionIndexForTarget(targets, 'provider-a', 'model-a')).toBe(0);
+    expect(plannedVersionIndexForTarget(targets, 'provider-c', 'model-c')).toBe(2);
+    expect(plannedVersionIndexForTarget(targets, 'provider-x', 'model-c')).toBeNull();
   });
 });

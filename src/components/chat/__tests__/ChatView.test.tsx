@@ -34,12 +34,54 @@ function makeMessage(overrides: Partial<Message>): Message {
 }
 
 describe('ChatView assistant display policy', () => {
-  it('does not mount AssistantFooter while an assistant message is streaming', () => {
-    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
-    const footerBranch = source.match(/footer:\s*msg && activeConversationId \? \([\s\S]*?\) : footerLoading \?/);
+  it('loads stored attachment images through the read-only media source', () => {
+    const attachmentPreview = readFileSync(
+      resolve(process.cwd(), 'src/components/chat/MessageAttachmentPreview.tsx'),
+      'utf8',
+    );
 
-    expect(footerBranch?.[0]).toContain('{!isStreaming && (');
-    expect(footerBranch?.[0]).not.toContain('isStreaming={isStreaming}');
+    expect(attachmentPreview).toContain(
+      'loadStoredMediaSource(attachment.id, attachment.file_path)',
+    );
+    expect(attachmentPreview).not.toContain("invoke<string>('read_attachment_preview'");
+    expect(attachmentPreview).toMatch(
+      /React\.useEffect\(\(\) => \{\s*if \(isImage \|\| fileExists !== null\) return;[\s\S]*?invoke<boolean>\('check_attachment_exists'/,
+    );
+    expect(attachmentPreview).toContain('onError={() => {');
+    expect(attachmentPreview).toContain('mask: { blur: true }');
+    expect(attachmentPreview).toContain('scaleStep: 0.5');
+  });
+
+  it('loads the complete transcript before copy and structured exports when the message window is trimmed', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/useChatShareExport.tsx'), 'utf8');
+
+    expect(source).toContain('const loadCompleteTranscript = useCallback(async () => {');
+    expect(source).toContain("invoke<Message[]>('list_messages'");
+    expect(source).toContain('const transcript = await loadCompleteTranscript();');
+    expect(source).not.toContain('exportAsMarkdown(messages,');
+    expect(source).not.toContain('exportAsText(messages,');
+    expect(source).not.toContain('exportAsJSON(messages,');
+    expect(source).not.toContain('copyTranscript(messages,');
+  });
+
+  it('mounts the streaming footer so multi-model status and switching are immediately available', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+    const footerIndex = source.indexOf('<AssistantFooter');
+    const footerBranch = footerIndex >= 0 ? source.slice(footerIndex - 200, footerIndex + 900) : '';
+
+    expect(footerBranch).toContain('{(!isStreaming || hasMultiModels) && <AssistantFooter');
+    expect(footerBranch).toContain('isStreaming={isStreaming}');
+  });
+
+  it('renders independent-window multi-model replies as per-model conversation columns', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+
+    expect(source).toContain('renderConversation={(column) => (');
+    expect(source).toContain('makeLaneRoles(column)');
+    expect(source).toContain('shouldHideMultiModelLayoutSwitcher(chatChrome.kind)');
+    expect(source).toContain('<InputArea />');
+    expect(source).not.toContain('comparisonDisplayModeForChrome');
+    expect(source).not.toContain('renderLaneUser');
   });
 
   it('temporarily closes live streaming think content before rendering', () => {
@@ -49,7 +91,7 @@ describe('ChatView assistant display policy', () => {
   });
 
   it('uses a finite live markdown window instead of placeholder batching', () => {
-    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/chatMarkdownShared.tsx'), 'utf8');
     const propsBlock = source.match(/const CHAT_RENDER_BATCH_PROPS = \{[\s\S]*?\} as const;/)?.[0] ?? '';
 
     expect(propsBlock).toContain('deferNodesUntilVisible: false');
@@ -58,7 +100,7 @@ describe('ChatView assistant display policy', () => {
   });
 
   it('routes plain text and markdown messages through chat typography classes', () => {
-    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatAssistantMarkdown.tsx'), 'utf8');
 
     expect(source).toContain('className="aqbot-chat-text"');
     expect(source).toContain('className="aqbot-chat-markdown"');
@@ -75,6 +117,29 @@ describe('ChatView assistant display policy', () => {
     expect(chatBlock).toContain('font-weight: var(--chat-font-weight');
     expect(codeBlock).toContain('font-family: var(--code-font-family');
     expect(codeBlock).not.toContain('--chat-font-family');
+  });
+
+  it('uses the configured primary color for chat and ACP markdown links', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8');
+    const acpSource = readFileSync(
+      resolve(process.cwd(), 'src/components/acp/AcpConversationPane.tsx'),
+      'utf8',
+    );
+    const linkThemeBlock = source.match(
+      /\.aqbot-chat-markdown \.link-node,[\s\S]*?\.aqbot-chat-markdown \.link-loading \{[\s\S]*?\}/,
+    )?.[0] ?? '';
+
+    expect(acpSource).toContain('className="aqbot-chat-markdown"');
+    expect(linkThemeBlock).toContain('color: var(--color-primary, #1677ff);');
+  });
+
+  it('uses a pure black tooltip background for dark markdown links', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf8');
+    const darkTooltipBlock = source.match(
+      /html\[data-theme=["']dark["']\] \.ms-tooltip\[data-dark=["']true["']\] \{[\s\S]*?\}/,
+    )?.[0] ?? '';
+
+    expect(darkTooltipBlock).toMatch(/background-color:\s*#(?:000|000000);/);
   });
 
   it('gates custom user and ai message area styles behind separate chat settings', () => {
@@ -139,31 +204,63 @@ describe('ChatView assistant display policy', () => {
     expect(scrollHandler).toContain('void handleLoadOlderMessages();');
   });
 
+  it('does not repeat auto-scroll or synchronous layout reads when an Activity page reconnects', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+
+    expect(source).toContain('previousRequest?.items === finalBubbleItems');
+    expect(source).toContain('lastAutoScrollRequestRef.current = { items: finalBubbleItems, stickToBottom }');
+    expect(source).toContain('if (scrollLayoutMetricsRef.current.scrollHeight === 0)');
+
+    const userIntentAttach = source.match(/const attach = \(\) => \{[\s\S]*?\n    \};/)?.[0] ?? '';
+    expect(userIntentAttach).not.toContain('attachedScrollBox.scrollHeight');
+  });
+
+  it('invalidates transient popovers and late async modals when Chat is suspended', () => {
+    const source = [
+      readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8'),
+      readFileSync(resolve(process.cwd(), 'src/components/chat/ChatAssistantFooter.tsx'), 'utf8'),
+    ].join('\n');
+
+    expect(source).toContain('const [open, setOpen] = usePageTransientOpenState();');
+    expect(source).toContain('pageConnectionGenerationRef.current !== connectionGeneration');
+    expect(source).toContain('useConversationStore.getState().activeConversationId !== convId');
+  });
+
   it('defers parsing assistant code blocks until the message becomes visible', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
     const nodesMemo = source.match(/const aiContentNodesById = useMemo\(\(\) => \{[\s\S]*?\n  \}, \[[^\]]*\]\);/)?.[0] ?? '';
 
     expect(nodesMemo).toContain('shouldDeferAssistantMarkdownParse(item.content)');
     expect(nodesMemo.indexOf('shouldDeferAssistantMarkdownParse(item.content)')).toBeLessThan(
-      nodesMemo.indexOf('safeParseChatMarkdown(item.content)'),
+      nodesMemo.indexOf('safeParseChatMarkdown(renderableContent)'),
     );
   });
 
   it('does not refetch every assistant version when unrelated pages change message count', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
+    const versionGroupsHook = readFileSync(
+      resolve(process.cwd(), 'src/hooks/useMessageVersionGroups.ts'),
+      'utf8',
+    );
 
-    expect(source).toContain('listMessageVersionsBatch(activeConversationId, parentMessageIds)');
+    expect(source).toContain('useMessageVersionGroups({');
+    expect(versionGroupsHook).toContain('ensureMessageVersionGroupsLoaded(');
+    expect(versionGroupsHook).toContain('parentMessageIdsToLoadKey');
+    expect(versionGroupsHook).toContain(
+      '[conversationId, ensureMessageVersionGroupsLoaded, parentMessageIdsToLoadKey]',
+    );
     expect(source).not.toContain('const messagesLength = useConversationStore((s) => s.messages.length);');
-    expect(source).not.toMatch(/listMessageVersions\([\s\S]*?\], \[[^\]]*messagesLength[^\]]*\]\);/);
+    expect(versionGroupsHook).not.toMatch(/ensureMessageVersionGroupsLoaded\([\s\S]*?messages\.length/);
   });
 
   it('renders role intro prompts for empty role conversations', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/components/chat/ChatView.tsx'), 'utf8');
 
     expect(source).toContain('getRoleIntro');
-    expect(source).toContain('roleIntro.openingMessage');
-    expect(source).toContain('roleIntro.openingQuestions');
+    expect(source).toContain('RoleIntroPanel');
+    expect(source).toContain('handleRoleIntroSelect');
     expect(source).toContain('setPendingPromptText');
+    expect(source).not.toContain('roleIntroPromptItems');
   });
 
   it('injects a web-search display card for normal assistant replies with searched parent messages', () => {

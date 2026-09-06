@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/core", "crates/providers", "crates/gateway", "crates/migration", "crates/agent"]
+members = [".", "crates/core", "crates/providers", "crates/gateway", "crates/migration", "crates/agent", "crates/acp-client"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -37,7 +37,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools", "macos-private-api"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
@@ -50,9 +50,11 @@ serde_json = { workspace = true }
 aqbot-core = { path = "crates/core" }
 aqbot-providers = { path = "crates/providers" }
 aqbot-agent = { path = "crates/agent" }
+aqbot-acp-client = { path = "crates/acp-client" }
 open-agent-sdk = { path = "crates/open-agent-sdk" }
 aqbot-gateway = { path = "crates/gateway" }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true }
 sea-orm = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
@@ -65,9 +67,16 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 tauri-plugin-mcp-bridge = "0.2"
 font-kit = "0.14"
 tauri-plugin-clipboard-manager = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
+ndarray = "0.17"
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "esaxx_fast"] }
 csv = "1"
 zip = "2"
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+hex = "0.4"
 tempfile = "3"
 open = "5"
 urlencoding = "2"
@@ -76,17 +85,84 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tauri-plugin-deep-link = "2.4.7"
 tauri-plugin-single-instance = { version = "=2.4.0", features = ["deep-link"] }
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", features = ["relax-sign-encoding"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSImage",
+    "NSImageRep",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSWindow",
+    "NSWorkspace",
+    "block2",
+    "libc",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSData",
+    "NSDictionary",
+    "NSNotification",
+    "NSURL",
+    "NSObject",
+    "NSOperation",
+    "NSString",
+    "block2",
+] }
+plist = "1"
+block2 = "0.6.2"
+axuielement = { version = "0.9.1", features = ["async"] }
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+# Exposes CGEventPostToPid so synthetic copy events cannot leak into a new foreground app.
+core-graphics = { version = "0.25", features = ["elcapitan"] }
+# Nonactivating NSPanel for the selection toolbar (hover + click without activating the app).
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "a3122e894383aa068ec5365a42994e3ac94ba1b6" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+uiautomation = { version = "0.25.0", features = ["event"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Registry",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { version = "0.30.0", features = ["tokio"] }
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+x11rb = { version = "0.13.2", features = ["image"] }
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
 opt-level = "s"
+
+[patch.crates-io]
+tauri-plugin-mcp-bridge = { path = "patches/tauri-plugin-mcp-bridge" }

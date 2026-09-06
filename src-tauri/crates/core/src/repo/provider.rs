@@ -21,6 +21,7 @@ fn parse_provider_type(s: &str) -> ProviderType {
         "jina" => ProviderType::Jina,
         "cohere" => ProviderType::Cohere,
         "voyage" => ProviderType::Voyage,
+        "bedrock" => ProviderType::Bedrock,
         _ => ProviderType::Custom,
     }
 }
@@ -38,6 +39,7 @@ fn provider_type_str(pt: &ProviderType) -> &'static str {
         ProviderType::Jina => "jina",
         ProviderType::Cohere => "cohere",
         ProviderType::Voyage => "voyage",
+        ProviderType::Bedrock => "bedrock",
         ProviderType::Custom => "custom",
     }
 }
@@ -57,6 +59,24 @@ fn key_from_entity(m: provider_keys::Model) -> ProviderKey {
 }
 
 fn model_from_entity(m: models::Model) -> Model {
+    let metadata_state = m.metadata_state_json.and_then(|value| {
+        serde_json::from_str(&value)
+            .map_err(|error| {
+                tracing::warn!(
+                    provider_id = %m.provider_id,
+                    model_id = %m.model_id,
+                    %error,
+                    "Ignoring invalid model metadata state"
+                );
+            })
+            .ok()
+    });
+    let aliases = m
+        .aliases_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .map(normalize_model_aliases)
+        .unwrap_or_default();
     Model {
         provider_id: m.provider_id,
         model_id: m.model_id,
@@ -64,11 +84,17 @@ fn model_from_entity(m: models::Model) -> Model {
         group_name: m.group_name,
         model_type: m.model_type.parse().unwrap_or_default(),
         capabilities: serde_json::from_str(&m.capabilities).unwrap_or_default(),
-        max_tokens: m.max_tokens.map(|v| v as u32),
+        context_window: m.max_tokens.map(|v| v as u32),
+        max_output_tokens: m.max_output_tokens.map(|value| value as u32),
         enabled: m.enabled != 0,
         param_overrides: m
             .param_overrides
             .and_then(|s| serde_json::from_str(&s).ok()),
+        image_config: m
+            .image_config_json
+            .and_then(|value| serde_json::from_str(&value).ok()),
+        metadata_state,
+        aliases,
     }
 }
 
@@ -83,6 +109,7 @@ fn provider_from_entity(
         provider_type: parse_provider_type(&row.provider_type),
         api_host: row.api_host,
         api_path: row.api_path,
+        aws_region: row.aws_region,
         enabled: row.enabled != 0,
         models,
         keys,
@@ -132,6 +159,7 @@ pub async fn create_provider(
 ) -> Result<ProviderConfig> {
     let id = gen_id();
     let now = now_ts();
+    let aws_region = normalized_aws_region(&input.provider_type, input.aws_region)?;
 
     providers::ActiveModel {
         id: Set(id.clone()),
@@ -139,6 +167,7 @@ pub async fn create_provider(
         provider_type: Set(provider_type_str(&input.provider_type).to_string()),
         api_host: Set(input.api_host),
         api_path: Set(input.api_path),
+        aws_region: Set(aws_region),
         enabled: Set(if input.enabled { 1 } else { 0 }),
         proxy_config: Set(None),
         custom_headers: Set(None),
@@ -161,11 +190,23 @@ pub async fn update_provider(
 ) -> Result<ProviderConfig> {
     let existing = get_provider(db, id).await?;
     let now = now_ts();
+    let provider_type = input
+        .provider_type
+        .unwrap_or_else(|| existing.provider_type.clone());
+    if (existing.provider_type == ProviderType::Bedrock) != (provider_type == ProviderType::Bedrock)
+    {
+        return Err(AQBotError::Validation(
+            "AWS Bedrock providers cannot be converted to or from API-key providers".into(),
+        ));
+    }
 
     let name = input.name.unwrap_or(existing.name);
     let api_host = input.api_host.unwrap_or(existing.api_host);
     let enabled = input.enabled.unwrap_or(existing.enabled);
-    let provider_type = input.provider_type.unwrap_or(existing.provider_type);
+    let aws_region = normalized_aws_region(
+        &provider_type,
+        input.aws_region.unwrap_or(existing.aws_region),
+    )?;
     let proxy_json = match input.proxy_config {
         Some(ref pc) => Some(serde_json::to_string(pc).unwrap()),
         None => existing
@@ -182,6 +223,7 @@ pub async fn update_provider(
     am.name = Set(name);
     am.api_host = Set(api_host);
     am.provider_type = Set(provider_type_str(&provider_type).to_string());
+    am.aws_region = Set(aws_region);
     am.enabled = Set(if enabled { 1 } else { 0 });
     am.proxy_config = Set(proxy_json);
     if let Some(api_path) = input.api_path {
@@ -200,6 +242,21 @@ pub async fn update_provider(
     am.update(db).await?;
 
     get_provider(db, id).await
+}
+
+fn normalized_aws_region(
+    provider_type: &ProviderType,
+    aws_region: Option<String>,
+) -> Result<Option<String>> {
+    if provider_type != &ProviderType::Bedrock {
+        return Ok(None);
+    }
+
+    let region = aws_region
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AQBotError::Validation("AWS region is required for Bedrock".into()))?;
+    Ok(Some(region))
 }
 
 fn parse_deep_link_provider_type(value: &str) -> Result<ProviderType> {
@@ -316,6 +373,7 @@ pub async fn import_provider_from_deep_link(
                         provider_type,
                         api_host: baseurl,
                         api_path: None,
+                        aws_region: None,
                         enabled: true,
                         builtin_id: None,
                     },
@@ -610,6 +668,17 @@ where
             .param_overrides
             .as_ref()
             .map(|po| serde_json::to_string(po).unwrap_or_else(|_| "null".to_string()));
+        let image_config_json = model.image_config.as_ref().map(|config| config.to_string());
+        let metadata_state_json = model
+            .metadata_state
+            .as_ref()
+            .and_then(|state| serde_json::to_string(state).ok());
+        let aliases = normalize_model_aliases(model.aliases.iter().map(|s| s.as_str()));
+        let aliases_json = if aliases.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&aliases).unwrap_or_else(|_| "[]".to_string()))
+        };
 
         models::ActiveModel {
             provider_id: Set(provider_id.to_string()),
@@ -618,9 +687,13 @@ where
             group_name: Set(model.group_name.clone()),
             model_type: Set(model.model_type.to_string()),
             capabilities: Set(capabilities),
-            max_tokens: Set(model.max_tokens.map(|v| v as i64)),
+            max_tokens: Set(model.context_window.map(|v| v as i64)),
+            max_output_tokens: Set(model.max_output_tokens.map(|value| value as i64)),
             enabled: Set(if model.enabled { 1 } else { 0 }),
             param_overrides: Set(param_overrides),
+            image_config_json: Set(image_config_json),
+            metadata_state_json: Set(metadata_state_json),
+            aliases_json: Set(aliases_json),
         }
         .insert(conn)
         .await?;
@@ -629,11 +702,31 @@ where
     Ok(())
 }
 
+fn validate_provider_model_aliases(input_models: &[Model]) -> Result<()> {
+    let siblings: Vec<(String, Vec<String>)> = input_models
+        .iter()
+        .map(|m| {
+            (
+                m.model_id.clone(),
+                normalize_model_aliases(m.aliases.iter().map(|s| s.as_str())),
+            )
+        })
+        .collect();
+    for model in input_models {
+        let aliases = normalize_model_aliases(model.aliases.iter().map(|s| s.as_str()));
+        validate_model_aliases(&model.model_id, &aliases, &siblings)
+            .map_err(AQBotError::Validation)?;
+    }
+    Ok(())
+}
+
 pub async fn save_models(
     db: &DatabaseConnection,
     provider_id: &str,
     input_models: &[Model],
 ) -> Result<()> {
+    validate_provider_model_aliases(input_models)?;
+
     let provider_id = provider_id.to_string();
     let input_models = input_models.to_vec();
 
@@ -662,6 +755,8 @@ pub async fn save_models_from_user_selection(
     provider_id: &str,
     input_models: &[Model],
 ) -> Result<()> {
+    validate_provider_model_aliases(input_models)?;
+
     let provider = get_provider(db, provider_id).await?;
     let Some(builtin_id) = provider.builtin_id.clone() else {
         return save_models(db, provider_id, input_models).await;
@@ -672,11 +767,8 @@ pub async fn save_models_from_user_selection(
         return save_models(db, provider_id, input_models).await;
     };
 
-    let builtin_model_ids: HashSet<&str> = builtin
-        .models
-        .iter()
-        .map(|model| model.model_id)
-        .collect();
+    let builtin_model_ids: HashSet<&str> =
+        builtin.models.iter().map(|model| model.model_id).collect();
     let before_model_ids: HashSet<String> = provider
         .models
         .iter()
@@ -859,6 +951,7 @@ pub async fn list_providers_merged(db: &DatabaseConnection) -> Result<Vec<Provid
                 provider_type: bp.provider_type.clone(),
                 api_host: String::from(bp.api_host),
                 api_path: None,
+                aws_region: None,
                 enabled: false,
                 models: default_models,
                 keys: vec![],
@@ -916,6 +1009,7 @@ pub async fn ensure_builtin_provider(db: &DatabaseConnection, builtin_id: &str) 
             provider_type: bp.provider_type.clone(),
             api_host: String::from(bp.api_host),
             api_path: None,
+            aws_region: None,
             enabled: false,
             builtin_id: Some(String::from(builtin_id)),
         },
@@ -951,6 +1045,162 @@ mod tests {
     use crate::db::create_test_pool;
 
     #[tokio::test]
+    async fn shuaiapi_virtual_provider_materializes_with_builtin_defaults() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let virtual_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("shuaiapi"))
+            .expect("SHUAI API virtual provider");
+
+        assert_eq!(virtual_provider.id, "builtin_shuaiapi");
+        assert_eq!(virtual_provider.name, "SHUAI API");
+        assert_eq!(virtual_provider.provider_type, ProviderType::OpenAI);
+        assert_eq!(virtual_provider.api_host, "https://api.shuaiapi.com");
+        assert_eq!(virtual_provider.api_path, None);
+        assert!(!virtual_provider.enabled);
+        assert!(virtual_provider.keys.is_empty());
+        assert!(virtual_provider.models.is_empty());
+
+        let provider_id = ensure_builtin_provider(db, "shuaiapi").await.unwrap();
+        assert_ne!(provider_id, "builtin_shuaiapi");
+        assert_eq!(
+            ensure_builtin_provider(db, "shuaiapi").await.unwrap(),
+            provider_id
+        );
+
+        let materialized = get_provider(db, &provider_id).await.unwrap();
+        assert_eq!(materialized.name, "SHUAI API");
+        assert_eq!(materialized.provider_type, ProviderType::OpenAI);
+        assert_eq!(materialized.api_host, "https://api.shuaiapi.com");
+        assert_eq!(materialized.api_path, None);
+        assert!(!materialized.enabled);
+        assert!(materialized.keys.is_empty());
+        assert!(materialized.models.is_empty());
+        assert_eq!(materialized.builtin_id.as_deref(), Some("shuaiapi"));
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let merged_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("shuaiapi"))
+            .expect("SHUAI API materialized provider");
+        assert_eq!(merged_provider.id, provider_id);
+        assert_eq!(
+            providers
+                .iter()
+                .filter(|provider| provider.builtin_id.as_deref() == Some("shuaiapi"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn gptnb_virtual_provider_materializes_with_builtin_defaults() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let virtual_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("gptnb"))
+            .expect("GPTNB virtual provider");
+
+        assert_eq!(virtual_provider.id, "builtin_gptnb");
+        assert_eq!(virtual_provider.name, "GPTNB");
+        assert_eq!(virtual_provider.provider_type, ProviderType::OpenAI);
+        assert_eq!(virtual_provider.api_host, "https://goapi.gptnb.ai");
+        assert_eq!(virtual_provider.api_path, None);
+        assert!(!virtual_provider.enabled);
+        assert!(virtual_provider.keys.is_empty());
+        assert!(virtual_provider.models.is_empty());
+
+        let provider_id = ensure_builtin_provider(db, "gptnb").await.unwrap();
+        assert_ne!(provider_id, "builtin_gptnb");
+        assert_eq!(
+            ensure_builtin_provider(db, "gptnb").await.unwrap(),
+            provider_id
+        );
+
+        let materialized = get_provider(db, &provider_id).await.unwrap();
+        assert_eq!(materialized.name, "GPTNB");
+        assert_eq!(materialized.provider_type, ProviderType::OpenAI);
+        assert_eq!(materialized.api_host, "https://goapi.gptnb.ai");
+        assert_eq!(materialized.api_path, None);
+        assert!(!materialized.enabled);
+        assert!(materialized.keys.is_empty());
+        assert!(materialized.models.is_empty());
+        assert_eq!(materialized.builtin_id.as_deref(), Some("gptnb"));
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let merged_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("gptnb"))
+            .expect("GPTNB materialized provider");
+        assert_eq!(merged_provider.id, provider_id);
+        assert_eq!(
+            providers
+                .iter()
+                .filter(|provider| provider.builtin_id.as_deref() == Some("gptnb"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn newapi_virtual_provider_materializes_with_builtin_defaults() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let virtual_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("newapi"))
+            .expect("New API virtual provider");
+
+        assert_eq!(virtual_provider.id, "builtin_newapi");
+        assert_eq!(virtual_provider.name, "New API");
+        assert_eq!(virtual_provider.provider_type, ProviderType::OpenAI);
+        assert_eq!(virtual_provider.api_host, "");
+        assert_eq!(virtual_provider.api_path, None);
+        assert!(!virtual_provider.enabled);
+        assert!(virtual_provider.keys.is_empty());
+        assert!(virtual_provider.models.is_empty());
+
+        let provider_id = ensure_builtin_provider(db, "newapi").await.unwrap();
+        assert_ne!(provider_id, "builtin_newapi");
+        assert_eq!(
+            ensure_builtin_provider(db, "newapi").await.unwrap(),
+            provider_id
+        );
+
+        let materialized = get_provider(db, &provider_id).await.unwrap();
+        assert_eq!(materialized.name, "New API");
+        assert_eq!(materialized.provider_type, ProviderType::OpenAI);
+        assert_eq!(materialized.api_host, "");
+        assert_eq!(materialized.api_path, None);
+        assert!(!materialized.enabled);
+        assert!(materialized.keys.is_empty());
+        assert!(materialized.models.is_empty());
+        assert_eq!(materialized.builtin_id.as_deref(), Some("newapi"));
+
+        let providers = list_providers_merged(db).await.unwrap();
+        let merged_provider = providers
+            .iter()
+            .find(|provider| provider.builtin_id.as_deref() == Some("newapi"))
+            .expect("New API materialized provider");
+        assert_eq!(merged_provider.id, provider_id);
+        assert_eq!(
+            providers
+                .iter()
+                .filter(|provider| provider.builtin_id.as_deref() == Some("newapi"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn provider_key_update_rewrites_encrypted_value_and_prefix() {
         let h = create_test_pool().await.unwrap();
         let db = &h.conn;
@@ -962,6 +1212,7 @@ mod tests {
                 provider_type: ProviderType::Custom,
                 api_host: "https://example.com".into(),
                 api_path: None,
+                aws_region: None,
                 enabled: true,
                 builtin_id: None,
             },
@@ -1002,6 +1253,7 @@ mod tests {
                 provider_type: ProviderType::OpenAI,
                 api_host: "https://api.minimaxi.com".into(),
                 api_path: None,
+                aws_region: None,
                 enabled: true,
                 builtin_id: Some("minimax".into()),
             },
@@ -1018,9 +1270,17 @@ mod tests {
                 group_name: None,
                 model_type: ModelType::Chat,
                 capabilities: vec![ModelCapability::TextChat],
-                max_tokens: Some(1_000_000),
+                context_window: Some(1_000_000),
+                max_output_tokens: Some(4_096),
                 enabled: true,
                 param_overrides: None,
+                image_config: None,
+                metadata_state: Some(ModelMetadataState {
+                    model_type: ModelMetadataSource::User,
+                    max_output_tokens: ModelMetadataSource::Catalog,
+                    ..ModelMetadataState::default()
+                }),
+                aliases: Vec::new(),
             }],
         )
         .await
@@ -1046,6 +1306,71 @@ mod tests {
                 .as_ref()
                 .and_then(|params| params.use_max_completion_tokens),
             Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_adapter_config_round_trips_with_model() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let provider = create_provider(
+            db,
+            CreateProviderInput {
+                name: "Custom xAI".into(),
+                provider_type: ProviderType::Custom,
+                api_host: "https://api.x.ai".into(),
+                api_path: Some("/v1/images/generations".into()),
+                aws_region: None,
+                enabled: true,
+                builtin_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        save_models(
+            db,
+            &provider.id,
+            &[Model {
+                provider_id: provider.id.clone(),
+                model_id: "grok-imagine-image".into(),
+                name: "Grok Imagine".into(),
+                group_name: None,
+                model_type: ModelType::Image,
+                capabilities: Vec::new(),
+                context_window: None,
+                max_output_tokens: Some(4_096),
+                enabled: true,
+                param_overrides: None,
+                image_config: Some(serde_json::json!({
+                    "adapter_id": "xai_images",
+                    "timeout_secs": 3600
+                })),
+                metadata_state: Some(ModelMetadataState {
+                    model_type: ModelMetadataSource::User,
+                    max_output_tokens: ModelMetadataSource::Catalog,
+                    ..ModelMetadataState::default()
+                }),
+                aliases: Vec::new(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let model = get_model(db, &provider.id, "grok-imagine-image")
+            .await
+            .unwrap();
+        assert_eq!(
+            model
+                .image_config
+                .as_ref()
+                .and_then(|value| value.get("adapter_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("xai_images")
+        );
+        assert_eq!(model.max_output_tokens, Some(4_096));
+        assert_eq!(
+            model.metadata_state.as_ref().map(|state| state.model_type),
+            Some(ModelMetadataSource::User)
         );
     }
 

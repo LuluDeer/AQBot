@@ -7,9 +7,11 @@ import { useUIStore, useSettingsStore } from '@/stores';
 import { useBackupStore } from '@/stores/backupStore';
 import { isTauri, invoke } from '@/lib/invoke';
 import { getShortcutBinding, formatShortcutForDisplay } from '@/lib/shortcuts';
+import { isTitlebarIconVisible } from '@/lib/titlebarIcons';
 import { useUpdateChecker } from '@/hooks/useUpdateChecker';
 import appLogo from '@/assets/image/logo.png';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { titleBarPaddingLeft } from '@/lib/titleBarLayout';
 
 const IS_WINDOWS = navigator.userAgent.includes('Windows');
 
@@ -34,12 +36,14 @@ const THEME_ICONS: Record<string, React.ReactNode> = {
 };
 
 import { LANG_OPTIONS } from '@/lib/constants';
+import { ConversationTabBar } from './ConversationTabBar';
 
 
-export function TitleBar() {
+export function TitleBar({ variant = 'main' }: { variant?: 'main' | 'popout' }) {
   const { t, i18n } = useTranslation();
   const { token } = theme.useToken();
   const { modal, message } = App.useApp();
+  const isPopout = variant === 'popout';
   const activePage = useUIStore((s) => s.activePage);
   const enterSettings = useUIStore((s) => s.enterSettings);
   const exitSettings = useUIStore((s) => s.exitSettings);
@@ -120,6 +124,7 @@ export function TitleBar() {
 
   // Windows window controls
   const [isMaximized, setIsMaximized] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
     if (!IS_WINDOWS || !isTauri()) return;
@@ -132,6 +137,39 @@ export function TitleBar() {
       });
     })();
     return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    if (IS_WINDOWS || !isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const syncFullscreen = async () => {
+      try {
+        const fullscreen = await getCurrentWindow().isFullscreen();
+        if (!cancelled) setIsFullscreen(fullscreen);
+      } catch {
+        if (!cancelled) setIsFullscreen(false);
+      }
+    };
+    const onWindowResize = () => {
+      void syncFullscreen();
+    };
+    void (async () => {
+      await syncFullscreen();
+      try {
+        unlisten = await getCurrentWindow().onResized(() => {
+          void syncFullscreen();
+        });
+      } catch {
+        unlisten = undefined;
+      }
+    })();
+    window.addEventListener('resize', onWindowResize);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      window.removeEventListener('resize', onWindowResize);
+    };
   }, []);
 
   const handleWindowMinimize = useCallback(async () => {
@@ -150,7 +188,9 @@ export function TitleBar() {
   const [backupPopoverOpen, setBackupPopoverOpen] = useState(false);
   const [backingUp, setBackingUp] = useState<'local' | 'webdav' | null>(null);
   const [lastLocalBackup, setLastLocalBackup] = useState<string | null>(null);
+  const [lastLocalAt, setLastLocalAt] = useState<number | null>(null);
   const [lastWebDavSync, setLastWebDavSync] = useState<string | null>(null);
+  const [lastWebDavAt, setLastWebDavAt] = useState<number | null>(null);
   // Timestamps (ms) for next scheduled backups
   const [nextLocalTs, setNextLocalTs] = useState<number | null>(null);
   const [nextWebDavTs, setNextWebDavTs] = useState<number | null>(null);
@@ -172,43 +212,47 @@ export function TitleBar() {
 
   // Fetch backup info on mount and when popover opens
   useEffect(() => {
+    if (isPopout) return;
     loadBackupSettings();
 
     invoke<{ lastSyncTime: string | null }>('get_webdav_sync_status')
-      .then((s) => {
-        if (s.lastSyncTime) {
-          const d = new Date(s.lastSyncTime);
-          if (!Number.isNaN(d.getTime())) {
-            setLastWebDavSync(d.toLocaleString());
-          }
+      .then((status) => {
+        if (!status.lastSyncTime) return;
+        const date = new Date(status.lastSyncTime);
+        if (!Number.isNaN(date.getTime())) {
+          setLastWebDavSync(date.toLocaleString());
+          setLastWebDavAt(date.getTime());
         }
       })
-      .catch(() => {});
+      .catch((error) => {
+        console.error('Failed to refresh WebDAV sync status', error);
+      });
 
     invoke<Array<{ createdAt: string }>>('list_backups')
       .then((list) => {
-        if (list.length > 0) {
-          const raw = list[0].createdAt;
-          const d = new Date(raw.includes('T') || raw.includes('Z') ? raw : raw + 'Z');
-          if (!Number.isNaN(d.getTime())) setLastLocalBackup(d.toLocaleString());
+        if (list.length === 0) return;
+        const raw = list[0].createdAt;
+        const date = new Date(raw.includes('T') || raw.includes('Z') ? raw : `${raw}Z`);
+        if (!Number.isNaN(date.getTime())) {
+          setLastLocalBackup(date.toLocaleString());
+          setLastLocalAt(date.getTime());
         }
       })
-      .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backupPopoverOpen]);
+      .catch((error) => {
+        console.error('Failed to refresh local backup status', error);
+      });
+  }, [backupPopoverOpen, isPopout, loadBackupSettings]);
 
   // Calculate next WebDAV sync timestamp (re-run when settings or lastWebDavSync change)
   useEffect(() => {
-    if (!lastWebDavSync) {
+    if (lastWebDavAt == null) {
       setNextWebDavTs(null);
       return;
     }
-    const d = new Date(lastWebDavSync);
-    if (Number.isNaN(d.getTime())) return;
     const interval = settings.webdav_sync_interval_minutes ?? 60;
     if (settings.webdav_sync_enabled && interval > 0) {
       const intervalMs = interval * 60000;
-      let next = d.getTime() + intervalMs;
+      let next = lastWebDavAt + intervalMs;
       // If overdue, advance to the next future interval
       while (next < Date.now()) {
         next += intervalMs;
@@ -217,7 +261,7 @@ export function TitleBar() {
     } else {
       setNextWebDavTs(null);
     }
-  }, [settings.webdav_sync_enabled, settings.webdav_sync_interval_minutes, lastWebDavSync]);
+  }, [settings.webdav_sync_enabled, settings.webdav_sync_interval_minutes, lastWebDavAt]);
 
   // Calculate next local backup timestamp from backup settings
   useEffect(() => {
@@ -226,8 +270,8 @@ export function TitleBar() {
       return;
     }
     const intervalMs = (backupSettings.intervalHours ?? 24) * 3600000;
-    if (lastLocalBackup) {
-      const lastTime = new Date(lastLocalBackup).getTime();
+    if (lastLocalAt != null) {
+      const lastTime = lastLocalAt;
       if (!Number.isNaN(lastTime)) {
         let next = lastTime + intervalMs;
         // If overdue, advance to the next future interval
@@ -240,18 +284,28 @@ export function TitleBar() {
     }
     // No previous backup — next backup at now + interval
     setNextLocalTs(Date.now() + intervalMs);
-  }, [backupSettings, lastLocalBackup]);
+  }, [backupSettings, lastLocalAt]);
 
   // Live countdown on button — tick every second while any backup is scheduled
   useEffect(() => {
     const tick = () => {
       const now = Date.now();
       let soonest: number | null = null;
-      if (nextLocalTs) {
-        if (!soonest || nextLocalTs < soonest) soonest = nextLocalTs;
+      let localTs = nextLocalTs;
+      if (localTs) {
+        if (localTs <= now) {
+          localTs = now + (backupSettings?.intervalHours ?? 24) * 3600000;
+          setNextLocalTs(localTs);
+        }
+        if (!soonest || localTs < soonest) soonest = localTs;
       }
-      if (nextWebDavTs) {
-        if (!soonest || nextWebDavTs < soonest) soonest = nextWebDavTs;
+      let webDavTs = nextWebDavTs;
+      if (webDavTs) {
+        if (webDavTs <= now) {
+          webDavTs = now + (settings.webdav_sync_interval_minutes ?? 60) * 60000;
+          setNextWebDavTs(webDavTs);
+        }
+        if (!soonest || webDavTs < soonest) soonest = webDavTs;
       }
       if (soonest) {
         setCountdownText(fmtCountdown(soonest - now));
@@ -263,7 +317,12 @@ export function TitleBar() {
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [nextLocalTs, nextWebDavTs]);
+  }, [
+    backupSettings?.intervalHours,
+    nextLocalTs,
+    nextWebDavTs,
+    settings.webdav_sync_interval_minutes,
+  ]);
 
   // Live countdown in popover — tick every second only when open
   useEffect(() => {
@@ -337,7 +396,7 @@ export function TitleBar() {
 
   const handleDragMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
-    if (target.closest('button')) return;
+    if (target.closest('.title-bar-nodrag')) return;
     if (!isTauri()) return;
     e.preventDefault();
 
@@ -397,8 +456,8 @@ export function TitleBar() {
         height: 36,
         display: 'flex',
         alignItems: 'center',
-        justifyContent: 'space-between',
-        paddingLeft: IS_WINDOWS ? 12 : 72,
+        justifyContent: 'flex-start',
+        paddingLeft: titleBarPaddingLeft({ isWindows: IS_WINDOWS, isFullscreen }),
         paddingRight: IS_WINDOWS ? 0 : 12,
         backgroundColor: 'transparent',
         flexShrink: 0,
@@ -411,11 +470,23 @@ export function TitleBar() {
           <img src={appLogo} alt="AQBot" style={{ width: 18, height: 18 }} draggable={false} />
           <span style={{ fontSize: 13, fontWeight: 600, color: token.colorTextBase, userSelect: 'none' }}>AQBot</span>
         </div>
-      ) : <div />}
+      ) : <div style={{ flexShrink: 0 }} />}
 
-      <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+      {!isPopout && activePage === 'chat' && settings.conversation_tabs_enabled && (
+        <div
+          style={{ flex: 1, minWidth: 0, height: '100%', display: 'flex', alignItems: 'center' }}
+        >
+          <ConversationTabBar />
+        </div>
+      )}
+      {(isPopout || activePage !== 'chat' || !settings.conversation_tabs_enabled) && (
+        <div style={{ flex: 1, minWidth: 0 }} />
+      )}
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 0, flexShrink: 0 }}>
       <div className="title-bar-nodrag" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
         {/* Pin Toggle */}
+        {isTitlebarIconVisible(settings, 'pin') && (
         <Tooltip title={t('desktop.alwaysOnTop')}>
           <button
             onClick={handlePinToggle}
@@ -441,8 +512,10 @@ export function TitleBar() {
             {pinned ? <Pin size={14} /> : <PinOff size={14} />}
           </button>
         </Tooltip>
+        )}
 
         {/* Theme Dropdown */}
+        {isTitlebarIconVisible(settings, 'theme') && (
         <Dropdown
           menu={{ items: themeMenuItems, onClick: handleThemeChange, selectedKeys: [themeMode] }}
           trigger={['click']}
@@ -456,8 +529,10 @@ export function TitleBar() {
             {THEME_ICONS[themeMode] ?? <Monitor size={14} />}
           </button>
         </Dropdown>
+        )}
 
         {/* Language Dropdown */}
+        {!isPopout && isTitlebarIconVisible(settings, 'language') && (
         <Dropdown
           menu={{ items: langMenuItems, onClick: handleLangChange, selectedKeys: [i18n.language] }}
           trigger={['click']}
@@ -471,8 +546,10 @@ export function TitleBar() {
             <Globe size={14} />
           </button>
         </Dropdown>
+        )}
 
         {/* Quick Backup */}
+        {!isPopout && isTitlebarIconVisible(settings, 'backup') && (
         <Popover
           open={backupPopoverOpen}
           onOpenChange={setBackupPopoverOpen}
@@ -584,8 +661,10 @@ export function TitleBar() {
             </button>
           </Tooltip>
         </Popover>
+        )}
 
         {/* GitHub */}
+        {!isPopout && isTitlebarIconVisible(settings, 'github') && (
         <Dropdown
           menu={{ items: githubMenuItems, onClick: handleGithubClick }}
           trigger={['click']}
@@ -599,9 +678,10 @@ export function TitleBar() {
             <Github size={14} />
           </button>
         </Dropdown>
+        )}
 
         {/* Check Update */}
-        {isTauri() && (
+        {!isPopout && isTitlebarIconVisible(settings, 'update') && isTauri() && (
           <Tooltip title={t('settings.checkUpdate')}>
             <button
               onClick={handleCheckUpdate}
@@ -615,6 +695,7 @@ export function TitleBar() {
         )}
 
         {/* Reload Page */}
+        {!isPopout && isTitlebarIconVisible(settings, 'reload') && (
         <Tooltip title={t('desktop.reloadPage')}>
           <button
             onClick={handleReload}
@@ -624,10 +705,17 @@ export function TitleBar() {
             <RotateCcw size={14} />
           </button>
         </Tooltip>
+        )}
 
-        {/* Settings Toggle */}
-        <Tooltip title={`${isInSettings ? t('settings.closeSettings') : t('settings.openSettings')} (${formatShortcutForDisplay(getShortcutBinding(settings, 'openSettings'))})`}>
+        {/* Settings Toggle — always visible in the main window */}
+        {!isPopout && (
+        <Tooltip title={(() => {
+          const label = isInSettings ? t('settings.closeSettings') : t('settings.openSettings');
+          const binding = getShortcutBinding(settings, 'openSettings');
+          return binding ? `${label} (${formatShortcutForDisplay(binding)})` : label;
+        })()}>
         <button
+          data-testid="settings-toggle"
           onClick={(e) => {
             handleSettingsToggle();
             e.currentTarget.style.backgroundColor = 'transparent';
@@ -655,6 +743,7 @@ export function TitleBar() {
           {isInSettings ? <XCircle size={14} /> : <Settings size={14} />}
         </button>
         </Tooltip>
+        )}
       </div>
 
       {/* Windows window controls */}

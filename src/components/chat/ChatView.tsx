@@ -1,2067 +1,173 @@
-import React, { useMemo, useCallback, useRef, useState, useEffect, useSyncExternalStore } from 'react';
-import { CloseCircleFilled, SyncOutlined } from '@ant-design/icons';
-import { Typography, Button, Dropdown, Input, App, Avatar, Alert, Popconfirm, Popover, theme, Tag, Image, Tooltip, Modal, Spin } from 'antd';
-import type { InputRef } from 'antd';
-import { Pencil, Share2, FileImage, FileCode, FileText, FileType, Bot, Brain, Lightbulb, Code, Languages, Copy, Check, RotateCcw, User, Trash2, ChevronLeft, ChevronRight, ChevronDown, Scissors, Paperclip, AlertCircle, X, ArrowDown, ArrowUp, ArrowLeftRight, Zap, Sparkles, TextCursorInput, GitBranch, ChartNoAxesColumn, MessageSquare, ArrowUpRight, ArrowDownRight, Coins, Clock, Timer, Download, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
-import { ModelIcon } from '@lobehub/icons';
-import { getConvIcon } from '@/lib/convIcon';
-import { getRoleIntro } from '@/lib/roleIntro';
-import { normalizeAutoConversationTitle } from '@/lib/conversationTitle';
-import Bubble from '@ant-design/x/es/bubble';
-import Prompts from '@ant-design/x/es/prompts';
-import Actions from '@ant-design/x/es/actions';
-import Think from '@ant-design/x/es/think';
-import type { BubbleItemType, BubbleListRef, RoleType } from '@ant-design/x/es/bubble/interface';
-import type { PromptsItemType } from '@ant-design/x/es/prompts';
-import NodeRenderer, { setCustomComponents, withMarkstreamComponentDisplay, type NodeComponentProps, type CodeBlockActionContext, type CodeBlockPreviewPayload, type MermaidBlockActionContext, type InfographicBlockActionContext } from 'markstream-react';
-import { useTranslation } from 'react-i18next';
-import { CodeBlockHeaderActions } from './CodeBlockHeaderActions';
-import { CodeBlockPreviewModal } from './CodeBlockPreviewModal';
-import { MermaidBlockHeaderActions } from './MermaidBlockHeaderActions';
-import { InfographicBlockHeaderActions } from './InfographicBlockHeaderActions';
-import { DiagramModeToggle } from './DiagramModeToggle';
-import { MermaidZoomControls } from './MermaidZoomControls';
-import {
-  getLiveStreamContent,
-  subscribeLiveStreamContent,
-  useConversationStore,
-  useProviderStore,
-  useSettingsStore,
-  useAgentStore,
-} from '@/stores';
-import { setupAgentEventListeners } from '@/stores/agentStore';
-import { useUserProfileStore, type AvatarType } from '@/stores/userProfileStore';
+import { usePageSuspendCleanup } from '@/components/layout/PageLifecycle';
+import { useCopyToClipboard } from '@/hooks/useCopyToClipboard';
+import { useMessageVersionGroups } from '@/hooks/useMessageVersionGroups';
+import { useMultiModelLayoutState } from '@/hooks/useMultiModelLayoutState';
+import { useResolvedAvatarSrc } from '@/hooks/useResolvedAvatarSrc';
 import { useResolvedDarkMode } from '@/hooks/useResolvedDarkMode';
-import { InputArea } from './InputArea';
-import { ModelSelector } from './ModelSelector';
-import { parseSearchContent } from '@/lib/searchUtils';
-import {
-  CHAT_CUSTOM_HTML_TAGS,
-  safeParseChatMarkdown,
-  shouldUsePlainTextChatContent,
-  stripAqbotTags,
-  type ChatMarkdownNode,
-} from '@/lib/chatMarkdown';
-import { normalizeHtmlRenderContent } from '@/lib/chatHtmlRender';
-import { normalizeThinkTagsForMarkdown } from '@/lib/thinkTags';
+import { safeParseChatMarkdown, shouldUsePlainTextChatContent, type ChatMarkdownNode } from '@/lib/chatMarkdown';
+import { createChatContentFingerprint, getCachedChatMarkdown, setCachedChatMarkdown } from '@/lib/chatMarkdownCache';
 import {
   getMessageVersionGroupKey,
-  hasMultipleModelVersions,
   resolvePendingDisplayVersionSelection,
-  selectRenderableVersionSet,
   shouldRenderStandaloneAssistantError,
   type PendingDisplayVersionSelection,
 } from '@/lib/chatMultiModel';
-import { WebSearchNode, WebSearchQueryNode } from './WebSearchNode';
-import { MemoryRetrievalNode } from './MemoryRetrievalNode';
-import { KnowledgeRetrievalNode } from './KnowledgeRetrievalNode';
-import { McpContainerNode } from './McpContainerNode';
+import { getConvIcon } from '@/lib/convIcon';
+import { normalizeAutoConversationTitle } from '@/lib/conversationTitle';
+import { invoke } from '@/lib/invoke';
+import { getRoleIntro } from '@/lib/roleIntro';
+import { parseSearchContent } from '@/lib/searchUtils';
+import { normalizeStoredMediaUrlsForPlatform } from '@/lib/storedMedia';
+import {
+  selectUiMultiModelDoneMessageIds,
+  selectUiMultiModelParentId,
+  selectUiPendingCompanionModels,
+  selectUiStreaming,
+  selectUiStreamingMessageId,
+  useAgentStore,
+  useConversationStore,
+  useMultiModelColumnLayoutStore,
+  useProviderStore,
+  useSettingsStore,
+} from '@/stores';
+import { MAX_LOADED_MESSAGES } from '@/stores/conversationStore';
+import { useUserProfileStore, type AvatarType } from '@/stores/userProfileStore';
+import type {
+  ConversationStats,
+  ConversationSummary,
+  Message,
+  MultiModelDisplayMode,
+} from '@/types';
+import { SyncOutlined } from '@ant-design/icons';
+import Actions from '@ant-design/x/es/actions';
+import Bubble from '@ant-design/x/es/bubble';
+import type { BubbleItemType, BubbleListRef, RoleType } from '@ant-design/x/es/bubble/interface';
+import type { PromptsItemType } from '@ant-design/x/es/prompts';
+import Prompts from '@ant-design/x/es/prompts';
+import type { InputRef } from 'antd';
+import {
+  Alert,
+  App,
+  Avatar,
+  Button,
+  Checkbox,
+  Dropdown,
+  Input,
+  Modal,
+  Popconfirm,
+  Popover,
+  Spin,
+  Tabs,
+  Tag,
+  Tooltip,
+  Typography,
+  theme,
+} from 'antd';
+import {
+  Bot,
+  ChartNoAxesColumn,
+  Check,
+  ChevronDown,
+  Code,
+  Copy,
+  FileCode,
+  FileImage,
+  Languages,
+  Lightbulb,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Pencil,
+  RotateCcw,
+  Scissors,
+  Share2,
+  Sparkles,
+  Trash2,
+  X,
+  Zap,
+} from 'lucide-react';
+import NodeRenderer, { type CodeBlockPreviewPayload } from 'markstream-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useChatChrome } from '@/lib/chatChrome';
+import { getContextErrorMessage } from '@/lib/contextErrorMessage';
+import { agentStatusText } from '@/lib/skillAvailability';
+import {
+  buildLaneColumns,
+  filterVersionsForLane,
+  selectLaneAnswer,
+  shouldHideMultiModelLayoutSwitcher,
+  shouldUseLaneWorkspace,
+  type LaneColumn,
+} from '@/lib/multiModelLanes';
+import { registerHighlight } from 'stream-markdown';
+import AskUserCard from './AskUserCard';
+import { ChatMessageRenderBoundary } from './ChatMessageRenderBoundary';
+import { ChatMinimap, MinimapScrollProvider } from './ChatMinimap';
+import { ChatScrollIndicator } from './ChatScrollIndicator';
+import { CodeBlockPreviewModal } from './CodeBlockPreviewModal';
+import { ConversationModelIcon } from './ConversationModelIcon';
+import { InputArea } from './InputArea';
+import { RoleIntroPanel } from './RoleIntroPanel';
+import { MessageAttachmentPreview } from './MessageAttachmentPreview';
+import { ModelSelector } from './ModelSelector';
+import { MultiModelAnswerFocusLayer } from './MultiModelAnswerFocusLayer';
+import { MultiModelColumnScroll } from './MultiModelColumnScroll';
+import { MultiModelDisplay } from './MultiModelDisplay';
+import { MultiModelLaneWorkspace } from './MultiModelLaneWorkspace';
+import { StreamingStatusIndicator } from './StreamingStatusIndicator';
+import PermissionCard from './PermissionCard';
+import { getChatCodeThemes, setCodeBlockPreviewHandler, setMermaidOpenModalHandler } from './chatMarkdownShared';
+import { normalizeAssistantBubbleParentKey, resolveAssistantMessageForBubbleKey } from './chatMessageLookup';
+import { collectRetainedChatCacheKeys, retainMapKeys, retainSetValues } from './chatRetainedCaches';
 import {
   CHAT_AUTO_SCROLL_BOTTOM_THRESHOLD,
+  CHAT_SCROLL_BOX_SELECTOR,
   CHAT_SCROLL_IS_REVERSED,
+  captureMessageScrollAnchor,
   getDistanceToHistoryTop,
-  getScrollTopAfterPrepend,
   hasMeasuredScrollLayoutChanged,
   hasScrollLayoutMetricsChanged,
+  isReversedScrollBox,
   resolveChatScrollElements,
+  restoreMessageScrollAnchor,
   shouldIgnoreScrollDepartureFromBottom,
   shouldKeepAutoScroll,
-  shouldStickToBottomOnLayoutChange,
   shouldShowScrollToBottom,
+  shouldStickToBottomOnLayoutChange,
 } from './chatScroll';
-import { formatTokenCount, formatSpeed, formatDuration } from '../gateway/tokenFormat';
 import {
-  THINKING_LOADING_MARKER,
   closeStreamingThinkBlock,
   getStreamingLoadingState,
-  getStreamingStatusPresentation,
   hasAqbotDisplayContent,
   hasModelVisibleContent,
   isAssistantStreamingForRender,
   shouldRenderAssistantMarkdownFromContent,
   shouldShowInitialStreamingDots,
   shouldShowInlineStreamingStatus,
-  splitLeadingAqbotDisplayContent,
-  stripLeadingAqbotDisplayTags,
-  type StreamActivity,
 } from './chatStreaming';
-import { useCopyToClipboard } from '@/hooks/useCopyToClipboard';
+import { formatChatTime } from './chatTime';
 import {
   buildAssistantDisplayContent,
   shouldHideAssistantBubble,
   splitAssistantErrorDisplayContent,
 } from './toolCallDisplay';
-import { resolveAssistantMessageForBubbleKey } from './chatMessageLookup';
-import { ChatScrollIndicator } from './ChatScrollIndicator';
-import { ChatMinimap, MinimapScrollProvider } from './ChatMinimap';
-import { MultiModelDisplay, LayoutSwitcher, type MultiModelDisplayMode } from './MultiModelDisplay';
-import { ConversationModelIcon } from './ConversationModelIcon';
-import PermissionCard from './PermissionCard';
-import AskUserCard from './AskUserCard';
-import { ChatImageNode } from './ChatImageNode';
-import { HtmlRenderNode } from './HtmlRenderNode';
-import { formatChatTime } from './chatTime';
-import { ChatMessageRenderBoundary } from './ChatMessageRenderBoundary';
-import { perfNow, perfTraceDuration } from '@/lib/perfTrace';
 
-import { invoke } from '@/lib/invoke';
-import { registerHighlight } from 'stream-markdown';
-import { useResolvedAvatarSrc } from '@/hooks/useResolvedAvatarSrc';
-import type { Message, Attachment, ConversationStats, ConversationSummary } from '@/types';
-
-// ── markstream-react custom thinking component ──────────────────────────
-
-const DEFAULT_LIGHT_CODE_BLOCK_THEME = 'github-light';
-const DEFAULT_DARK_CODE_BLOCK_THEME = 'poimandres';
-const HEAVY_MARKDOWN_CHAR_LIMIT = 20_000;
-const DANGEROUS_D2_STYLE_PATTERNS = [
-  /javascript:/i,
-  /expression\s*\(/i,
-  /url\s*\(\s*javascript:/i,
-  /@import/i,
-] as const;
-const SAFE_D2_URL_PATTERN = /^(?:https?:|mailto:|tel:|#|\/|data:image\/(?:png|gif|jpe?g|webp);)/i;
-const CHAT_D2_DARK_THEME_ID = 200;
-const CHAT_RENDER_BATCH_PROPS = {
-  viewportPriority: true,
-  deferNodesUntilVisible: false,
-  initialRenderBatchSize: 24,
-  renderBatchSize: 48,
-  renderBatchDelay: 24,
-  renderBatchBudgetMs: 4,
-  maxLiveNodes: 480,
-  liveNodeBuffer: 96,
-} as const;
-const MINIMAP_JUMP_BEFORE_LIMIT = 4;
-const MINIMAP_JUMP_AFTER_LIMIT = 8;
-const USER_SCROLL_INTENT_GRACE_MS = 250;
-
-function useLiveStreamContent(messageId: string | null | undefined, enabled: boolean): string | undefined {
-  const subscribedMessageId = enabled ? messageId : null;
-  return useSyncExternalStore(
-    useCallback(
-      (listener) => subscribeLiveStreamContent(subscribedMessageId, listener),
-      [subscribedMessageId],
-    ),
-    useCallback(
-      () => getLiveStreamContent(subscribedMessageId),
-      [subscribedMessageId],
-    ),
-    () => undefined,
-  );
-}
-
-function StreamingAssistantContent({
-  messageId,
-  baseContent,
-  isStreaming,
-  children,
-}: {
-  messageId: string | null | undefined;
-  baseContent: string;
-  isStreaming: boolean;
-  children: (content: string) => React.ReactNode;
-}) {
-  const liveContent = useLiveStreamContent(messageId, isStreaming);
-  return <>{children(liveContent ?? baseContent)}</>;
-}
-
-// ── Attachment preview component ────────────────────────────────────────
-
-const ATTACHMENT_IMG_STYLE: React.CSSProperties = {
-  maxWidth: 200,
-  maxHeight: 160,
-  borderRadius: 8,
-  objectFit: 'cover' as const,
-};
-
-function AttachmentPreview({ att, themeColor }: { att: Attachment; themeColor: string }) {
-  const { t } = useTranslation();
-  const { modal } = App.useApp();
-  const isImage = att.file_type?.startsWith('image/');
-  const [src, setSrc] = React.useState<string | null>(() => {
-    if (!isImage) return null;
-    if (att.data) return `data:${att.file_type};base64,${att.data}`;
-    return null;
-  });
-  const [failed, setFailed] = React.useState(false);
-  const [fileExists, setFileExists] = React.useState<boolean | null>(null);
-
-  // Check file existence for all attachments
-  React.useEffect(() => {
-    if (!att.file_path) { setFileExists(false); return; }
-    let cancelled = false;
-    invoke<boolean>('check_attachment_exists', { filePath: att.file_path })
-      .then((exists) => { if (!cancelled) setFileExists(exists); })
-      .catch(() => { if (!cancelled) setFileExists(false); });
-    return () => { cancelled = true; };
-  }, [att.file_path]);
-
-  // Load image preview (only if file exists)
-  React.useEffect(() => {
-    if (!isImage || src || failed) return;
-    if (!att.file_path || fileExists === false) { setFailed(true); return; }
-    if (fileExists === null) return; // still checking
-    let cancelled = false;
-    invoke<string>('read_attachment_preview', { filePath: att.file_path })
-      .then((dataUrl) => { if (!cancelled) setSrc(dataUrl); })
-      .catch(() => { if (!cancelled) setFailed(true); });
-    return () => { cancelled = true; };
-  }, [isImage, att.file_path, src, failed, fileExists]);
-
-  // Deleted/missing file — show red error tag, click to show location modal
-  if (fileExists === false) {
-    const showMissingModal = () => {
-      invoke<string>('resolve_attachment_path', { filePath: att.file_path })
-        .then((absPath) => {
-          modal.confirm({
-            icon: <CloseCircleFilled style={{ color: '#ff4d4f' }} />,
-            title: t('chat.attachmentNotFound'),
-            content: absPath,
-            okText: t('chat.attachmentOk'),
-            cancelText: t('chat.attachmentRevealLocation'),
-            onCancel: () => {
-              invoke('reveal_attachment_file', { filePath: att.file_path }).catch(() => {});
-            },
-          });
-        })
-        .catch(() => {
-          modal.error({
-            title: t('chat.attachmentNotFound'),
-            content: att.file_path || att.file_name,
-            okText: t('chat.attachmentOk'),
-          });
-        });
-    };
-    return (
-      <Tag
-        icon={<AlertCircle size={12} />}
-        color="error"
-        style={{ margin: 0, cursor: 'pointer' }}
-        onClick={showMissingModal}
-      >
-        {att.file_name}
-      </Tag>
-    );
-  }
-
-  // Still checking existence — show neutral loading tag
-  if (fileExists === null && !src) {
-    return (
-      <Tag
-        icon={isImage ? <FileImage size={12} /> : <Paperclip size={12} />}
-        style={{ margin: 0, cursor: 'default', opacity: 0.5 }}
-      >
-        {att.file_name}
-      </Tag>
-    );
-  }
-
-  if (isImage && src) {
-    return (
-      <Image
-        src={src}
-        alt={att.file_name}
-        style={ATTACHMENT_IMG_STYLE}
-        preview={{ mask: { blur: true }, scaleStep: 0.5 }}
-      />
-    );
-  }
-
-  const handleOpen = () => {
-    if (att.file_path) {
-      invoke('open_attachment_file', { filePath: att.file_path }).catch(() => {});
-    }
-  };
-
-  const handleReveal = () => {
-    if (att.file_path) {
-      invoke('reveal_attachment_file', { filePath: att.file_path }).catch(() => {});
-    }
-  };
-
-  const contextMenuItems = att.file_path
-    ? [
-        { key: 'open', label: t('chat.attachmentOpen'), onClick: handleOpen },
-        { key: 'reveal', label: t('chat.attachmentRevealInFinder'), onClick: handleReveal },
-      ]
-    : [];
-
-  const tag = (
-    <Tag
-      icon={isImage ? <FileImage size={12} /> : <Paperclip size={12} />}
-      color={themeColor}
-      style={{ margin: 0, cursor: att.file_path ? 'pointer' : 'default' }}
-      onClick={att.file_path ? handleOpen : undefined}
-    >
-      {att.file_name}
-    </Tag>
-  );
-
-  if (!att.file_path) return tag;
-
-  return (
-    <Dropdown menu={{ items: contextMenuItems }} trigger={['contextMenu']}>
-      {tag}
-    </Dropdown>
-  );
-}
-
-type CustomNodeAttrs =
-  | Record<string, string | boolean>
-  | [string, string][]
-  | Array<{ name: string; value: string | boolean }>
-  | null
-  | undefined;
-
-function normalizeCodeTheme(raw?: string) {
-  const t = raw?.trim();
-  if (t === 'vs-code' || t === 'vscode') return 'dark-plus';
-  if (t === 'one-dark') return 'one-dark-pro';
-  return t || undefined;
-}
-
-function getChatCodeThemes(selectedDarkTheme?: string, selectedLightTheme?: string) {
-  const darkTheme = normalizeCodeTheme(selectedDarkTheme) || DEFAULT_DARK_CODE_BLOCK_THEME;
-  const lightTheme = normalizeCodeTheme(selectedLightTheme) || DEFAULT_LIGHT_CODE_BLOCK_THEME;
-  return {
-    darkTheme,
-    lightTheme,
-    themes: Array.from(new Set([lightTheme, darkTheme])),
-  };
-}
-
-let _codeBlockPreviewHandler: ((payload: CodeBlockPreviewPayload) => void) | null = null;
-let _mermaidOpenModalHandler: ((svgString: string | null) => void) | null = null;
-
-function getChatCodeBlockProps(darkTheme: string, lightTheme: string) {
-  return {
-    darkTheme,
-    lightTheme,
-    renderHeaderActions: (ctx: CodeBlockActionContext) => (
-      <CodeBlockHeaderActions ctx={ctx} />
-    ),
-    onPreviewCode: (payload: CodeBlockPreviewPayload) => {
-      _codeBlockPreviewHandler?.(payload);
-    },
-  };
-}
-
-const CHAT_MERMAID_PROPS = {
-  renderHeaderActions: (ctx: MermaidBlockActionContext) => (
-    <MermaidBlockHeaderActions ctx={ctx} />
-  ),
-  renderModeToggle: (ctx: MermaidBlockActionContext) => (
-    <DiagramModeToggle showSource={ctx.showSource} onSwitchMode={ctx.switchMode} />
-  ),
-  renderZoomControls: (ctx: MermaidBlockActionContext) => (
-    <MermaidZoomControls ctx={ctx} />
-  ),
-  onOpenModal: (ev: { preventDefault: () => void; svgString?: string | null }) => {
-    if (_mermaidOpenModalHandler) {
-      ev.preventDefault();
-      _mermaidOpenModalHandler(ev.svgString ?? null);
-    }
-  },
-};
-
-const CHAT_INFOGRAPHIC_PROPS = {
-  renderHeaderActions: (ctx: InfographicBlockActionContext) => (
-    <InfographicBlockHeaderActions ctx={ctx} />
-  ),
-  renderModeToggle: (ctx: InfographicBlockActionContext) => (
-    <DiagramModeToggle showSource={ctx.showSource} onSwitchMode={ctx.switchMode} />
-  ),
-  renderZoomControls: (ctx: InfographicBlockActionContext) => (
-    <MermaidZoomControls ctx={ctx as any} />
-  ),
-};
-
-function getCustomAttr(attrs: CustomNodeAttrs, name: string): string | undefined {
-  if (!attrs) return undefined;
-
-  if (Array.isArray(attrs)) {
-    for (const attr of attrs) {
-      if (Array.isArray(attr)) {
-        const [attrName, value] = attr;
-        if (attrName === name) return value;
-        continue;
-      }
-
-      if (attr && typeof attr === 'object' && 'name' in attr && attr.name === name) {
-        return typeof attr.value === 'string' ? attr.value : undefined;
-      }
-    }
-    return undefined;
-  }
-
-  const value = attrs[name];
-  return typeof value === 'string' ? value : undefined;
-}
-
-function isChatD2CodeBlockNode(node: ChatMarkdownNode): node is ChatD2CodeBlockNode {
-  return node.type === 'code_block'
-    && 'code' in node
-    && typeof node.code === 'string'
-    && (!('language' in node) || typeof node.language === 'string' || typeof node.language === 'undefined');
-}
-
-function getSingleD2CodeBlockNode(nodes?: ChatMarkdownNode[]) {
-  if (!nodes || nodes.length !== 1) return null;
-
-  const [firstNode] = nodes;
-  if (!isChatD2CodeBlockNode(firstNode) || firstNode.language?.trim().toLowerCase() !== 'd2') {
-    return null;
-  }
-
-  return firstNode;
-}
-
-function containsDeferredHeavyNode(nodes?: ChatMarkdownNode[]) {
-  if (!nodes) return false;
-
-  const stack: unknown[] = [...nodes];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current || typeof current !== 'object') {
-      continue;
-    }
-
-    if ('type' in current && current.type === 'code_block') {
-      return true;
-    }
-
-    for (const value of Object.values(current)) {
-      if (Array.isArray(value)) {
-        stack.push(...value);
-      }
-    }
-  }
-
-  return false;
-}
-
-function isStandaloneD2Fence(content: string) {
-  return /^\s*```[ \t]*d2[^\n]*\n[\s\S]*\n```[ \t]*\s*$/i.test(content);
-}
-
-function shouldDeferAssistantMarkdownParse(content: string) {
-  return content.length > HEAVY_MARKDOWN_CHAR_LIMIT || (content.includes('```') && !isStandaloneD2Fence(content));
-}
-
-function sanitizeD2Url(url: string) {
-  const value = url.trim();
-  return SAFE_D2_URL_PATTERN.test(value) ? value : '';
-}
-
-function sanitizeD2Svg(svg: string) {
-  if (typeof document === 'undefined' || typeof DOMParser === 'undefined') {
-    return '';
-  }
-
-  const sanitizeTree = (root: Element) => {
-    const blockedTags = new Set(['script']);
-    const nodes = [root, ...Array.from(root.querySelectorAll('*'))];
-
-    for (const element of nodes) {
-      if (blockedTags.has(element.tagName.toLowerCase())) {
-        element.remove();
-        continue;
-      }
-
-      for (const attr of Array.from(element.attributes)) {
-        const name = attr.name;
-        if (/^on/i.test(name)) {
-          element.removeAttribute(name);
-          continue;
-        }
-
-        if (name === 'style' && attr.value && DANGEROUS_D2_STYLE_PATTERNS.some((pattern) => pattern.test(attr.value))) {
-          element.removeAttribute(name);
-          continue;
-        }
-
-        if ((name === 'href' || name === 'xlink:href') && attr.value) {
-          const safeUrl = sanitizeD2Url(attr.value);
-          if (!safeUrl) {
-            element.removeAttribute(name);
-            continue;
-          }
-          if (safeUrl !== attr.value) {
-            element.setAttribute(name, safeUrl);
-          }
-        }
-      }
-    }
-  };
-
-  const normalizedSvg = svg
-    .replace(/["']\s*javascript:/gi, '#')
-    .replace(/\bjavascript:/gi, '#')
-    .replace(/["']\s*vbscript:/gi, '#')
-    .replace(/\bvbscript:/gi, '#')
-    .replace(/\bdata:text\/html/gi, '#');
-
-  const xmlRoot = new DOMParser().parseFromString(normalizedSvg, 'image/svg+xml').documentElement;
-  if (xmlRoot && xmlRoot.nodeName.toLowerCase() === 'svg') {
-    sanitizeTree(xmlRoot);
-    return xmlRoot.outerHTML;
-  }
-
-  const container = document.createElement('div');
-  container.innerHTML = normalizedSvg;
-  const htmlSvg = container.querySelector('svg');
-  if (!htmlSvg) {
-    return '';
-  }
-
-  sanitizeTree(htmlSvg);
-  return htmlSvg.outerHTML;
-}
-
-type ChatD2Instance = {
-  compile: (source: string) => Promise<unknown>;
-  render: (diagram: unknown, options?: unknown) => Promise<unknown>;
-};
-
-type ChatD2Constructor = new () => ChatD2Instance;
-
-let chatD2CtorPromise: Promise<ChatD2Constructor> | null = null;
-
-async function loadChatD2Ctor() {
-  if (!chatD2CtorPromise) {
-    chatD2CtorPromise = import('@terrastruct/d2').then((module) => {
-      if (typeof module.D2 !== 'function') {
-        throw new Error('Failed to resolve D2 constructor from @terrastruct/d2.');
-      }
-
-      return module.D2 as ChatD2Constructor;
-    });
-  }
-
-  return chatD2CtorPromise;
-}
-
-function ThinkNode(props: NodeComponentProps<{
-  type: 'think';
-  content: string;
-  attrs?: CustomNodeAttrs;
-}>) {
-  const { t } = useTranslation();
-  const selectedDarkCodeTheme = useSettingsStore((s) => s.settings.code_theme);
-  const selectedLightCodeTheme = useSettingsStore((s) => s.settings.code_theme_light);
-  const codeFontFamily = useSettingsStore((s) => s.settings.code_font_family);
-  const { node, ctx } = props;
-  const thinkingNodesCacheRef = useRef<Map<string, ChatMarkdownNode[]>>(new Map());
-  const rawThinkingContent = String(node.content ?? '');
-  const isStreaming = rawThinkingContent.includes(THINKING_LOADING_MARKER);
-  const totalMsAttr = getCustomAttr(node.attrs, 'totalMs') ?? getCustomAttr(node.attrs, 'totalms');
-  const totalMs = totalMsAttr ? parseInt(totalMsAttr, 10) : null;
-  const thinkingContent = rawThinkingContent
-    .replace(`${THINKING_LOADING_MARKER}\n`, '')
-    .replace(THINKING_LOADING_MARKER, '');
-  const [expanded, setExpanded] = useState(isStreaming);
-  const prevStreamingRef = useRef(isStreaming);
-
-  useEffect(() => {
-    setExpanded(isStreaming);
-    prevStreamingRef.current = isStreaming;
-  }, [isStreaming]);
-
-  useEffect(() => {
-    if (isStreaming) {
-      setExpanded(true);
-    } else if (prevStreamingRef.current) {
-      setExpanded(false);
-    }
-    prevStreamingRef.current = isStreaming;
-  }, [isStreaming]);
-
-  const title = isStreaming
-    ? t('chat.thinkingInProgress')
-    : totalMs && !isNaN(totalMs)
-      ? `${t('chat.thinkingComplete')} ${formatDuration(totalMs)}`
-      : t('chat.thinkingComplete');
-
-  const thinkingNodes = useMemo(() => {
-    const cache = thinkingNodesCacheRef.current;
-    const cached = cache.get(thinkingContent);
-    if (cached) return cached;
-
-    const parsed = safeParseChatMarkdown(thinkingContent);
-    cache.set(thinkingContent, parsed);
-    if (cache.size > 24) {
-      const firstKey = cache.keys().next().value;
-      if (firstKey) cache.delete(firstKey);
-    }
-    return parsed;
-  }, [thinkingContent]);
-  const { darkTheme, lightTheme, themes } = useMemo(
-    () => getChatCodeThemes(selectedDarkCodeTheme, selectedLightCodeTheme),
-    [selectedDarkCodeTheme, selectedLightCodeTheme],
-  );
-  const codeBlockProps = useMemo(
-    () => getChatCodeBlockProps(darkTheme, lightTheme),
-    [darkTheme, lightTheme],
-  );
-  const codeBlockMonacoOptions = useMemo(
-    () => codeFontFamily ? { fontFamily: codeFontFamily } : undefined,
-    [codeFontFamily],
-  );
-  const rendererKey = `${ctx?.customId ?? 'default'}:${ctx?.isDark ? 'dark' : 'light'}:${darkTheme}:${lightTheme}`;
-
-  return (
-    <Think
-      title={title}
-      blink={isStreaming}
-      loading={isStreaming ? (
-        <SyncOutlined style={{ fontSize: 12, animation: 'aqbot-think-spin 1s linear infinite' }} />
-      ) : false}
-      icon={<Brain size={14} />}
-      expanded={expanded}
-      onExpand={setExpanded}
-    >
-      <NodeRenderer
-        key={rendererKey}
-        nodes={thinkingNodes}
-        customId={ctx?.customId}
-        isDark={ctx?.isDark}
-        final={!isStreaming}
-        typewriter={false}
-        themes={themes}
-        codeBlockLightTheme={lightTheme}
-        codeBlockDarkTheme={darkTheme}
-        codeBlockProps={codeBlockProps}
-        codeBlockMonacoOptions={codeBlockMonacoOptions}
-        customHtmlTags={CHAT_CUSTOM_HTML_TAGS.filter((t) => t !== 'think')}
-        mermaidProps={CHAT_MERMAID_PROPS}
-        infographicProps={CHAT_INFOGRAPHIC_PROPS}
-        {...CHAT_RENDER_BATCH_PROPS}
-      />
-    </Think>
-  );
-}
-
-type ChatD2CodeBlockNode = {
-  type: 'code_block';
-  language?: string;
-  code: string;
-  raw: string;
-  loading?: boolean;
-};
-
-function ChatD2BlockNode({
-  node,
-  isDark,
-}: {
-  node: ChatD2CodeBlockNode;
-  isDark?: boolean;
-}) {
-  const { token } = theme.useToken();
-  const { t } = useTranslation();
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const [showSource, setShowSource] = useState(false);
-  const [isCollapsed, setIsCollapsed] = useState(false);
-  const { copy: copyD2, isCopied: d2Copied } = useCopyToClipboard({ timeout: 1000 });
-  const [svgMarkup, setSvgMarkup] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [canRenderPreview, setCanRenderPreview] = useState(false);
-  const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
-
-  useEffect(() => {
-    setCanRenderPreview(false);
-    if (showSource) return;
-
-    const element = containerRef.current;
-    if (!element || typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') {
-      setCanRenderPreview(true);
-      return;
-    }
-
-    let frameId = 0;
-    let timeoutId: number | null = null;
-    const win = window as Window & {
-      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
-      cancelIdleCallback?: (handle: number) => void;
-    };
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries[0]?.isIntersecting) return;
-      observer.disconnect();
-      frameId = window.requestAnimationFrame(() => {
-        if (typeof win.requestIdleCallback === 'function') {
-          timeoutId = win.requestIdleCallback(() => setCanRenderPreview(true), { timeout: 250 });
-          return;
-        }
-        timeoutId = window.setTimeout(() => setCanRenderPreview(true), 0);
-      });
-    }, { rootMargin: '160px 0px' });
-
-    observer.observe(element);
-    return () => {
-      observer.disconnect();
-      window.cancelAnimationFrame(frameId);
-      if (timeoutId !== null) {
-        if (typeof win.cancelIdleCallback === 'function') {
-          win.cancelIdleCallback(timeoutId);
-        } else {
-          window.clearTimeout(timeoutId);
-        }
-      }
-    };
-  }, [node.code, showSource]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!canRenderPreview || showSource) {
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    const renderD2 = async () => {
-      const source = String(node.code ?? '');
-      if (!source) {
-        setSvgMarkup('');
-        setError(null);
-        return;
-      }
-
-      setError(null);
-
-      try {
-        const D2Ctor = await loadChatD2Ctor();
-        const instance = new D2Ctor();
-        const compiled = await instance.compile(source) as {
-          diagram?: unknown;
-          renderOptions?: Record<string, unknown>;
-          options?: Record<string, unknown>;
-        } | unknown;
-        const diagram = typeof compiled === 'object' && compiled !== null && 'diagram' in compiled
-          ? compiled.diagram
-          : compiled;
-        const renderOptions = typeof compiled === 'object' && compiled !== null
-          ? ('renderOptions' in compiled && compiled.renderOptions) || ('options' in compiled && compiled.options) || {}
-          : {};
-        const nextRenderOptions = typeof renderOptions === 'object' && renderOptions !== null
-          ? { ...renderOptions as Record<string, unknown> }
-          : {};
-
-        if (isDark) {
-          nextRenderOptions.themeID = typeof nextRenderOptions.darkThemeID === 'number'
-            ? nextRenderOptions.darkThemeID
-            : CHAT_D2_DARK_THEME_ID;
-          nextRenderOptions.darkThemeID = null;
-          nextRenderOptions.darkThemeOverrides = null;
-          nextRenderOptions.themeOverrides = {
-            N1: token.colorText,
-            N2: token.colorTextSecondary,
-            N3: token.colorTextTertiary,
-            N4: token.colorTextQuaternary,
-            N5: token.colorBorder,
-            N6: token.colorBorderSecondary,
-            N7: token.colorBgContainer,
-            B1: token.colorText,
-            B2: token.colorTextSecondary,
-            B3: token.colorTextTertiary,
-            B4: token.colorBorder,
-            B5: token.colorBorderSecondary,
-            B6: token.colorBgElevated,
-            AA2: token.colorTextSecondary,
-            AA4: token.colorTextTertiary,
-            AA5: token.colorBorder,
-            AB4: token.colorTextSecondary,
-            AB5: token.colorTextTertiary,
-            ...(typeof nextRenderOptions.themeOverrides === 'object' && nextRenderOptions.themeOverrides !== null
-              ? nextRenderOptions.themeOverrides as Record<string, unknown>
-              : {}),
-          };
-        }
-
-        const rendered = await instance.render(diagram, nextRenderOptions);
-        const rawSvg = typeof rendered === 'string'
-          ? rendered
-          : typeof rendered === 'object' && rendered !== null && 'svg' in rendered && typeof rendered.svg === 'string'
-            ? rendered.svg
-            : typeof rendered === 'object' && rendered !== null && 'data' in rendered && typeof rendered.data === 'string'
-              ? rendered.data
-              : '';
-
-        if (!rawSvg) {
-          throw new Error('D2 render returned empty output.');
-        }
-
-        const sanitizedSvg = sanitizeD2Svg(rawSvg);
-        if (!sanitizedSvg) {
-          throw new Error('D2 SVG sanitization failed in the current WebView.');
-        }
-
-        if (cancelled) return;
-        setSvgMarkup(sanitizedSvg);
-      } catch (renderError) {
-        if (cancelled) return;
-        setSvgMarkup('');
-        setError(renderError instanceof Error ? renderError.message : 'D2 render failed.');
-      }
-    };
-
-    void renderD2();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [canRenderPreview, isDark, node.code, showSource, token.colorBgContainer, token.colorBgElevated, token.colorBorder, token.colorBorderSecondary, token.colorText, token.colorTextQuaternary, token.colorTextSecondary, token.colorTextTertiary]);
-
-
-  const handleExport = useCallback(() => {
-    if (!svgMarkup) return;
-
-    const blob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `d2-diagram-${Date.now()}.svg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-  }, [svgMarkup]);
-
-  const shellStyle = useMemo(() => ({
-    borderColor: isDark ? token.colorBorderSecondary : token.colorBorderSecondary,
-    background: isDark ? token.colorBgElevated : token.colorBgContainer,
-    color: token.colorText,
-  }), [isDark, token.colorBgContainer, token.colorBgElevated, token.colorBorderSecondary, token.colorText]);
-
-  const headerStyle = useMemo(() => ({
-    color: token.colorText,
-    backgroundColor: isDark ? token.colorBgContainer : token.colorFillAlter,
-    borderBottomColor: token.colorBorderSecondary,
-  }), [isDark, token.colorBgContainer, token.colorBorderSecondary, token.colorFillAlter, token.colorText]);
-
-  const getD2BtnStyle = useCallback((idx: number): React.CSSProperties => ({
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: 28,
-    height: 28,
-    borderRadius: token.borderRadiusSM,
-    border: 'none',
-    background: hoveredIdx === idx ? (token.colorFillSecondary || 'rgba(255,255,255,0.1)') : 'transparent',
-    color: hoveredIdx === idx ? token.colorText : token.colorTextSecondary,
-    cursor: 'pointer',
-    padding: 0,
-    transition: 'color 0.2s, background 0.2s',
-  }), [hoveredIdx, token]);
-
-  const previewStyle = useMemo(() => ({
-    background: isDark ? token.colorBgContainer : token.colorBgElevated,
-  }), [isDark, token.colorBgContainer, token.colorBgElevated]);
-
-  return (
-    <div ref={containerRef} className="d2-block my-4 rounded-lg border overflow-hidden shadow-sm" style={shellStyle}>
-      <div
-        className="d2-block-header flex justify-between items-center px-4 py-1.5 border-b border-gray-400/5"
-        style={headerStyle}
-      >
-        <div className="flex items-center gap-x-2">
-          <span className="text-sm font-medium font-mono">D2</span>
-        </div>
-        <div className="flex items-center gap-x-2">
-          <DiagramModeToggle
-            showSource={showSource}
-            onSwitchMode={(mode) => setShowSource(mode === 'source')}
-          />
-          {/* Collapse */}
-          <Tooltip title={isCollapsed ? t('common.expand') : t('common.collapse')} mouseEnterDelay={0.4}>
-            <button type="button" style={getD2BtnStyle(0)} onClick={() => setIsCollapsed(v => !v)}
-              onMouseEnter={() => setHoveredIdx(0)} onMouseLeave={() => setHoveredIdx(null)}>
-              <ChevronRight
-                size={14}
-                style={{
-                  transform: isCollapsed ? 'rotate(0deg)' : 'rotate(90deg)',
-                  transition: 'transform 0.2s',
-                }}
-              />
-            </button>
-          </Tooltip>
-          {/* Copy */}
-          <Tooltip title={d2Copied ? t('common.copied') : t('common.copy')} mouseEnterDelay={0.4}>
-            <button type="button" style={getD2BtnStyle(1)} onClick={() => void copyD2(node.code)}
-              onMouseEnter={() => setHoveredIdx(1)} onMouseLeave={() => setHoveredIdx(null)}>
-              {d2Copied ? <Check size={14} style={{ color: token.colorSuccess }} /> : <Copy size={14} />}
-            </button>
-          </Tooltip>
-          {/* Export */}
-          {svgMarkup ? (
-            <Tooltip title={t('common.export')} mouseEnterDelay={0.4}>
-              <button type="button" style={getD2BtnStyle(2)} onClick={handleExport}
-                onMouseEnter={() => setHoveredIdx(2)} onMouseLeave={() => setHoveredIdx(null)}>
-                <Download size={14} />
-              </button>
-            </Tooltip>
-          ) : null}
-        </div>
-      </div>
-
-      {!isCollapsed && (
-        <div className="d2-block-body">
-          {showSource || (!svgMarkup && !!error) ? (
-            <div className="d2-source px-4 py-4">
-              <pre className="d2-code"><code>{node.code}</code></pre>
-              {error ? <p className="d2-error mt-2 text-xs">{error}</p> : null}
-            </div>
-          ) : (
-            <div className="d2-render" style={previewStyle}>
-              {svgMarkup ? (
-                <div className="d2-svg" dangerouslySetInnerHTML={{ __html: svgMarkup }} />
-              ) : (
-                <div className="flex items-center justify-center px-4 py-10" style={{ color: token.colorTextSecondary, gap: 8 }}>
-                  <SyncOutlined spin />
-                  <span className="text-sm">{canRenderPreview ? t('chat.renderingChart') : t('chat.chartAboutToRender')}</span>
-                </div>
-              )}
-              {error ? <p className="d2-error px-4 pb-3 text-xs">{error}</p> : null}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ChatD2Node(props: NodeComponentProps<ChatD2CodeBlockNode>) {
-  const { node, ctx } = props;
-  return <ChatD2BlockNode node={node} isDark={ctx?.isDark} />;
-}
-
-// ── Inline tool-call node (renders inside markdown content flow) ──────
-
-const toolCallIcons: Record<string, React.ReactNode> = {
-  bash: <Code size={14} />,
-  write: <FileCode size={14} />,
-  read: <FileText size={14} />,
-  edit: <FileCode size={14} />,
-  glob: <FileType size={14} />,
-  grep: <FileText size={14} />,
-  ls: <FileType size={14} />,
-};
-
-function getInlineToolIcon(toolName: string): React.ReactNode {
-  const lower = toolName.toLowerCase();
-  for (const [key, icon] of Object.entries(toolCallIcons)) {
-    if (lower.includes(key)) return icon;
-  }
-  return <Zap size={14} />;
-}
-
-const toolCallStatusColors: Record<string, string> = {
-  queued: '#faad14',
-  running: '#1890ff',
-  success: '#52c41a',
-  failed: '#ff4d4f',
-  cancelled: '#8c8c8c',
-};
-
-function ToolCallNode(props: NodeComponentProps<{
-  type: 'tool-call';
-  content: string;
-  attrs?: CustomNodeAttrs;
-}>) {
-  const { node } = props;
-  const { token } = theme.useToken();
-  const { t } = useTranslation();
-  const toolCalls = useAgentStore((s) => s.toolCalls);
-  const [expanded, setExpanded] = useState(false);
-
-  const execId = getCustomAttr(node.attrs, 'id') ?? '';
-  const toolName = getCustomAttr(node.attrs, 'name') ?? '';
-  const summary = String(node.content ?? '');
-
-  const tc = toolCalls[execId];
-  const status = tc?.executionStatus ?? 'success';
-  const statusColor = toolCallStatusColors[status] || token.colorTextSecondary;
-  const isLoading = status === 'queued' || status === 'running';
-  const hasDetails = tc && (tc.input || tc.output);
-
-  return (
-    <div style={{ margin: '4px 0' }}>
-      <div
-        onClick={() => hasDetails && setExpanded(!expanded)}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 8,
-          padding: '4px 10px',
-          borderRadius: token.borderRadius,
-          backgroundColor: token.colorFillQuaternary,
-          border: `1px solid ${token.colorBorderSecondary}`,
-          fontSize: 13,
-          lineHeight: '20px',
-          fontFamily: 'monospace',
-          cursor: hasDetails ? 'pointer' : 'default',
-          userSelect: 'none',
-        }}
-      >
-        <span style={{ color: statusColor, display: 'flex', alignItems: 'center', flexShrink: 0 }}>
-          {getInlineToolIcon(toolName)}
-        </span>
-        <span style={{ fontWeight: 500, flexShrink: 0 }}>{toolName}</span>
-        {summary && (
-          <>
-            <span style={{ color: token.colorTextQuaternary }}>›</span>
-            <Typography.Text
-              type="secondary"
-              ellipsis
-              style={{ fontSize: 12, flex: 1, minWidth: 0 }}
-            >
-              {summary}
-            </Typography.Text>
-          </>
-        )}
-        {isLoading ? (
-          <SyncOutlined style={{ fontSize: 12, color: statusColor }} spin />
-        ) : (
-          <span
-            style={{
-              width: 6,
-              height: 6,
-              borderRadius: '50%',
-              backgroundColor: statusColor,
-              flexShrink: 0,
-            }}
-          />
-        )}
-        {hasDetails && (
-          <span style={{ color: token.colorTextSecondary, display: 'flex', alignItems: 'center', flexShrink: 0, transition: 'transform 0.2s', transform: expanded ? 'rotate(180deg)' : 'rotate(0deg)' }}>
-            <ChevronDown size={14} />
-          </span>
-        )}
-      </div>
-      {expanded && hasDetails && (
-        <div
-          style={{
-            margin: '2px 0 0',
-            padding: '6px 10px',
-            borderRadius: token.borderRadius,
-            backgroundColor: token.colorFillQuaternary,
-            border: `1px solid ${token.colorBorderSecondary}`,
-            borderTop: 'none',
-            fontSize: 12,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 4,
-          }}
-        >
-          {tc.input && Object.keys(tc.input).length > 0 && (
-            <details style={{ margin: 0 }}>
-              <summary style={{ fontSize: 12, color: token.colorTextSecondary, cursor: 'pointer', userSelect: 'none' }}>
-                {t('chat.inspector.toolInput', '输入参数')}
-              </summary>
-              <pre
-                style={{
-                  margin: '4px 0 0',
-                  padding: 8,
-                  fontSize: 11,
-                  fontFamily: 'monospace',
-                  backgroundColor: token.colorBgTextHover,
-                  borderRadius: token.borderRadius,
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all',
-                  maxHeight: 200,
-                  overflow: 'auto',
-                }}
-              >
-                {JSON.stringify(tc.input, null, 2)}
-              </pre>
-            </details>
-          )}
-          {tc.output && (
-            <details style={{ margin: 0 }}>
-              <summary style={{ fontSize: 12, color: token.colorTextSecondary, cursor: 'pointer', userSelect: 'none' }}>
-                {t('chat.inspector.toolOutput', '执行结果')}
-              </summary>
-              <pre
-                style={{
-                  margin: '4px 0 0',
-                  padding: 8,
-                  fontSize: 11,
-                  fontFamily: 'monospace',
-                  backgroundColor: token.colorBgTextHover,
-                  borderRadius: token.borderRadius,
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all',
-                  maxHeight: 200,
-                  overflow: 'auto',
-                  color: tc.isError ? token.colorError : undefined,
-                }}
-              >
-                {tc.output}
-              </pre>
-            </details>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-setCustomComponents('chat', { think: ThinkNode, 'web-search-query': WebSearchQueryNode, 'web-search': WebSearchNode, 'knowledge-retrieval': KnowledgeRetrievalNode, 'memory-retrieval': MemoryRetrievalNode, 'tool-call': ToolCallNode, 'html-render': withMarkstreamComponentDisplay(HtmlRenderNode, 'block'), d2: ChatD2Node, vmr_container: McpContainerNode, image: ChatImageNode, img: ChatImageNode });
-
-function stripAssistantAqbotTags(content: string) {
-  return stripAqbotTags(content, { stripThink: true });
-}
-
-function stripUserAqbotTags(content: string) {
-  return stripAqbotTags(content, { stripThink: false });
-}
-
-function PlainTextChatContent({
-  content,
-  textAlign,
-}: {
-  content: string;
-  textAlign?: React.CSSProperties['textAlign'];
-}) {
-  return (
-    <div className="aqbot-chat-text" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', textAlign }}>
-      {content}
-    </div>
-  );
-}
-
-function MessageRenderFallback({
-  content,
-  notice,
-  textAlign,
-}: {
-  content: string;
-  notice: string;
-  textAlign?: React.CSSProperties['textAlign'];
-}) {
-  return (
-    <div>
-      <Alert type="warning" message={notice} showIcon style={{ marginBottom: 8 }} />
-      <PlainTextChatContent content={content} textAlign={textAlign} />
-    </div>
-  );
-}
-
-const AssistantMarkdown = React.memo(function AssistantMarkdown({
-  content,
-  nodes,
-  isDarkMode,
-  isStreaming,
-  codeBlockDarkTheme,
-  codeBlockLightTheme,
-  codeBlockThemes,
-  codeFontFamily,
-  displayPrefix,
-}: {
-  content: string;
-  nodes?: ChatMarkdownNode[];
-  isDarkMode: boolean;
-  isStreaming: boolean;
-  codeBlockDarkTheme: string;
-  codeBlockLightTheme: string;
-  codeBlockThemes: string[];
-  codeFontFamily?: string;
-  displayPrefix?: string;
-}) {
-  const { token } = theme.useToken();
-  const { t } = useTranslation();
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const codeBlockProps = useMemo(
-    () => getChatCodeBlockProps(codeBlockDarkTheme, codeBlockLightTheme),
-    [codeBlockDarkTheme, codeBlockLightTheme],
-  );
-  const codeBlockMonacoOptions = useMemo(
-    () => codeFontFamily ? { fontFamily: codeFontFamily } : undefined,
-    [codeFontFamily],
-  );
-  const singleD2Node = useMemo(() => getSingleD2CodeBlockNode(nodes), [nodes]);
-  const hasDeferredHeavyNodes = useMemo(
-    () => !isStreaming && (containsDeferredHeavyNode(nodes) || shouldDeferAssistantMarkdownParse(content)),
-    [content, nodes, isStreaming],
-  );
-  const [readyToRenderHeavyNodes, setReadyToRenderHeavyNodes] = useState(!hasDeferredHeavyNodes);
-  const rendererKey = `${isDarkMode ? 'dark' : 'light'}:${codeBlockDarkTheme}:${codeBlockLightTheme}`;
-  const contentWithoutExplicitDisplay = useMemo(() => (
-    displayPrefix
-      ? stripLeadingAqbotDisplayTags(normalizeThinkTagsForMarkdown(content), ['knowledge-retrieval', 'memory-retrieval'])
-      : normalizeThinkTagsForMarkdown(content)
-  ), [content, displayPrefix]);
-  const displaySplit = useMemo(() => {
-    if (nodes) return { prefix: displayPrefix ?? '', body: normalizeThinkTagsForMarkdown(content) };
-    const split = splitLeadingAqbotDisplayContent(contentWithoutExplicitDisplay);
-    return {
-      prefix: `${split.prefix}${displayPrefix ?? ''}`,
-      body: split.body,
-    };
-  }, [content, contentWithoutExplicitDisplay, displayPrefix, nodes]);
-  const displayPrefixNodes = useMemo(() => (
-    displaySplit.prefix
-      ? safeParseChatMarkdown(displaySplit.prefix)
-      : undefined
-  ), [displaySplit.prefix]);
-  const rendererContent = useMemo(
-    () => normalizeHtmlRenderContent(displaySplit.body, { final: !isStreaming }),
-    [displaySplit.body, isStreaming],
-  );
-
-  useEffect(() => {
-    if (!hasDeferredHeavyNodes) {
-      setReadyToRenderHeavyNodes(true);
-      return;
-    }
-
-    setReadyToRenderHeavyNodes(false);
-    const element = containerRef.current;
-    if (!element || typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') {
-      setReadyToRenderHeavyNodes(true);
-      return;
-    }
-
-    let frameId = 0;
-    let timeoutId: number | null = null;
-    const win = window as Window & {
-      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
-      cancelIdleCallback?: (handle: number) => void;
-    };
-    const observer = new IntersectionObserver((entries) => {
-      if (!entries[0]?.isIntersecting) return;
-      observer.disconnect();
-      frameId = window.requestAnimationFrame(() => {
-        if (typeof win.requestIdleCallback === 'function') {
-          timeoutId = win.requestIdleCallback(() => setReadyToRenderHeavyNodes(true), { timeout: 250 });
-          return;
-        }
-        timeoutId = window.setTimeout(() => setReadyToRenderHeavyNodes(true), 0);
-      });
-    }, { rootMargin: '160px 0px' });
-
-    observer.observe(element);
-    return () => {
-      observer.disconnect();
-      window.cancelAnimationFrame(frameId);
-      if (timeoutId !== null) {
-        if (typeof win.cancelIdleCallback === 'function') {
-          win.cancelIdleCallback(timeoutId);
-        } else {
-          window.clearTimeout(timeoutId);
-        }
-      }
-    };
-  }, [content, hasDeferredHeavyNodes]);
-
-  if (singleD2Node) {
-    return (
-      <ChatD2BlockNode
-        key={`d2:${rendererKey}`}
-        node={singleD2Node}
-        isDark={isDarkMode}
-      />
-    );
-  }
-
-  if (hasDeferredHeavyNodes && !readyToRenderHeavyNodes) {
-    return (
-      <div className="aqbot-chat-markdown">
-        <div
-          ref={containerRef}
-          className="my-4 rounded-lg border"
-          style={{
-            borderColor: token.colorBorderSecondary,
-            background: isDarkMode ? token.colorBgContainer : token.colorBgElevated,
-          }}
-        >
-          <div
-            className="flex items-center justify-center px-4 py-10"
-            style={{ color: token.colorTextSecondary, gap: 8 }}
-          >
-            <SyncOutlined spin />
-            <span className="text-sm">{t('chat.loadingRenderContent')}</span>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="aqbot-chat-markdown">
-      {nodes ? (
-        <NodeRenderer
-          key={rendererKey}
-          nodes={nodes}
-          isDark={isDarkMode}
-          customId="chat"
-          customHtmlTags={CHAT_CUSTOM_HTML_TAGS}
-          final={!isStreaming}
-          typewriter={false}
-          themes={codeBlockThemes}
-          codeBlockLightTheme={codeBlockLightTheme}
-          codeBlockDarkTheme={codeBlockDarkTheme}
-          codeBlockProps={codeBlockProps}
-          codeBlockMonacoOptions={codeBlockMonacoOptions}
-          mermaidProps={CHAT_MERMAID_PROPS}
-          infographicProps={CHAT_INFOGRAPHIC_PROPS}
-          {...CHAT_RENDER_BATCH_PROPS}
-        />
-      ) : (
-        <>
-          {displayPrefixNodes && (
-            <NodeRenderer
-              key={`${rendererKey}:display-prefix`}
-              nodes={displayPrefixNodes}
-              isDark={isDarkMode}
-              customId="chat"
-              customHtmlTags={CHAT_CUSTOM_HTML_TAGS}
-              final
-              typewriter={false}
-              themes={codeBlockThemes}
-              codeBlockLightTheme={codeBlockLightTheme}
-              codeBlockDarkTheme={codeBlockDarkTheme}
-              codeBlockProps={codeBlockProps}
-              codeBlockMonacoOptions={codeBlockMonacoOptions}
-              mermaidProps={CHAT_MERMAID_PROPS}
-              infographicProps={CHAT_INFOGRAPHIC_PROPS}
-              {...CHAT_RENDER_BATCH_PROPS}
-            />
-          )}
-          {rendererContent && (
-            <NodeRenderer
-              key={rendererKey}
-              content={rendererContent}
-              isDark={isDarkMode}
-              customId="chat"
-              customHtmlTags={CHAT_CUSTOM_HTML_TAGS}
-              final={!isStreaming}
-              typewriter={false}
-              themes={codeBlockThemes}
-              codeBlockLightTheme={codeBlockLightTheme}
-              codeBlockDarkTheme={codeBlockDarkTheme}
-              codeBlockProps={codeBlockProps}
-              codeBlockMonacoOptions={codeBlockMonacoOptions}
-              mermaidProps={CHAT_MERMAID_PROPS}
-              infographicProps={CHAT_INFOGRAPHIC_PROPS}
-              {...CHAT_RENDER_BATCH_PROPS}
-            />
-          )}
-        </>
-      )}
-    </div>
-  );
-}, (prev, next) => (
-  prev.content === next.content
-  && prev.nodes === next.nodes
-  && prev.isDarkMode === next.isDarkMode
-  && prev.isStreaming === next.isStreaming
-  && prev.codeBlockDarkTheme === next.codeBlockDarkTheme
-  && prev.codeBlockLightTheme === next.codeBlockLightTheme
-  && prev.codeBlockThemes === next.codeBlockThemes
-  && prev.codeFontFamily === next.codeFontFamily
-  && prev.displayPrefix === next.displayPrefix
-));
-
-// ── Version pagination component for multi-version AI replies ──────────
-
-function VersionPagination({
-  msg,
-  conversationId,
-  allVersions,
-}: {
-  msg: Message;
-  conversationId: string;
-  allVersions: Message[];
-}) {
-  const { token } = theme.useToken();
-  const switchMessageVersion = useConversationStore((s) => s.switchMessageVersion);
-
-  // Scope to current model's versions
-  const currentModelId = msg.model_id;
-  const modelVersions = allVersions.filter((v) => v.model_id === currentModelId);
-
-  if (modelVersions.length <= 1) return null;
-
-  const sorted = [...modelVersions].sort((a, b) => a.version_index - b.version_index);
-  const currentIdx = sorted.findIndex((v) => v.id === msg.id);
-  const current = currentIdx >= 0 ? currentIdx : sorted.findIndex((v) => v.is_active);
-
-  const handlePrev = () => {
-    if (current > 0 && msg.parent_message_id) {
-      switchMessageVersion(conversationId, msg.parent_message_id, sorted[current - 1].id);
-    }
-  };
-  const handleNext = () => {
-    if (current < sorted.length - 1 && msg.parent_message_id) {
-      switchMessageVersion(conversationId, msg.parent_message_id, sorted[current + 1].id);
-    }
-  };
-
-  return (
-    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2, marginRight: 8 }}>
-      <Button
-        type="text"
-        size="small"
-        icon={<ChevronLeft size={14} />}
-        disabled={current <= 0}
-        onClick={handlePrev}
-        style={{ minWidth: 20, padding: '0 2px' }}
-      />
-      <Typography.Text style={{ fontSize: 11, color: token.colorTextSecondary }}>
-        {current + 1}/{sorted.length}
-      </Typography.Text>
-      <Button
-        type="text"
-        size="small"
-        icon={<ChevronRight size={14} />}
-        disabled={current >= sorted.length - 1}
-        onClick={handleNext}
-        style={{ minWidth: 20, padding: '0 2px' }}
-      />
-    </span>
-  );
-}
-
-function findLatestLocalGeneratedVersion(
-  parentMessageId: string | null | undefined,
-  providerId: string | null | undefined,
-  modelId: string | null | undefined,
-): Message | null {
-  if (!parentMessageId) return null;
-  const versions = useConversationStore.getState().messages.filter((message) =>
-    message.role === 'assistant'
-    && message.parent_message_id === parentMessageId
-    && (message.provider_id ?? null) === (providerId ?? null)
-    && (message.model_id ?? null) === (modelId ?? null)
-  );
-
-  return [...versions].sort((left, right) =>
-    right.version_index - left.version_index
-    || right.created_at - left.created_at
-    || right.id.localeCompare(left.id)
-  )[0] ?? null;
-}
-
-function ModelTags({
-  msg,
-  conversationId,
-  allVersions,
-  getModelDisplayInfo,
-}: {
-  msg: Message;
-  conversationId: string;
-  allVersions: Message[];
-  getModelDisplayInfo: (modelId?: string | null, providerId?: string | null) => { modelName: string; providerName: string };
-}) {
-  const { token } = theme.useToken();
-  const switchMessageVersion = useConversationStore((s) => s.switchMessageVersion);
-  const pendingCompanionModels = useConversationStore((s) => s.pendingCompanionModels);
-  const multiModelParentId = useConversationStore((s) => s.multiModelParentId);
-  const multiModelDoneMessageIds = useConversationStore((s) => s.multiModelDoneMessageIds);
-
-  // Only show pending/streaming indicators for the specific multi-model target message
-  const isMultiModelTarget = msg.parent_message_id === multiModelParentId;
-
-  const modelGroups = useMemo(() => {
-    const groups = new Map<string, Message[]>();
-    for (const v of allVersions) {
-      const key = v.model_id ?? '__unknown__';
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)!.push(v);
-    }
-    return groups;
-  }, [allVersions]);
-
-  // Pending companions that haven't generated a version yet
-  const pendingModels = useMemo(() => {
-    if (!isMultiModelTarget || !pendingCompanionModels.length) return [];
-    return pendingCompanionModels.filter((cm) => !modelGroups.has(cm.modelId));
-  }, [isMultiModelTarget, pendingCompanionModels, modelGroups]);
-
-  // Check if a model is currently streaming (has a version but not yet completed)
-  const streamingModelIds = useMemo(() => {
-    const ids = new Set<string>();
-    if (!isMultiModelTarget) return ids;
-    for (const cm of pendingCompanionModels) {
-      if (modelGroups.has(cm.modelId)) {
-        // Check if this model's version has completed (per-model tracking)
-        const versions = modelGroups.get(cm.modelId)!;
-        const isDone = versions.some((v) => multiModelDoneMessageIds.includes(v.id));
-        if (!isDone) ids.add(cm.modelId);
-      }
-    }
-    return ids;
-  }, [isMultiModelTarget, pendingCompanionModels, modelGroups, multiModelDoneMessageIds]);
-
-  if (modelGroups.size <= 1 && pendingModels.length === 0) return null;
-
-  const currentModelId = msg.model_id ?? '__unknown__';
-
-  const handleTagClick = (modelId: string) => {
-    if (modelId === currentModelId || !msg.parent_message_id) return;
-    const versions = modelGroups.get(modelId);
-    if (!versions || versions.length === 0) return;
-    const sorted = [...versions].sort((a, b) => b.version_index - a.version_index);
-    switchMessageVersion(conversationId, msg.parent_message_id, sorted[0].id);
-  };
-
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-      {Array.from(modelGroups.keys()).map((modelId) => {
-        const isActive = modelId === currentModelId;
-        const isStreaming = streamingModelIds.has(modelId);
-        const { modelName } = getModelDisplayInfo(modelId, modelGroups.get(modelId)?.[0]?.provider_id);
-        return (
-          <Tooltip key={modelId} title={modelName} mouseEnterDelay={0.3}>
-            <div
-              onClick={() => handleTagClick(modelId)}
-              className={isStreaming ? 'model-tag-streaming' : undefined}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 26,
-                height: 26,
-                borderRadius: '50%',
-                border: `1.5px solid ${isActive ? token.colorPrimary : 'transparent'}`,
-                cursor: isActive ? 'default' : 'pointer',
-                transition: 'border-color 0.2s',
-                flexShrink: 0,
-              }}
-            >
-              <ModelIcon model={modelId} size={20} type="avatar" />
-            </div>
-          </Tooltip>
-        );
-      })}
-      {/* Pending companion models waiting to stream */}
-      {pendingModels.map((cm) => {
-        const { modelName } = getModelDisplayInfo(cm.modelId, cm.providerId);
-        return (
-          <Tooltip key={`pending-${cm.modelId}`} title={`${modelName} (waiting...)`} mouseEnterDelay={0.3}>
-            <div
-              className="model-tag-pending"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                width: 26,
-                height: 26,
-                borderRadius: '50%',
-                border: `1.5px dashed ${token.colorTextQuaternary}`,
-                opacity: 0.5,
-                flexShrink: 0,
-              }}
-            >
-              <ModelIcon model={cm.modelId} size={20} type="avatar" />
-            </div>
-          </Tooltip>
-        );
-      })}
-    </div>
-  );
-}
-
-// 3-button delete popover for last AI version
-function DeleteLastVersionPopover({
-  msg,
-  conversationId,
-  deleteMessage,
-  deleteMessageGroup,
-  messageApi,
-  token,
-}: {
-  msg: Message;
-  conversationId: string;
-  deleteMessage: (messageId: string) => Promise<void>;
-  deleteMessageGroup: (convId: string, parentMsgId: string) => Promise<void>;
-  messageApi: ReturnType<typeof App.useApp>['message'];
-  token: ReturnType<typeof theme.useToken>['token'];
-}) {
-  const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-
-  const handleDeleteThisOnly = async () => {
-    setOpen(false);
-    try {
-      await deleteMessage(msg.id);
-    } catch (e) {
-      messageApi.error(String(e));
-    }
-  };
-
-  const handleDeleteAll = async () => {
-    setOpen(false);
-    try {
-      if (msg.parent_message_id) {
-        await deleteMessageGroup(conversationId, msg.parent_message_id);
-      } else if (msg.id.startsWith('temp-')) {
-        // No parent link (e.g. error before backend persisted) — remove locally
-        useConversationStore.setState((s) => ({
-          messages: s.messages.filter((m) => m.id !== msg.id),
-        }));
-      }
-    } catch (e) {
-      messageApi.error(String(e));
-    }
-  };
-
-  return (
-    <Popover
-      open={open}
-      onOpenChange={setOpen}
-      trigger="click"
-      placement="top"
-      content={
-        <div style={{ maxWidth: 280 }}>
-          <div style={{ marginBottom: 12, display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-            <AlertCircle size={16} style={{ color: token.colorWarning, marginTop: 2, flexShrink: 0 }} />
-            <span>{t('chat.deleteLastVersionHint')}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-            <Button size="small" onClick={() => setOpen(false)}>
-              {t('common.cancel')}
-            </Button>
-            <Button size="small" onClick={handleDeleteThisOnly}>
-              {t('chat.deleteThisOnly')}
-            </Button>
-            <Button size="small" danger type="primary" onClick={handleDeleteAll}>
-              {t('chat.deleteAll')}
-            </Button>
-          </div>
-        </div>
-      }
-    >
-      <Tooltip title={t('chat.delete')}>
-        <span className="aqbot-action-item" style={{ color: token.colorError }}>
-          <Trash2 size={14} />
-        </span>
-      </Tooltip>
-    </Popover>
-  );
-}
-
-function AssistantFooter({
-  msg,
-  conversationId,
-  versions,
-  assistantCopyText,
-  getModelDisplayInfo,
-  onEditMessage,
-  isStreaming = false,
-  displayMode,
-  onDisplayModeChange,
-  onMultiModelDetected,
-  onRegeneratedVersionCreated,
-}: {
-  msg: Message;
-  conversationId: string;
-  versions?: Message[];
-  assistantCopyText: string;
-  getModelDisplayInfo: (modelId?: string | null, providerId?: string | null) => { modelName: string; providerName: string };
-  onEditMessage: (messageId: string, content: string, role: 'user' | 'assistant') => void;
-  isStreaming?: boolean;
-  displayMode?: MultiModelDisplayMode;
-  onDisplayModeChange?: (parentMsgId: string, mode: MultiModelDisplayMode) => void;
-  onMultiModelDetected?: (parentMsgId: string, versions: Message[]) => void;
-  onRegeneratedVersionCreated?: (message: Message) => void;
-}) {
-  const { token } = theme.useToken();
-  const { t } = useTranslation();
-  const { message: messageApi } = App.useApp();
-  const regenerateMessage = useConversationStore((s) => s.regenerateMessage);
-  const regenerateWithModel = useConversationStore((s) => s.regenerateWithModel);
-  const deleteMessageGroup = useConversationStore((s) => s.deleteMessageGroup);
-  const deleteMessage = useConversationStore((s) => s.deleteMessage);
-  const branchConversation = useConversationStore((s) => s.branchConversation);
-  const { copy: copyAssistant, isCopied: assistantCopied } = useCopyToClipboard();
-  // Branch modal state
-  const [branchModalOpen, setBranchModalOpen] = useState(false);
-  const [branchAsChild, setBranchAsChild] = useState(false);
-  const [branchTitle, setBranchTitle] = useState('');
-  const conversations = useConversationStore((s) => s.conversations);
-  const currentConvTitle = conversations.find((c) => c.id === conversationId)?.title ?? '';
-  const storeMessages = useConversationStore((s) => s.messages);
-  const allVersions = versions ?? [];
-
-  // Merge DB-fetched versions with in-store companion messages for real-time visibility
-  const mergedVersions = useMemo(() => {
-    if (!msg.parent_message_id) return allVersions;
-    const dbIds = new Set(allVersions.map((v) => v.id));
-    const extra = storeMessages.filter(
-      (m) => m.parent_message_id === msg.parent_message_id && m.role === 'assistant' && !dbIds.has(m.id) && m.model_id,
-    );
-    return extra.length > 0 ? [...allVersions, ...extra] : allVersions;
-  }, [allVersions, storeMessages, msg.parent_message_id]);
-
-  // Check if this message has multiple model versions
-  const hasMultiModels = useMemo(() => hasMultipleModelVersions(mergedVersions), [mergedVersions]);
-
-  // Report the latest version snapshot to parent so cached multi-model state
-  // can be updated or cleared after deletes/switches.
-  useEffect(() => {
-    if (versions !== undefined && msg.parent_message_id && onMultiModelDetected) {
-      onMultiModelDetected(msg.parent_message_id, mergedVersions);
-    }
-  }, [msg.parent_message_id, mergedVersions, onMultiModelDetected, versions]);
-
-  // Current message's model for ModelSelector highlight
-  const currentModelOverride = useMemo(() => {
-    if (msg.provider_id && msg.model_id) {
-      return { providerId: msg.provider_id, modelId: msg.model_id };
-    }
-    return null;
-  }, [msg.provider_id, msg.model_id]);
-
-  const handleModelSelect = useCallback(async (providerId: string, modelId: string) => {
-    try {
-      let pending: Promise<Message>;
-      if (providerId === msg.provider_id && modelId === msg.model_id) {
-        // Same model → regular regenerate
-        pending = regenerateMessage(msg.id);
-      } else {
-        // Different model → generate with new model
-        pending = regenerateWithModel(msg.id, providerId, modelId);
-      }
-      const localGenerated = findLatestLocalGeneratedVersion(msg.parent_message_id, providerId, modelId);
-      if (localGenerated) onRegeneratedVersionCreated?.(localGenerated);
-      const generated = await pending;
-      onRegeneratedVersionCreated?.(
-        findLatestLocalGeneratedVersion(msg.parent_message_id, providerId, modelId) ?? generated,
-      );
-    } catch (e) {
-      messageApi.error(String(e));
-    }
-  }, [messageApi, msg.id, msg.model_id, msg.parent_message_id, msg.provider_id, onRegeneratedVersionCreated, regenerateMessage, regenerateWithModel]);
-  const totalTokens = (msg.prompt_tokens ?? 0) + (msg.completion_tokens ?? 0);
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column' }}>
-      {!isStreaming && (msg.prompt_tokens != null || msg.completion_tokens != null || msg.tokens_per_second != null || msg.first_token_latency_ms != null) && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: token.colorTextDescription, lineHeight: '16px', marginTop: -6, marginBottom: 4, flexWrap: 'wrap' }}>
-          {msg.prompt_tokens != null && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-              <ArrowUp size={10} />
-              {formatTokenCount(msg.prompt_tokens)} tokens
-            </span>
-          )}
-          {msg.completion_tokens != null && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-              <ArrowDown size={10} />
-              {formatTokenCount(msg.completion_tokens)} tokens
-            </span>
-          )}
-          {totalTokens > 0 && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-              <Coins size={10} />
-              {formatTokenCount(totalTokens)} tokens
-            </span>
-          )}
-          {msg.tokens_per_second != null && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-              <Zap size={10} />
-              {formatSpeed(msg.tokens_per_second)}
-            </span>
-          )}
-          {msg.first_token_latency_ms != null && (
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-              <TextCursorInput size={10} />
-              {formatDuration(msg.first_token_latency_ms)}
-            </span>
-          )}
-        </div>
-      )}
-      {!isStreaming && (
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <VersionPagination msg={msg} conversationId={conversationId} allVersions={mergedVersions} />
-          <Actions
-          items={[
-            {
-              key: 'copy',
-              icon: assistantCopied ? <Check size={14} style={{ color: token.colorSuccess }} /> : <Copy size={14} />,
-              label: t('chat.copy'),
-              onItemClick: () => {
-                void copyAssistant(assistantCopyText).then(ok => {
-                  if (ok) messageApi.success(t('chat.copied'));
-                });
-              },
-            },
-            {
-              key: 'regenerate',
-              icon: <RotateCcw size={14} />,
-              label: t('chat.regenerate'),
-              onItemClick: async () => {
-                try {
-                  const pending = regenerateMessage(msg.id);
-                  const localGenerated = findLatestLocalGeneratedVersion(msg.parent_message_id, msg.provider_id, msg.model_id);
-                  if (localGenerated) onRegeneratedVersionCreated?.(localGenerated);
-                  const generated = await pending;
-                  onRegeneratedVersionCreated?.(
-                    findLatestLocalGeneratedVersion(msg.parent_message_id, msg.provider_id, msg.model_id) ?? generated,
-                  );
-                } catch (e) {
-                  messageApi.error(String(e));
-                }
-              },
-            },
-            ...(msg.role === 'assistant' ? [{
-              key: 'edit',
-              icon: <Pencil size={14} />,
-              label: t('chat.editMessage'),
-              onItemClick: () => {
-                onEditMessage(msg.id, msg.content, 'assistant');
-              },
-            }] : []),
-            {
-              key: 'model',
-              actionRender: () => (
-                <ModelSelector
-                  onSelect={handleModelSelect}
-                  overrideCurrentModel={currentModelOverride}
-                >
-                  <Tooltip title={t('chat.switchModel')}>
-                    <span className="aqbot-action-item" style={{ color: token.colorTextSecondary }}>
-                      <ArrowLeftRight size={14} />
-                    </span>
-                  </Tooltip>
-                </ModelSelector>
-              ),
-            },
-            {
-              key: 'branch',
-              actionRender: () => (
-                <Dropdown
-                  menu={{
-                    items: [
-                      {
-                        key: 'independent',
-                        label: t('chat.branchIndependent'),
-                        onClick: () => {
-                          setBranchAsChild(false);
-                          setBranchTitle(currentConvTitle);
-                          setBranchModalOpen(true);
-                        },
-                      },
-                      {
-                        key: 'child',
-                        label: t('chat.branchChild'),
-                        onClick: () => {
-                          setBranchAsChild(true);
-                          setBranchTitle(currentConvTitle);
-                          setBranchModalOpen(true);
-                        },
-                      },
-                    ],
-                  }}
-                  trigger={['click']}
-                  placement="bottom"
-                >
-                  <Tooltip title={t('chat.branchConversation')}>
-                    <span className="aqbot-action-item" style={{ color: token.colorTextSecondary }}>
-                      <GitBranch size={14} />
-                    </span>
-                  </Tooltip>
-                </Dropdown>
-              ),
-            },
-            {
-              key: 'delete',
-              actionRender: () => {
-                const isLastVersion = mergedVersions.filter((v) => v.id !== msg.id).length === 0;
-
-                if (isLastVersion) {
-                  // Last version — Popover with 3 buttons
-                  return (
-                    <DeleteLastVersionPopover
-                      msg={msg}
-                      conversationId={conversationId}
-                      deleteMessage={deleteMessage}
-                      deleteMessageGroup={deleteMessageGroup}
-                      messageApi={messageApi}
-                      token={token}
-                    />
-                  );
-                }
-
-                // Multiple versions — standard Popconfirm
-                return (
-                  <Popconfirm
-                    title={t('chat.confirmDeleteVersion')}
-                    onConfirm={async () => {
-                      try {
-                        await deleteMessage(msg.id);
-                      } catch (e) {
-                        messageApi.error(String(e));
-                      }
-                    }}
-                    okText={t('common.confirm')}
-                    cancelText={t('common.cancel')}
-                  >
-                    <Tooltip title={t('chat.delete')}>
-                      <span className="aqbot-action-item" style={{ color: token.colorError }}>
-                        <Trash2 size={14} />
-                      </span>
-                    </Tooltip>
-                  </Popconfirm>
-                );
-              },
-            },
-          ]}
-        />
-      </div>
-      )}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
-        {hasMultiModels && displayMode && onDisplayModeChange && msg.parent_message_id && (
-          <LayoutSwitcher
-            currentMode={displayMode}
-            onModeChange={(mode) => onDisplayModeChange(msg.parent_message_id!, mode)}
-          />
-        )}
-        <ModelTags msg={msg} conversationId={conversationId} allVersions={mergedVersions} getModelDisplayInfo={getModelDisplayInfo} />
-      </div>
-      <Modal
-        open={branchModalOpen}
-        title={t('chat.branchConversation')}
-        onCancel={() => setBranchModalOpen(false)}
-        onOk={async () => {
-          try {
-            const title = branchTitle.trim() || currentConvTitle;
-            await branchConversation(conversationId, msg.id, branchAsChild, title);
-            messageApi.success(t('chat.branchCreated'));
-            setBranchModalOpen(false);
-          } catch (e) {
-            messageApi.error(String(e));
-          }
-        }}
-        okText={t('common.confirm')}
-        cancelText={t('common.cancel')}
-        width={400}
-        destroyOnClose
-      >
-        <Input
-          value={branchTitle}
-          onChange={(e) => setBranchTitle(e.target.value)}
-          placeholder={t('chat.branchTitlePlaceholder')}
-          autoFocus
-          onPressEnter={async () => {
-            try {
-              const title = branchTitle.trim() || currentConvTitle;
-              await branchConversation(conversationId, msg.id, branchAsChild, title);
-              messageApi.success(t('chat.branchCreated'));
-              setBranchModalOpen(false);
-            } catch (e) {
-              messageApi.error(String(e));
-            }
-          }}
-        />
-      </Modal>
-    </div>
-  );
-}
-
-
-// ── Export helpers ──────────────────────────────────────────────────────
-
-import { copyTranscript, exportAsPNG, exportAsMarkdown, exportAsJSON, exportAsText } from '@/lib/exportChat';
-
-// ── Stats Popover ──────────────────────────────────────────────────────
-
-function StatsPopoverContent({ stats, t, token }: {
-  stats: ConversationStats | null;
-  t: (key: string) => string;
-  token: Record<string, any>;
-}) {
-  if (!stats) {
-    return (
-      <div style={{ display: 'flex', justifyContent: 'center', padding: '24px 40px' }}>
-        <Spin size="small" />
-      </div>
-    );
-  }
-
-  const items: Array<{
-    icon: React.ReactNode;
-    label: string;
-    value: string;
-    sub?: Array<{ icon: React.ReactNode; label: string; value: string }>;
-  }> = [
-    {
-      icon: <MessageSquare size={14} />,
-      label: t('chat.stats.totalMessages'),
-      value: stats.total_messages.toLocaleString(),
-      sub: [
-        { icon: <User size={12} />, label: t('chat.stats.userMessages'), value: stats.total_user_messages.toLocaleString() },
-        { icon: <Bot size={12} />, label: t('chat.stats.assistantMessages'), value: stats.total_assistant_messages.toLocaleString() },
-      ],
-    },
-    {
-      icon: <Coins size={14} />,
-      label: t('chat.stats.totalTokens'),
-      value: formatTokenCount(stats.total_tokens),
-      sub: [
-        { icon: <ArrowUpRight size={12} />, label: t('chat.stats.inputTokens'), value: formatTokenCount(stats.total_prompt_tokens) },
-        { icon: <ArrowDownRight size={12} />, label: t('chat.stats.outputTokens'), value: formatTokenCount(stats.total_completion_tokens) },
-      ],
-    },
-    ...(stats.avg_first_token_latency_ms != null ? [{
-      icon: <Zap size={14} />,
-      label: t('chat.stats.avgFirstToken'),
-      value: formatDuration(stats.avg_first_token_latency_ms),
-    }] : []),
-    ...(stats.avg_response_time_ms != null ? [{
-      icon: <Clock size={14} />,
-      label: t('chat.stats.avgResponseTime'),
-      value: formatDuration(stats.avg_response_time_ms),
-    }] : []),
-    ...(stats.avg_tokens_per_second != null ? [{
-      icon: <Timer size={14} />,
-      label: t('chat.stats.avgSpeed'),
-      value: formatSpeed(stats.avg_tokens_per_second),
-    }] : []),
-  ];
-
-  return (
-    <div style={{ minWidth: 220, maxWidth: 280 }}>
-      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-        <ChartNoAxesColumn size={14} />
-        {t('chat.stats.title')}
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {items.map((item, i) => (
-          <div key={i}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, color: token.colorTextSecondary }}>
-                {item.icon}
-                {item.label}
-              </span>
-              <span style={{ fontSize: 14, fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
-                {item.value}
-              </span>
-            </div>
-            {item.sub && (
-              <div style={{ marginLeft: 20, marginTop: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
-                {item.sub.map((s, j) => (
-                  <div key={j} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: token.colorTextDescription }}>
-                      {s.icon}
-                      {s.label}
-                    </span>
-                    <span style={{ fontSize: 12, color: token.colorTextSecondary, fontVariantNumeric: 'tabular-nums' }}>
-                      {s.value}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {i < items.length - 1 && (
-              <div style={{ borderBottom: `1px solid ${token.colorBorderSecondary}`, marginTop: 10 }} />
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
+import { AssistantFooter, StatsPopoverContent, findLatestLocalGeneratedVersion } from './ChatAssistantFooter';
+import {
+  AssistantMarkdown,
+  MessageRenderFallback,
+  MINIMAP_JUMP_AFTER_LIMIT,
+  MINIMAP_JUMP_BEFORE_LIMIT,
+  PlainTextChatContent,
+  StreamingAssistantContent,
+  USER_SCROLL_INTENT_GRACE_MS,
+  shouldDeferAssistantMarkdownParse,
+  stripAssistantAqbotTags,
+  stripUserAqbotTags,
+} from './ChatAssistantMarkdown';
+
+import { useChatShareExport } from './useChatShareExport';
+import { useChatBubblePresentation } from './useChatBubblePresentation';
 
 // ── Component ──────────────────────────────────────────────────────────
 
@@ -2069,6 +175,17 @@ export function ChatView() {
   const { t } = useTranslation();
   const { token } = theme.useToken();
   const { message: messageApi } = App.useApp();
+  const pageActiveRef = useRef(true);
+  const pageConnectionGenerationRef = useRef(0);
+
+  useEffect(() => {
+    pageConnectionGenerationRef.current += 1;
+    pageActiveRef.current = true;
+    return () => {
+      pageActiveRef.current = false;
+      pageConnectionGenerationRef.current += 1;
+    };
+  }, []);
 
   // ── Store selectors ────────────────────────────────────────────────
   const conversations = useConversationStore((s) => s.conversations);
@@ -2077,16 +194,26 @@ export function ChatView() {
   const ragDisplayByMessageId = useConversationStore((s) => s.ragDisplayByMessageId);
   const searchDisplayByMessageId = useConversationStore((s) => s.searchDisplayByMessageId);
   const loading = useConversationStore((s) => s.loading);
+  const showingPreviousConversationWindow = Boolean(
+    loading
+    && activeConversationId
+    && messages.length > 0
+    && messages.some((message) => message.conversation_id !== activeConversationId),
+  );
   const loadingOlder = useConversationStore((s) => s.loadingOlder);
   const loadingNewer = useConversationStore((s) => s.loadingNewer);
   const hasOlderMessages = useConversationStore((s) => s.hasOlderMessages);
   const hasNewerMessages = useConversationStore((s) => s.hasNewerMessages);
-  const streaming = useConversationStore((s) => s.streaming);
+  const streaming = useConversationStore(selectUiStreaming);
   const compressingConversationId = useConversationStore((s) => s.compressingConversationId);
-  const streamingMessageId = useConversationStore((s) => s.streamingMessageId);
-  const streamActivityByMessageId = useConversationStore((s) => s.streamActivityByMessageId);
-  const multiModelParentId = useConversationStore((s) => s.multiModelParentId);
-  const multiModelDoneMessageIds = useConversationStore((s) => s.multiModelDoneMessageIds);
+  const streamingMessageId = useConversationStore(selectUiStreamingMessageId);
+  const multiModelParentId = useConversationStore(selectUiMultiModelParentId);
+  const pendingCompanionModels = useConversationStore(selectUiPendingCompanionModels);
+  const pendingCompanionModelCount = pendingCompanionModels.length;
+  const multiModelTargets = useConversationStore((s) => s.multiModelTargets);
+  const chatChrome = useChatChrome();
+  const multiModelDoneMessageIds = useConversationStore(selectUiMultiModelDoneMessageIds);
+  const setConversationMultiModelDisplayMode = useConversationStore((s) => s.setConversationMultiModelDisplayMode);
   const thinkingActiveMessageIds = useConversationStore((s) => s.thinkingActiveMessageIds);
   const storeError = useConversationStore((s) => s.error);
   const updateConversation = useConversationStore((s) => s.updateConversation);
@@ -2104,20 +231,22 @@ export function ChatView() {
   const branchConversation = useConversationStore((s) => s.branchConversation);
   const removeContextClear = useConversationStore((s) => s.removeContextClear);
   const getCompressionSummary = useConversationStore((s) => s.getCompressionSummary);
+  const retryCompression = useConversationStore((s) => s.retryCompression);
   const deleteCompression = useConversationStore((s) => s.deleteCompression);
-  const listMessageVersionsBatch = useConversationStore((s) => s.listMessageVersionsBatch);
-  const hydrateMessageVersions = useConversationStore((s) => s.hydrateMessageVersions);
+  const openCompressionSummaryToken = useConversationStore((s) => s.openCompressionSummaryToken);
   const [summaryModalOpen, setSummaryModalOpen] = useState(false);
   const [summaryModalText, setSummaryModalText] = useState('');
   const [summaryModalSummary, setSummaryModalSummary] = useState<ConversationSummary | null>(null);
+  const [summaryModalTab, setSummaryModalTab] = useState<'summary' | 'source'>('summary');
+  const [summaryRetrying, setSummaryRetrying] = useState(false);
   const [previewPayload, setPreviewPayload] = useState<CodeBlockPreviewPayload | null>(null);
   const [previewModalOpen, setPreviewModalOpen] = useState(false);
   const [mermaidPreviewSvg, setMermaidPreviewSvg] = useState<string | null>(null);
   const [mermaidPreviewOpen, setMermaidPreviewOpen] = useState(false);
-  const [streamStatusNow, setStreamStatusNow] = useState(() => Date.now());
   const createConversation = useConversationStore((s) => s.createConversation);
   const providers = useProviderStore((s) => s.providers);
   const settings = useSettingsStore((s) => s.settings);
+  const popoutWidthMode = useMultiModelColumnLayoutStore((s) => s.layout.popoutWidthMode);
   const saveSettings = useSettingsStore((s) => s.saveSettings);
   const bubbleStyle = settings.bubble_style;
   const chatSidebarCollapsed = settings.chat_sidebar_collapsed ?? false;
@@ -2175,29 +304,63 @@ export function ChatView() {
 
   // Register module-level preview handler for code blocks
   useEffect(() => {
-    _codeBlockPreviewHandler = (payload: CodeBlockPreviewPayload) => {
+    setCodeBlockPreviewHandler((payload: CodeBlockPreviewPayload) => {
       setPreviewPayload(payload);
       setPreviewModalOpen(true);
-    };
-    return () => { _codeBlockPreviewHandler = null; };
+    });
+    return () => { setCodeBlockPreviewHandler(null); };
   }, []);
 
   // Register module-level preview handler for mermaid
   useEffect(() => {
-    _mermaidOpenModalHandler = (svgString: string | null) => {
+    setMermaidOpenModalHandler((svgString: string | null) => {
       setMermaidPreviewSvg(svgString);
       setMermaidPreviewOpen(true);
-    };
-    return () => { _mermaidOpenModalHandler = null; };
+    });
+    return () => { setMermaidOpenModalHandler(null); };
   }, []);
 
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
+  const persistConversationDisplayMode = useCallback(async (mode: MultiModelDisplayMode) => {
+    if (!activeConversationId) {
+      throw new Error('Cannot persist a layout without an active conversation');
+    }
+    await setConversationMultiModelDisplayMode(activeConversationId, mode);
+  }, [activeConversationId, setConversationMultiModelDisplayMode]);
+  const {
+    getDisplayMode,
+    retainDisplayModes,
+    setDisplayMode,
+  } = useMultiModelLayoutState({
+    conversationId: activeConversationId,
+    globalDisplayMode: settings.multi_model_display_mode ?? 'tabs',
+    conversationDisplayMode: activeConversation?.multi_model_display_mode_override,
+    persistConversationDisplayMode,
+  });
+  const handleDisplayModeChange = useCallback((parentMessageId: string, mode: MultiModelDisplayMode) => {
+    void setDisplayMode(parentMessageId, mode).catch(() => {
+      messageApi.error(t('chat.multiModel.displayModeSaveFailed'));
+    });
+  }, [messageApi, setDisplayMode, t]);
+  useEffect(() => {
+    const agentStore = useAgentStore.getState();
+    const visibleAgentConversationId = activeConversation?.mode === 'agent'
+      ? activeConversationId
+      : null;
+    agentStore.setVisibleConversation(visibleAgentConversationId);
+    return () => {
+      if (useAgentStore.getState().visibleConversationId === visibleAgentConversationId) {
+        useAgentStore.getState().setVisibleConversation(null);
+      }
+    };
+  }, [activeConversation?.mode, activeConversationId]);
   const activeCustomConvIcon = activeConversation ? getConvIcon(activeConversation.id) : null;
   const resolvedActiveCustomConvIconSrc = useResolvedAvatarSrc(
     (activeCustomConvIcon?.type as AvatarType) ?? 'icon',
     activeCustomConvIcon?.value ?? '',
   );
-  const compressing = compressingConversationId === activeConversationId;
+  const compressing = activeConversationId !== null
+    && compressingConversationId === activeConversationId;
   const isTitleGenerating = activeConversationId != null && titleGeneratingConversationId === activeConversationId;
   const summaryBoundaryLabel = useMemo(() => {
     const boundaryId = summaryModalSummary?.compressed_until_message_id;
@@ -2245,56 +408,47 @@ export function ChatView() {
     );
   }, [chatSidebarCollapsed, handleChatSidebarToggle, t]);
 
-  // ── User avatar helper (mirrors Sidebar.tsx pattern) ───────────────
-  const renderUserAvatar = useCallback(() => {
-    const size = 32;
-    if (profile.avatarType === 'emoji' && profile.avatarValue) {
-      return (
-        <div
-          style={{
-            width: size,
-            height: size,
-            borderRadius: '50%',
-            backgroundColor: token.colorFillSecondary,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 16,
-          }}
-        >
-          {profile.avatarValue}
-        </div>
-      );
-    }
-    if ((profile.avatarType === 'url' || profile.avatarType === 'file') && profile.avatarValue) {
-      const src = profile.avatarType === 'file' ? resolvedAvatarSrc : profile.avatarValue;
-      return <Avatar size={size} src={src} />;
-    }
-    return (
-      <Avatar size={size} icon={<User size={16} />} style={{ backgroundColor: token.colorPrimary }} />
-    );
-  }, [profile, token, resolvedAvatarSrc]);
-  const userAvatar = useMemo(() => renderUserAvatar(), [renderUserAvatar]);
+  const { getBubbleVariant, userAvatar } = useChatBubblePresentation({
+    bubbleStyle,
+    profile,
+    resolvedAvatarSrc,
+    token,
+  });
 
-  // ── Bubble style variant helper ────────────────────────────────────
-  const getBubbleVariant = useCallback(
-    (isUser: boolean): { variant: 'filled' | 'outlined' | 'shadow' | 'borderless'; style?: React.CSSProperties } => {
-      switch (bubbleStyle) {
-        case 'compact':
-          return { variant: 'borderless' };
-        case 'minimal':
-          return { variant: 'borderless', style: { padding: '4px 8px' } };
-        case 'modern':
-        default:
-          return { variant: isUser ? 'shadow' : 'outlined' };
-      }
-    },
-    [bubbleStyle],
-  );
+  const {
+    exitShareSelectMode,
+    exportMenuItems,
+    exportSelectedShare,
+    getShareSelectBubbleStyles,
+    handleShareSelectableClick,
+    resetShareSelection,
+    selectAllShareMessages,
+    selectedShareMessageIds,
+    shareExporting,
+    shareSelectMode,
+    toggleShareMessage,
+    wrapShareSelectableContent,
+  } = useChatShareExport({
+    activeConversation,
+    activeConversationId,
+    hasNewerMessages,
+    hasOlderMessages,
+    messageApi,
+    messages,
+    profileName: profile.name,
+    providers,
+    t,
+    token,
+  });
 
   // ── Title editing state ────────────────────────────────────────────
   const [editingTitle, setEditingTitle] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [focusedAssistantMessageId, setFocusedAssistantMessageId] = useState<string | null>(null);
+  const focusScrollAnchorRef = useRef<ReturnType<typeof captureMessageScrollAnchor>>(null);
+  const focusContentRendererRef = useRef<(message: Message, isVersionStreaming: boolean) => React.ReactNode>(
+    () => null,
+  );
   const [stickToBottom, setStickToBottom] = useState(true);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageRole, setEditingMessageRole] = useState<'user' | 'assistant' | null>(null);
@@ -2304,8 +458,68 @@ export function ChatView() {
   const [cardBranchTitle, setCardBranchTitle] = useState('');
   const [cardBranchSaving, setCardBranchSaving] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
+  /** Multi-select messages for share/export */
   const titleInputRef = useRef<InputRef>(null);
   const skipTitleSaveRef = useRef(false);
+
+  const openCompressionSummaryModal = useCallback(async () => {
+    const convId = activeConversationId;
+    if (!convId) return;
+    const connectionGeneration = pageConnectionGenerationRef.current;
+    const summary = await getCompressionSummary(convId);
+    if (
+      !pageActiveRef.current
+      || pageConnectionGenerationRef.current !== connectionGeneration
+      || useConversationStore.getState().activeConversationId !== convId
+    ) return;
+    setSummaryModalText(summary?.summary_text ?? t('chat.noSummary'));
+    setSummaryModalSummary(summary ?? null);
+    setSummaryModalTab('summary');
+    setSummaryModalOpen(true);
+  }, [activeConversationId, getCompressionSummary, t]);
+
+  // InputArea context circle requests opening this modal
+  const lastOpenCompressionSummaryTokenRef = useRef(0);
+  useEffect(() => {
+    if (openCompressionSummaryToken === 0) return;
+    if (openCompressionSummaryToken === lastOpenCompressionSummaryTokenRef.current) return;
+    lastOpenCompressionSummaryTokenRef.current = openCompressionSummaryToken;
+    void openCompressionSummaryModal();
+  }, [openCompressionSummaryToken, openCompressionSummaryModal]);
+
+  usePageSuspendCleanup(() => {
+    setStatsOpen(false);
+    setStats(null);
+    setEditingTitle(false);
+    setEditingMessageId(null);
+    setEditingMessageRole(null);
+    setEditingContent('');
+    setCardBranchTarget(null);
+    setCardBranchTitle('');
+    setSummaryModalOpen(false);
+    setSummaryModalSummary(null);
+    setSummaryModalTab('summary');
+    setSummaryRetrying(false);
+    setPreviewModalOpen(false);
+    setPreviewPayload(null);
+    setMermaidPreviewOpen(false);
+    setMermaidPreviewSvg(null);
+    resetShareSelection();
+    setFocusedAssistantMessageId(null);
+  });
+
+  // Leave share-select mode when switching conversations
+  useEffect(() => {
+    exitShareSelectMode();
+    setFocusedAssistantMessageId(null);
+  }, [activeConversationId, exitShareSelectMode]);
+
+  useEffect(() => {
+    if (!focusedAssistantMessageId) return;
+    if (!messages.some((message) => message.id === focusedAssistantMessageId)) {
+      setFocusedAssistantMessageId(null);
+    }
+  }, [focusedAssistantMessageId, messages]);
 
   // ── Stats popover state ─────────────────────────────────────────────
   const [statsOpen, setStatsOpen] = useState(false);
@@ -2327,8 +541,10 @@ export function ChatView() {
   const scrollBoxRef = useRef<HTMLElement | null>(null);
   const scrollContentRef = useRef<HTMLElement | null>(null);
   const pendingScrollConversationIdRef = useRef<string | null>(activeConversationId ?? null);
+  const lastScrollResetConversationIdRef = useRef<string | null>(null);
   const stickToBottomRef = useRef(stickToBottom);
   const scrollLayoutMetricsRef = useRef({ scrollHeight: 0, clientHeight: 0 });
+  const visibleMessageAnchorRef = useRef<ReturnType<typeof captureMessageScrollAnchor>>(null);
   const lastUserScrollIntentAtRef = useRef(0);
   const contentRendererMessageIdsRef = useRef<Set<string>>(new Set());
 
@@ -2346,6 +562,20 @@ export function ChatView() {
     scrollContentRef.current = scrollContent;
     return { scrollBox, scrollContent };
   }, []);
+
+  const openFocusedAssistant = useCallback((message: Message) => {
+    const { scrollBox } = syncChatScrollRefs();
+    focusScrollAnchorRef.current = scrollBox ? captureMessageScrollAnchor(scrollBox) : null;
+    setFocusedAssistantMessageId(message.id);
+  }, [syncChatScrollRefs]);
+
+  const closeFocusedAssistant = useCallback(() => {
+    setFocusedAssistantMessageId(null);
+    requestAnimationFrame(() => {
+      const { scrollBox } = syncChatScrollRefs();
+      if (scrollBox) restoreMessageScrollAnchor(scrollBox, focusScrollAnchorRef.current);
+    });
+  }, [syncChatScrollRefs]);
 
   const setStickToBottomState = useCallback((nextStickToBottom: boolean) => {
     stickToBottomRef.current = nextStickToBottom;
@@ -2390,10 +620,6 @@ export function ChatView() {
       attachedScrollBox.addEventListener('touchstart', handleUserIntent, { passive: true });
       attachedScrollBox.addEventListener('touchmove', handleUserIntent, { passive: true });
       attachedScrollBox.addEventListener('pointerdown', handleUserIntent, { passive: true });
-      scrollLayoutMetricsRef.current = {
-        scrollHeight: attachedScrollBox.scrollHeight,
-        clientHeight: attachedScrollBox.clientHeight,
-      };
     };
 
     const scheduleAttach = () => {
@@ -2446,7 +672,7 @@ export function ChatView() {
 
     void (async () => {
       await loadMessagesAround(messageId, MINIMAP_JUMP_BEFORE_LIMIT, MINIMAP_JUMP_AFTER_LIMIT);
-      window.requestAnimationFrame(scrollToMountedMessage);
+      if (pageActiveRef.current) window.requestAnimationFrame(scrollToMountedMessage);
     })();
   }, [loadMessagesAround]);
 
@@ -2457,10 +683,13 @@ export function ChatView() {
   }, [editingTitle]);
 
   useEffect(() => {
+    if (lastScrollResetConversationIdRef.current === activeConversationId) return;
+    lastScrollResetConversationIdRef.current = activeConversationId ?? null;
     pendingScrollConversationIdRef.current = activeConversationId ?? null;
     setShowScrollToBottom(false);
     setStickToBottomState(true);
     scrollLayoutMetricsRef.current = { scrollHeight: 0, clientHeight: 0 };
+    visibleMessageAnchorRef.current = null;
     contentRendererMessageIdsRef.current.clear();
   }, [activeConversationId, setStickToBottomState]);
 
@@ -2470,16 +699,6 @@ export function ChatView() {
     }
     contentRendererMessageIdsRef.current.add(streamingMessageId);
   }, [streaming, streamingMessageId]);
-
-  useEffect(() => {
-    if (!streaming) {
-      return;
-    }
-
-    setStreamStatusNow(Date.now());
-    const timer = window.setInterval(() => setStreamStatusNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [streaming]);
 
   const syncScrollToBottomVisibility = useCallback(() => {
     const { scrollBox: target } = syncChatScrollRefs();
@@ -2496,31 +715,32 @@ export function ChatView() {
   // Load agent tool history from DB on conversation switch
   useEffect(() => {
     if (activeConversation?.mode === 'agent' && activeConversationId) {
-      useAgentStore.getState().loadToolHistory(activeConversationId);
+      void useAgentStore.getState().ensureToolHistoryLoaded(activeConversationId).catch((error) => {
+        console.error('[ChatView] loadToolHistory failed:', error);
+      });
     }
   }, [activeConversationId, activeConversation?.mode]);
 
   // Show store errors as notifications
   useEffect(() => {
     if (storeError) {
-      messageApi.error(storeError);
+      messageApi.error(getContextErrorMessage(storeError, t));
       useConversationStore.setState({ error: null });
     }
-  }, [storeError, messageApi]);
-
-  // ── Agent event listeners ────────────────────────────────────────────
-  useEffect(() => {
-    const cleanup = setupAgentEventListeners();
-    return cleanup;
-  }, []);
+  }, [storeError, messageApi, t]);
 
   const currentAgentStatus = useAgentStore(
     (s) => (activeConversationId ? s.agentStatus[activeConversationId] : undefined),
   );
+  const currentAgentStatusText = agentStatusText(t, currentAgentStatus);
 
-  const agentToolCalls = useAgentStore((s) => s.toolCalls);
-  const agentPendingPermissions = useAgentStore((s) => s.pendingPermissions);
-  const agentPendingAskUser = useAgentStore((s) => s.pendingAskUser);
+  useAgentStore(
+    (s) => (activeConversationId ? s.conversationRevisions[activeConversationId] ?? 0 : 0),
+  );
+  const agentState = useAgentStore.getState();
+  const agentToolCalls = agentState.toolCalls;
+  const agentPendingPermissions = agentState.pendingPermissions;
+  const agentPendingAskUser = agentState.pendingAskUser;
 
   const handleTitleClick = useCallback(() => {
     if (!activeConversation) return;
@@ -2548,28 +768,39 @@ export function ChatView() {
 
   const handleLoadOlderMessages = useCallback(async () => {
     const scrollContainer = bubbleListRef.current?.scrollBoxNativeElement as HTMLDivElement | null | undefined;
-    const previousScrollHeight = scrollContainer?.scrollHeight ?? 0;
-    const previousScrollTop = scrollContainer?.scrollTop ?? 0;
+    const anchor = scrollContainer ? captureMessageScrollAnchor(scrollContainer) : null;
     await loadOlderMessages();
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        if (!scrollContainer) return;
-        scrollContainer.scrollTop = getScrollTopAfterPrepend(
-          previousScrollTop,
-          previousScrollHeight,
-          scrollContainer.scrollHeight,
-          CHAT_SCROLL_IS_REVERSED,
-        );
+        if (!scrollContainer || !pageActiveRef.current) return;
+        restoreMessageScrollAnchor(scrollContainer, anchor);
+        visibleMessageAnchorRef.current = captureMessageScrollAnchor(scrollContainer);
       });
     });
   }, [loadOlderMessages]);
 
   const handleLoadNewerMessages = useCallback(async () => {
+    const scrollContainer = bubbleListRef.current?.scrollBoxNativeElement as HTMLDivElement | null | undefined;
+    const anchor = !stickToBottomRef.current && scrollContainer
+      ? captureMessageScrollAnchor(scrollContainer)
+      : null;
     await loadNewerMessages();
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        if (!scrollContainer || !pageActiveRef.current) return;
+        if (stickToBottomRef.current) {
+          bubbleListRef.current?.scrollTo({ top: 'bottom', behavior: 'auto' });
+          return;
+        }
+        restoreMessageScrollAnchor(scrollContainer, anchor);
+        visibleMessageAnchorRef.current = captureMessageScrollAnchor(scrollContainer);
+      });
+    });
   }, [loadNewerMessages]);
 
   const handleBubbleListScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
     const target = event.currentTarget;
+    visibleMessageAnchorRef.current = captureMessageScrollAnchor(target);
     const currentMetrics = {
       scrollHeight: target.scrollHeight,
       clientHeight: target.clientHeight,
@@ -2644,6 +875,22 @@ export function ChatView() {
     setStickToBottomState(true);
   }, [setStickToBottomState]);
 
+  const handleLaneBubbleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
+    const eventTarget = event.target instanceof HTMLElement ? event.target : event.currentTarget;
+    const target = eventTarget.closest(CHAT_SCROLL_BOX_SELECTOR) as HTMLElement | null
+      ?? event.currentTarget;
+    if (loading || loadingOlder || !hasOlderMessages) return;
+    if (target.scrollHeight <= target.clientHeight + 24) return;
+    const distanceToHistoryTop = getDistanceToHistoryTop(
+      target.scrollHeight,
+      target.scrollTop,
+      target.clientHeight,
+      isReversedScrollBox(target),
+    );
+    if (distanceToHistoryTop > 24) return;
+    void handleLoadOlderMessages();
+  }, [handleLoadOlderMessages, hasOlderMessages, loading, loadingOlder]);
+
   useEffect(() => {
     if (typeof ResizeObserver === 'undefined') return;
 
@@ -2679,8 +926,14 @@ export function ChatView() {
         hadRecentUserScrollIntent,
       )) {
         bubbleListRef.current?.scrollTo({ top: 'bottom', behavior: 'auto' });
+        visibleMessageAnchorRef.current = null;
         setShowScrollToBottom(false);
         return;
+      }
+
+      if (!stickToBottomRef.current && visibleMessageAnchorRef.current) {
+        restoreMessageScrollAnchor(target, visibleMessageAnchorRef.current);
+        visibleMessageAnchorRef.current = captureMessageScrollAnchor(target);
       }
 
       syncScrollToBottomVisibility();
@@ -2702,10 +955,12 @@ export function ChatView() {
       disconnectResizeObserver();
       observedScrollBox = scrollBox;
       observedScrollContent = scrollContent;
-      scrollLayoutMetricsRef.current = {
-        scrollHeight: scrollBox.scrollHeight,
-        clientHeight: scrollBox.clientHeight,
-      };
+      if (scrollLayoutMetricsRef.current.scrollHeight === 0) {
+        scrollLayoutMetricsRef.current = {
+          scrollHeight: scrollBox.scrollHeight,
+          clientHeight: scrollBox.clientHeight,
+        };
+      }
 
       resizeObserver = new ResizeObserver(() => {
         if (frameId) {
@@ -2744,118 +999,20 @@ export function ChatView() {
   // Scroll to bottom when streaming starts (user sent a message while scrolled up)
   const prevStreamingRef = useRef(false);
   useEffect(() => {
+    let timeoutId: number | null = null;
     if (streaming && !prevStreamingRef.current) {
       // Delay to let the new message bubble render before scrolling
-      setTimeout(() => {
+      timeoutId = window.setTimeout(() => {
         bubbleListRef.current?.scrollTo({ top: 'bottom', behavior: 'smooth' });
         setShowScrollToBottom(false);
         setStickToBottomState(true);
       }, 50);
     }
     prevStreamingRef.current = streaming;
+    return () => {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
   }, [setStickToBottomState, streaming]);
-
-  // ── Export menu ────────────────────────────────────────────────────
-  const exportMenuItems = useMemo(
-    () => [
-      {
-        key: 'copy-md',
-        label: t('chat.copyMarkdown', '复制 Markdown'),
-        icon: <Copy size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await copyTranscript(messages, activeConversation?.title ?? 'chat', 'markdown', { includeThinking: false });
-            if (ok) messageApi.success(t('chat.copied'));
-          } catch (e) { console.error('Copy MD failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'png',
-        label: t('chat.exportPng'),
-        icon: <FileImage size={14} />,
-        onClick: async () => {
-          try {
-            const ok = await exportAsPNG(messageAreaRef.current, activeConversation?.title ?? 'chat');
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export PNG failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'md',
-        label: t('chat.exportMd'),
-        icon: <FileCode size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsMarkdown(messages, activeConversation?.title ?? 'chat');
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export MD failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'export-md-no-thinking',
-        label: t('chat.exportMdNoThinking', '导出 Markdown（不含思维链）'),
-        icon: <FileCode size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsMarkdown(messages, activeConversation?.title ?? 'chat', { includeThinking: false });
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export MD (no thinking) failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'txt',
-        label: t('chat.exportTxt'),
-        icon: <FileType size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsText(messages, activeConversation?.title ?? 'chat');
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export TXT failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'export-txt-no-thinking',
-        label: t('chat.exportTxtNoThinking', '导出文本（不含思维链）'),
-        icon: <FileType size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsText(messages, activeConversation?.title ?? 'chat', { includeThinking: false });
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export TXT (no thinking) failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'json',
-        label: t('chat.exportJson'),
-        icon: <FileText size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsJSON(messages, activeConversation?.title ?? 'chat');
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export JSON failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-      {
-        key: 'export-json-no-thinking',
-        label: t('chat.exportJsonNoThinking', '导出 JSON（不含思维链）'),
-        icon: <FileText size={14} />,
-        onClick: async () => {
-          if (messages.length === 0) { messageApi.warning(t('chat.noMessages')); return; }
-          try {
-            const ok = await exportAsJSON(messages, activeConversation?.title ?? 'chat', { includeThinking: false });
-            if (ok) messageApi.success(t('chat.exportSuccess'));
-          } catch (e) { console.error('Export JSON (no thinking) failed:', e); messageApi.error(t('chat.exportFailed')); }
-        },
-      },
-    ],
-    [messages, activeConversation, t, messageApi],
-  );
 
   // ── Welcome prompt items ───────────────────────────────────────────
   const greetingText = useMemo(() => {
@@ -2920,21 +1077,9 @@ export function ChatView() {
     return getRoleIntro(activeConversationId);
   }, [activeConversation?.message_count, activeConversationId, loading, messages.length]);
 
-  const roleIntroPromptItems: PromptsItemType[] = useMemo(
-    () => {
-      if (!roleIntro) return [];
-      return roleIntro.openingQuestions.map((question, index) => ({
-        key: `role-intro-${index}`,
-        label: question,
-      }));
-    },
-    [roleIntro],
-  );
-
-  const handleRoleIntroPromptClick = useCallback((info: { data: PromptsItemType }) => {
-    const text = typeof info.data.label === 'string' ? info.data.label : '';
-    if (!text) return;
-    useConversationStore.getState().setPendingPromptText(text);
+  const handleRoleIntroSelect = useCallback((content: string) => {
+    if (!content) return;
+    useConversationStore.getState().setPendingPromptText(content);
   }, []);
 
   // ── Bubble items (only show active messages) ────────────────────────
@@ -2942,69 +1087,35 @@ export function ChatView() {
     () => messages.filter((msg) => msg.is_active !== false),
     [messages],
   );
-  const assistantVersionParentIdsKey = useMemo(() => {
-    const ids = new Set<string>();
-    for (const msg of activeMessages) {
-      if (msg.role === 'assistant' && msg.parent_message_id) {
-        ids.add(msg.parent_message_id);
-      }
-    }
-    return Array.from(ids).join('\n');
-  }, [activeMessages]);
-  const [messageVersionsByParentId, setMessageVersionsByParentId] = useState<Record<string, Message[]>>({});
+  const retainedChatCacheKeys = useMemo(() => collectRetainedChatCacheKeys(
+    messages,
+    MAX_LOADED_MESSAGES,
+    streamingMessageId ? [streamingMessageId] : [],
+  ), [messages, streamingMessageId]);
+  const {
+    multiModelResponseParents,
+    renderableVersionsByParentId,
+  } = useMessageVersionGroups({
+    conversationId: activeConversationId,
+    messages,
+    visibleMessages: activeMessages,
+    retainedParentMessageIds: retainedChatCacheKeys.parentIds,
+    multiModelParentId,
+    pendingCompanionModelCount,
+    multiModelDoneMessageIds,
+  });
   const messageById = useMemo(
     () => new Map(messages.map((msg) => [msg.id, msg])),
     [messages],
   );
-
-  useEffect(() => {
-    if (!activeConversationId || !assistantVersionParentIdsKey) {
-      setMessageVersionsByParentId((prev) => (Object.keys(prev).length > 0 ? {} : prev));
-      return;
-    }
-
-    let cancelled = false;
-    let frameId = 0;
-    let idleId: number | null = null;
-    const win = window as Window & {
-      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number;
-      cancelIdleCallback?: (handle: number) => void;
-    };
-    const parentMessageIds = assistantVersionParentIdsKey.split('\n').filter(Boolean);
-    const startedAt = perfNow();
-    const load = () => {
-      listMessageVersionsBatch(activeConversationId, parentMessageIds).then((result) => {
-        perfTraceDuration('chat.messageVersions.ready', startedAt, {
-          conversationId: activeConversationId,
-          parentCount: parentMessageIds.length,
-        });
-        if (cancelled) return;
-        setMessageVersionsByParentId(result);
-        for (const [parentId, versions] of Object.entries(result)) {
-          if (versions.length > 0) {
-            hydrateMessageVersions(parentId, versions);
-          }
-        }
-      });
-    };
-
-    frameId = window.requestAnimationFrame(() => {
-      if (typeof win.requestIdleCallback === 'function') {
-        idleId = win.requestIdleCallback(load, { timeout: 500 });
-      } else {
-        load();
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      window.cancelAnimationFrame(frameId);
-      if (idleId !== null && typeof win.cancelIdleCallback === 'function') {
-        win.cancelIdleCallback(idleId);
-      }
-    };
-  }, [activeConversationId, assistantVersionParentIdsKey, hydrateMessageVersions, listMessageVersionsBatch]);
   // Separate lookup: parent message id → active assistant message (for stable bubble keys)
+  const laneColumns = useMemo(() => {
+    if (pendingCompanionModels.length > 0) {
+      return buildLaneColumns(pendingCompanionModels);
+    }
+    return buildLaneColumns(multiModelTargets);
+  }, [multiModelTargets, pendingCompanionModels]);
+  const useLaneWorkspace = shouldUseLaneWorkspace(chatChrome.kind, laneColumns);
   const assistantByParentId = useMemo(() => {
     const map = new Map<string, Message>();
     for (const msg of messages) {
@@ -3014,59 +1125,29 @@ export function ChatView() {
     }
     return map;
   }, [messages]);
-
-  // Pre-compute parent IDs that have responses from multiple distinct models
-  // (from in-store messages — may be incomplete after fetchMessages since DB only returns active)
-  const multiModelResponseParents = useMemo(() => {
-    const modelsByParent = new Map<string, Set<string>>();
-    for (const msg of messages) {
-      if (msg.role === 'assistant' && msg.parent_message_id) {
-        if (!modelsByParent.has(msg.parent_message_id)) {
-          modelsByParent.set(msg.parent_message_id, new Set());
-        }
-        // Use model_id if available; fall back to a per-message key so that
-        // error messages (which may lack model_id) are still counted as
-        // distinct model responses and don't break multi-model detection.
-        modelsByParent.get(msg.parent_message_id)!.add(msg.model_id || `__no_model_${msg.id}`);
-      }
-    }
-    const result = new Set<string>();
-    for (const [parentId, models] of modelsByParent) {
-      if (models.size > 1) result.add(parentId);
-    }
-    return result;
-  }, [messages]);
-
-  // Ref-based multi-model version cache — updated by AssistantFooter when it
-  // loads all versions from DB (which includes inactive versions not in store).
-  const multiModelVersionsRef = useRef<Map<string, Message[]>>(new Map());
-  const handleMultiModelDetected = useCallback((parentMsgId: string, versions: Message[]) => {
-    const hadCached = multiModelVersionsRef.current.has(parentMsgId);
-    const stillMultiModel = hasMultipleModelVersions(versions);
-
-    if (stillMultiModel) {
-      multiModelVersionsRef.current.set(parentMsgId, versions);
-    } else {
-      multiModelVersionsRef.current.delete(parentMsgId);
-    }
-
-    if (hadCached !== stillMultiModel || !multiModelResponseParents.has(parentMsgId)) {
-      // Trigger re-render so aiRole picks up the updated cache state.
-      setDisplayModeOverrides((prev) => new Map(prev));
-    }
-  }, [multiModelResponseParents]);
-
-  // Per-message display mode overrides (temporary, not persisted)
-  const [displayModeOverrides, setDisplayModeOverrides] = useState<Map<string, MultiModelDisplayMode>>(new Map());
   const [displayVersionOverrides, setDisplayVersionOverrides] = useState<Map<string, Map<string, string>>>(new Map());
   const [pendingDisplayVersionSelections, setPendingDisplayVersionSelections] = useState<Map<string, Map<string, PendingDisplayVersionSelection>>>(new Map());
-  const handleDisplayModeOverride = useCallback((parentMsgId: string, mode: MultiModelDisplayMode) => {
-    setDisplayModeOverrides((prev) => {
-      const next = new Map(prev);
-      next.set(parentMsgId, mode);
-      return next;
-    });
-  }, []);
+  const transientCacheConversationIdRef = useRef(activeConversationId);
+
+  useEffect(() => {
+    if (transientCacheConversationIdRef.current === activeConversationId) return;
+    transientCacheConversationIdRef.current = activeConversationId;
+    contentRendererMessageIdsRef.current.clear();
+    if (streamingMessageId) contentRendererMessageIdsRef.current.add(streamingMessageId);
+    setDisplayVersionOverrides((prev) => (prev.size > 0 ? new Map() : prev));
+    setPendingDisplayVersionSelections((prev) => (prev.size > 0 ? new Map() : prev));
+  }, [activeConversationId, streamingMessageId]);
+
+  useEffect(() => {
+    contentRendererMessageIdsRef.current = retainSetValues(
+      contentRendererMessageIdsRef.current,
+      retainedChatCacheKeys.messageIds,
+    );
+    retainDisplayModes(retainedChatCacheKeys.parentIds);
+    setDisplayVersionOverrides((prev) => retainMapKeys(prev, retainedChatCacheKeys.parentIds));
+    setPendingDisplayVersionSelections((prev) => retainMapKeys(prev, retainedChatCacheKeys.parentIds));
+  }, [retainDisplayModes, retainedChatCacheKeys]);
+
   const handleDisplayVersionOverride = useCallback((parentMsgId: string, modelKey: string, messageId: string) => {
     setDisplayVersionOverrides((prev) => {
       const next = new Map(prev);
@@ -3274,7 +1355,7 @@ export function ChatView() {
 
       if (msg.role === 'user') {
         const { userContent } = userSearchContentById.get(msg.id) ?? parseSearchContent(msg.content);
-        const signature = `user:${userContent}`;
+        const signature = `user:${createChatContentFingerprint(userContent)}`;
         const cached = cache.get(msg.id);
         const item = cached?.signature === signature
           ? cached.item
@@ -3307,7 +1388,13 @@ export function ChatView() {
       const stableKey = msg.parent_message_id ? `ai:${msg.parent_message_id}` : msg.id;
       if (nextCache.has(stableKey)) continue; // already rendered for this parent
       const displaySignature = msg.role === 'assistant' ? searchDisplayByMessageId[msg.id] ?? '' : '';
-      const signature = `ai:${msg.id}:${displaySignature}:${aiContent}`;
+      const signature = [
+        'ai',
+        msg.id,
+        msg.status,
+        createChatContentFingerprint(displaySignature),
+        createChatContentFingerprint(aiContent),
+      ].join(':');
       const cached = cache.get(stableKey);
       const item = cached?.signature === signature
         ? cached.item
@@ -3337,8 +1424,21 @@ export function ChatView() {
   const lastBubbleKey = finalBubbleItems.length > 0
     ? String(finalBubbleItems[finalBubbleItems.length - 1].key)
     : '';
+  const lastAutoScrollRequestRef = useRef<{
+    items: typeof finalBubbleItems;
+    stickToBottom: boolean;
+  } | null>(null);
 
   useEffect(() => {
+    const previousRequest = lastAutoScrollRequestRef.current;
+    if (
+      previousRequest?.items === finalBubbleItems
+      && previousRequest.stickToBottom === stickToBottom
+    ) {
+      return;
+    }
+    lastAutoScrollRequestRef.current = { items: finalBubbleItems, stickToBottom };
+
     const rafId = window.requestAnimationFrame(() => {
       if (stickToBottom) {
         bubbleListRef.current?.scrollTo({ top: 'bottom', behavior: 'auto' });
@@ -3368,12 +1468,7 @@ export function ChatView() {
       window.cancelAnimationFrame(frame2);
     };
   }, [activeConversationId, bubbleItems.length, lastBubbleKey]);
-  const aiContentNodesCacheRef = useRef<Map<string, {
-    content: string;
-    nodes: ChatMarkdownNode[];
-  }>>(new Map());
   const aiContentNodesById = useMemo(() => {
-    const cache = aiContentNodesCacheRef.current;
     const next = new Map<string, ChatMarkdownNode[]>();
 
     for (const item of bubbleItems) {
@@ -3404,25 +1499,19 @@ export function ChatView() {
 
       const messageId = String(item.key);
       if (shouldDeferAssistantMarkdownParse(item.content)) {
-        cache.delete(messageId);
         continue;
       }
 
-      const cached = cache.get(messageId);
-      if (cached && cached.content === item.content) {
-        next.set(messageId, cached.nodes);
+      const renderableContent = normalizeStoredMediaUrlsForPlatform(item.content);
+      const cached = getCachedChatMarkdown(messageId, renderableContent);
+      if (cached) {
+        next.set(messageId, cached);
         continue;
       }
 
-      const nodes = safeParseChatMarkdown(item.content);
-      cache.set(messageId, { content: item.content, nodes });
+      const nodes = safeParseChatMarkdown(renderableContent);
+      setCachedChatMarkdown(messageId, renderableContent, nodes);
       next.set(messageId, nodes);
-    }
-
-    for (const messageId of Array.from(cache.keys())) {
-      if (!next.has(messageId)) {
-        cache.delete(messageId);
-      }
     }
 
     return next;
@@ -3500,13 +1589,14 @@ export function ChatView() {
           fallback={(
             <MessageRenderFallback
               content={content}
-              notice={t('chat.messageRenderFallback', { defaultValue: '该消息渲染失败，已切换为纯文本' })}
+              notice={t('chat.messageRenderFallback')}
               textAlign={textAlign}
             />
           )}
         >
           <AssistantMarkdown
             content={content}
+            cacheKey={msg?.id ?? `user:${createChatContentFingerprint(content)}`}
             isDarkMode={isDarkMode}
             isStreaming={false}
             codeBlockDarkTheme={codeBlockDarkTheme}
@@ -3521,31 +1611,39 @@ export function ChatView() {
       placement: 'end' as const,
       ...getBubbleVariant(true),
       avatar: userAvatar,
+      styles: getShareSelectBubbleStyles(msg?.id),
       contentRender: attachments.length > 0
-        ? (content: string) => (
+        ? (content: string) => wrapShareSelectableContent(msg?.id, (
             <div style={{ textAlign: 'right' }}>
               <span data-aqbot-msg={msg?.id} style={{ height: 0, overflow: 'hidden', lineHeight: 0 }} />
               {renderUserContent(content, 'right')}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: content ? 8 : 0, justifyContent: 'flex-end' }}>
                 {attachments.map((att, i) => (
-                  <AttachmentPreview
+                  <MessageAttachmentPreview
                     key={att.id || `${att.file_name}-${i}`}
-                    att={att}
+                    attachment={att}
                     themeColor={token.colorPrimary}
                   />
                 ))}
               </div>
             </div>
-          )
-        : (content: string) => (
+          ))
+        : (content: string) => wrapShareSelectableContent(msg?.id, (
             <>
               <span data-aqbot-msg={msg?.id} style={{ height: 0, overflow: 'hidden', lineHeight: 0 }} />
               {renderUserContent(content)}
             </>
-          ),
+          )),
       header: (
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <div onClick={(e) => handleShareSelectableClick(msg?.id, e)}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: shareSelectMode ? 'pointer' : undefined }}>
+            {shareSelectMode && msg && (
+              <Checkbox
+                checked={selectedShareMessageIds.includes(msg.id)}
+                onChange={() => toggleShareMessage(msg.id)}
+                onClick={(e) => e.stopPropagation()}
+              />
+            )}
             <Typography.Text style={{ fontSize: 13 }}>{profile.name || t('chat.you')}</Typography.Text>
             {msg && (
               <Typography.Text type="secondary" style={{ fontSize: 11 }}>
@@ -3555,7 +1653,7 @@ export function ChatView() {
           </div>
         </div>
       ),
-      footer: (
+      footer: shareSelectMode ? null : (
         <Actions
           items={[
             {
@@ -3619,44 +1717,34 @@ export function ChatView() {
         />
       ),
     };
-  }, [activeConversationId, codeBlockDarkTheme, codeBlockLightTheme, codeBlockThemes, deleteMessageGroup, formatTime, getBubbleVariant, handleEditMessage, isDarkMode, messageApi, messageById, profile.name, regenerateMessage, settings.code_font_family, settings.render_user_markdown, t, token.colorError, token.colorPrimary, userAvatar]);
+  }, [activeConversationId, codeBlockDarkTheme, codeBlockLightTheme, codeBlockThemes, deleteMessageGroup, formatTime, getBubbleVariant, getShareSelectBubbleStyles, handleEditMessage, handleShareSelectableClick, isDarkMode, messageApi, messageById, profile.name, regenerateMessage, selectedShareMessageIds, settings.code_font_family, settings.render_user_markdown, shareSelectMode, t, toggleShareMessage, token.colorError, token.colorPrimary, userAvatar, wrapShareSelectableContent]);
 
-  const renderStreamingStatusIndicator = useCallback((
-    activity: StreamActivity | undefined,
-    hasModelText: boolean,
-    style?: React.CSSProperties,
-  ) => {
-    const presentation = getStreamingStatusPresentation({
-      isStreaming: streaming,
-      activity,
-      now: streamStatusNow,
-      hasModelText,
-    });
-    if (!presentation) {
-      return null;
-    }
-
-    const color = presentation.tone === 'warning' ? token.colorWarning : token.colorPrimary;
-    return (
-      <span
-        className="aqbot-streaming-status"
-        aria-label={t(presentation.labelKey)}
-        style={{ color, ...style }}
-      >
-        <span className="aqbot-streaming-dots" aria-hidden="true">
-          <span /><span /><span />
-        </span>
-        <Typography.Text style={{ fontSize: 12, color }}>
-          {t(presentation.labelKey)}
-        </Typography.Text>
-      </span>
-    );
-  }, [streaming, streamStatusNow, t, token.colorPrimary, token.colorWarning]);
-
-  const aiRole = useCallback((bubbleData: BubbleItemType) => {
+  const renderAiRole = useCallback((bubbleData: BubbleItemType, column: LaneColumn | null) => {
     // bubbleData.key is parent_message_id for stable rendering
-    const msg = resolveAssistantMessageForBubbleKey(bubbleData.key, assistantByParentId, messageById);
-    const msgActivity = msg?.id ? streamActivityByMessageId[msg.id] : undefined;
+    const parentKey = normalizeAssistantBubbleParentKey(bubbleData.key);
+    const msg = column
+      ? (selectLaneAnswer(
+          renderableVersionsByParentId[parentKey] ?? [],
+          column,
+          assistantByParentId.get(parentKey)?.id,
+          displayVersionOverrides.get(parentKey),
+        ) ?? undefined)
+      : resolveAssistantMessageForBubbleKey(bubbleData.key, assistantByParentId, messageById);
+    if (column && !msg) {
+      const { modelName } = getModelDisplayInfo(column.modelId, column.providerId);
+      return {
+        placement: 'start' as const,
+        ...getBubbleVariant(false),
+        avatar: undefined,
+        contentRender: () => (
+          <Typography.Text type="secondary">{t('chat.multiModel.lanePlaceholder')}</Typography.Text>
+        ),
+        header: (
+          <Typography.Text style={{ fontSize: 13 }}>{modelName}</Typography.Text>
+        ),
+        footer: null,
+      };
+    }
     const isStreaming = isAssistantStreamingForRender({
       isStreaming: streaming,
       messageId: msg?.id,
@@ -3671,11 +1759,23 @@ export function ChatView() {
     const searchDisplayPrefix = msg?.id ? searchDisplayByMessageId[msg.id] : undefined;
     const ragDisplayPrefix = msg?.id ? ragDisplayByMessageId[msg.id] : undefined;
     const displayPrefix = `${searchDisplayPrefix ?? ''}${ragDisplayPrefix ?? ''}` || undefined;
-    const parsedNodes = shouldRenderFromContent || displayPrefix
+    const laneDisplayContent = msg
+      ? closeStreamingThinkBlock(
+          buildAssistantDisplayContent(msg, messageById),
+          thinkingActiveMessageIds.has(msg.id) || isStreaming,
+        )
+      : '';
+    const parsedNodes = column || shouldRenderFromContent || displayPrefix
       ? undefined
       : aiContentNodesById.get(String(bubbleData.key));
-    const { footerLoading: rawFooterLoading } = getStreamingLoadingState(isStreaming, bubbleData.content);
-    const hasModelText = hasModelVisibleContent(bubbleData.content, stripAssistantAqbotTags);
+    const { footerLoading: rawFooterLoading } = getStreamingLoadingState(
+      isStreaming,
+      column ? laneDisplayContent : bubbleData.content,
+    );
+    const hasModelText = hasModelVisibleContent(
+      column ? laneDisplayContent : bubbleData.content,
+      stripAssistantAqbotTags,
+    );
     const footerLoading = rawFooterLoading && hasModelText;
     // Never let Ant Design Bubble's loading state replace AI content while a
     // stream is active; the markdown renderer receives incremental content and
@@ -3683,14 +1783,14 @@ export function ChatView() {
     const isAgentMsg = activeConversation?.mode === 'agent';
     const bubbleLoading = false;
 
-    // Determine effective display mode for this message
     const parentId = msg?.parent_message_id;
-    // Check both store-based detection and ref-based detection (from AssistantFooter DB queries)
-    const hasMultiModels = !!parentId && (
-      multiModelResponseParents.has(parentId) || multiModelVersionsRef.current.has(parentId)
+    const hasMultiModels = !column && !!parentId && (
+      multiModelResponseParents.has(parentId)
+      || (parentId === multiModelParentId && pendingCompanionModelCount > 1)
     );
+    const hideLayoutSwitcher = Boolean(column) || shouldHideMultiModelLayoutSwitcher(chatChrome.kind);
     const effectiveDisplayMode: MultiModelDisplayMode = hasMultiModels
-      ? (displayModeOverrides.get(parentId) ?? settings.multi_model_display_mode ?? 'tabs')
+      ? getDisplayMode(parentId)
       : 'tabs';
     const isNonTabsMultiModel = hasMultiModels && effectiveDisplayMode !== 'tabs';
     const renderVersionContent = (versionMessage: Message, isVersionStreaming: boolean) => {
@@ -3710,7 +1810,7 @@ export function ChatView() {
         }
         if (shouldShowInitialStreamingDots(versionIsStreaming, versionContent, stripAssistantAqbotTags)) {
           return (
-            renderStreamingStatusIndicator(streamActivityByMessageId[versionMessage.id], false)
+            <StreamingStatusIndicator messageId={versionMessage.id} hasModelText={false} />
           );
         }
         return (
@@ -3718,12 +1818,13 @@ export function ChatView() {
             fallback={(
               <MessageRenderFallback
                 content={versionContent}
-                notice={t('chat.messageRenderFallback', { defaultValue: '该消息渲染失败，已切换为纯文本' })}
+                notice={t('chat.messageRenderFallback')}
               />
             )}
           >
             <AssistantMarkdown
               content={versionContent}
+              cacheKey={versionMessage.id}
               isDarkMode={isDarkMode}
               isStreaming={versionIsStreaming}
               codeBlockDarkTheme={codeBlockDarkTheme}
@@ -3735,30 +1836,20 @@ export function ChatView() {
         );
       };
 
-      if (versionIsStreaming) {
-        return (
-          <StreamingAssistantContent
-            messageId={versionMessage.id}
-            baseContent={versionMessage.content}
-            isStreaming={versionIsStreaming}
-          >
-            {(liveContent) => renderVersionNode(buildVersionContent(liveContent))}
-          </StreamingAssistantContent>
-        );
-      }
-
       return renderVersionNode(buildVersionContent(versionMessage.content));
     };
+    focusContentRendererRef.current = renderVersionContent;
 
     return {
       placement: 'start' as const,
       ...getBubbleVariant(false),
-      avatar: isNonTabsMultiModel ? undefined : renderConvIconForChat(32, msg?.model_id),
+      avatar: isNonTabsMultiModel || column ? undefined : renderConvIconForChat(32, msg?.model_id),
       loading: bubbleLoading,
+      styles: getShareSelectBubbleStyles(msg?.id),
       contentRender: (content: string) => {
-        const baseRenderContent = typeof content === 'string' && content.length > 0
-          ? content
-          : (msg?.content ?? '');
+        const baseRenderContent = column
+          ? laneDisplayContent
+          : (typeof content === 'string' && content.length > 0 ? content : (msg?.content ?? ''));
         const renderContentNode = (renderContent: string) => {
           const renderContentHasSearchDisplay = /<(?:web-search-query|web-search)\b[^>]*data-aqbot=["']1["'][^>]*>/i.test(renderContent);
           const effectiveDisplayPrefix = `${renderContentHasSearchDisplay ? '' : searchDisplayPrefix ?? ''}${ragDisplayPrefix ?? ''}` || undefined;
@@ -3776,13 +1867,7 @@ export function ChatView() {
           const msgMarker = <span data-aqbot-msg={msg?.id} style={{ height: 0, overflow: 'hidden', lineHeight: 0 }} />;
           // Multi-model non-tabs mode: render all versions in side-by-side or stacked layout
           if (isNonTabsMultiModel && parentId && activeConversationId) {
-            // Prefer ref-based versions (from AssistantFooter DB query, includes inactive)
-            // Fall back to store-based versions (only has active during normal load)
-            const refVersions = multiModelVersionsRef.current.get(parentId);
-            const storeVersions = messages.filter(
-              (m) => m.parent_message_id === parentId && m.role === 'assistant',
-            );
-            const allVersions = selectRenderableVersionSet(storeVersions, refVersions);
+            const allVersions = renderableVersionsByParentId[parentId] ?? [];
             return (
               <>
                 {msgMarker}
@@ -3803,6 +1888,7 @@ export function ChatView() {
                   streamingMessageId={streamingMessageId}
                   multiModelDoneMessageIds={multiModelDoneMessageIds}
                   getModelDisplayInfo={getModelDisplayInfo}
+                  onFocusVersion={openFocusedAssistant}
                   renderContent={renderVersionContent}
                 />
               </>
@@ -3819,12 +1905,13 @@ export function ChatView() {
                     fallback={(
                       <MessageRenderFallback
                         content={errorDisplay.prefix}
-                        notice={t('chat.messageRenderFallback', { defaultValue: '该消息渲染失败，已切换为纯文本' })}
+                        notice={t('chat.messageRenderFallback')}
                       />
                     )}
                   >
                     <AssistantMarkdown
                       content={errorDisplay.prefix}
+                      cacheKey={`${msg?.id ?? String(bubbleData.key)}:error-prefix`}
                       isDarkMode={isDarkMode}
                       isStreaming={false}
                       codeBlockDarkTheme={codeBlockDarkTheme}
@@ -3841,7 +1928,7 @@ export function ChatView() {
 
           if (!isAgentMsg && shouldShowInitialDots) {
             return (
-              <>{msgMarker}{renderStreamingStatusIndicator(msgActivity, false)}</>
+              <>{msgMarker}<StreamingStatusIndicator messageId={msg?.id} hasModelText={false} /></>
             );
           }
 
@@ -3867,7 +1954,7 @@ export function ChatView() {
           // In agent mode: show inline loading dots only when no content AND no permissions/asks yet
           if (isAgentMsg && shouldShowInitialDots && msgPermissions.length === 0 && msgAskUsers.length === 0) {
             return (
-              <>{msgMarker}{renderStreamingStatusIndicator(msgActivity, false)}</>
+              <>{msgMarker}<StreamingStatusIndicator messageId={msg?.id} hasModelText={false} /></>
             );
           }
 
@@ -3878,13 +1965,14 @@ export function ChatView() {
                 fallback={(
                   <MessageRenderFallback
                     content={renderContent}
-                    notice={t('chat.messageRenderFallback', { defaultValue: '该消息渲染失败，已切换为纯文本' })}
+                    notice={t('chat.messageRenderFallback')}
                   />
                 )}
               >
                 <AssistantMarkdown
                   content={renderContent}
                   nodes={parsedNodes}
+                  cacheKey={msg?.id ?? String(bubbleData.key)}
                   isDarkMode={isDarkMode}
                   isStreaming={isStreaming}
                   codeBlockDarkTheme={codeBlockDarkTheme}
@@ -3896,7 +1984,7 @@ export function ChatView() {
               </ChatMessageRenderBoundary>
               {!isAgentMsg && shouldShowInlineStatus && (
                 <div style={{ marginTop: 8 }}>
-                  {renderStreamingStatusIndicator(msgActivity, false)}
+                  <StreamingStatusIndicator messageId={msg?.id} hasModelText={false} />
                 </div>
               )}
               {msgPermissions.map((pr) => {
@@ -3914,6 +2002,8 @@ export function ChatView() {
                     toolName={pr.toolName}
                     input={pr.input}
                     status={permStatus}
+                    workingDirectory={pr.workingDirectory}
+                    riskLevel={pr.riskLevel}
                   />
                 );
               })}
@@ -3929,15 +2019,15 @@ export function ChatView() {
               {/* Show loading dots when agent is streaming but footer dots are NOT showing (no text content yet) */}
               {isAgentMsg && isStreaming && !footerLoading && (
                 <div style={{ marginTop: 8 }}>
-                  {renderStreamingStatusIndicator(msgActivity, hasModelText)}
+                  <StreamingStatusIndicator messageId={msg?.id} hasModelText={hasModelText} />
                 </div>
               )}
             </>
           );
         };
 
-        if (isStreaming && msg?.id) {
-          return (
+        if (isStreaming && msg?.id && !isNonTabsMultiModel) {
+          return wrapShareSelectableContent(msg.id, (
             <StreamingAssistantContent
               messageId={msg.id}
               baseContent={baseRenderContent}
@@ -3948,17 +2038,27 @@ export function ChatView() {
                 thinkingActiveMessageIds.has(msg.id) || isStreaming,
               ))}
             </StreamingAssistantContent>
-          );
+          ));
         }
 
-        return renderContentNode(baseRenderContent);
+        return wrapShareSelectableContent(msg?.id, renderContentNode(baseRenderContent));
       },
       header: (() => {
-        if (isNonTabsMultiModel) return null;
+        if (isNonTabsMultiModel && !shareSelectMode) return null;
         const { modelName, providerName } = getModelDisplayInfo(msg?.model_id, msg?.provider_id);
         return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+          <div
+            style={{ display: 'flex', flexDirection: 'column', gap: 2, cursor: shareSelectMode ? 'pointer' : undefined }}
+            onClick={(e) => handleShareSelectableClick(msg?.id, e)}
+          >
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {shareSelectMode && msg && (
+                <Checkbox
+                  checked={selectedShareMessageIds.includes(msg.id)}
+                  onChange={() => toggleShareMessage(msg.id)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              )}
               {providerName && (
                 <Tag style={{ fontSize: 11, margin: 0, padding: '0 4px', lineHeight: '18px', color: token.colorPrimary, backgroundColor: token.colorPrimaryBg, border: 'none' }}>{providerName}</Tag>
               )}
@@ -3979,7 +2079,7 @@ export function ChatView() {
           </div>
         );
       })(),
-      footer: msg && activeConversationId ? (
+      footer: shareSelectMode ? null : msg && activeConversationId ? (
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           {footerLoading && !isNonTabsMultiModel && (
             <div
@@ -3990,23 +2090,23 @@ export function ChatView() {
               }}
               aria-label={t('chat.generating')}
             >
-              {renderStreamingStatusIndicator(msgActivity, true)}
+              <StreamingStatusIndicator messageId={msg.id} hasModelText />
             </div>
           )}
-          {!isStreaming && (
-            <AssistantFooter
-              msg={msg}
-              conversationId={activeConversationId}
-              versions={msg.parent_message_id ? messageVersionsByParentId[msg.parent_message_id] : undefined}
-              assistantCopyText={assistantCopyText}
-              getModelDisplayInfo={getModelDisplayInfo}
-              onEditMessage={handleEditMessage}
-              displayMode={effectiveDisplayMode}
-              onDisplayModeChange={handleDisplayModeOverride}
-              onMultiModelDetected={handleMultiModelDetected}
-              onRegeneratedVersionCreated={handleGeneratedVersionCreated}
-            />
-          )}
+          {(!isStreaming || hasMultiModels) && <AssistantFooter
+            msg={msg}
+            conversationId={activeConversationId}
+            versions={column && msg.parent_message_id
+              ? filterVersionsForLane(renderableVersionsByParentId[msg.parent_message_id], column)
+              : msg.parent_message_id ? renderableVersionsByParentId[msg.parent_message_id] : undefined}
+            assistantCopyText={assistantCopyText}
+            getModelDisplayInfo={getModelDisplayInfo}
+            onEditMessage={handleEditMessage}
+            isStreaming={isStreaming}
+            displayMode={hideLayoutSwitcher ? undefined : effectiveDisplayMode}
+            onDisplayModeChange={hideLayoutSwitcher ? undefined : handleDisplayModeChange}
+            onRegeneratedVersionCreated={handleGeneratedVersionCreated}
+          />}
         </div>
       ) : footerLoading ? (
         <div
@@ -4017,11 +2117,16 @@ export function ChatView() {
           }}
           aria-label={t('chat.generating')}
         >
-          {renderStreamingStatusIndicator(msgActivity, true)}
+          <StreamingStatusIndicator messageId={msg?.id} hasModelText />
         </div>
       ) : null,
     };
-  }, [activeConversation, activeConversationId, activeMessages, agentPendingPermissions, agentToolCalls, aiContentNodesById, assistantByParentId, codeBlockDarkTheme, codeBlockLightTheme, codeBlockThemes, deleteMessage, displayModeOverrides, displayVersionOverrides, formatTime, getBubbleVariant, getModelDisplayInfo, handleBranchDisplayedVersion, handleDisplayModeOverride, handleDisplayVersionOverride, handleEditMessage, handleGeneratedVersionCreated, handleMultiModelDetected, handleRegenerateDisplayedVersion, handleSetContextVersion, handleSwitchDisplayedVersionModel, isDarkMode, messageById, messageVersionsByParentId, messages, multiModelDoneMessageIds, multiModelParentId, multiModelResponseParents, ragDisplayByMessageId, renderConvIconForChat, renderStreamingStatusIndicator, searchDisplayByMessageId, settings, streamActivityByMessageId, streaming, streamingMessageId, switchMessageVersion, t, token.colorPrimary, token.colorTextDescription]);
+  }, [activeConversation, activeConversationId, activeMessages, agentPendingPermissions, agentToolCalls, aiContentNodesById, assistantByParentId, chatChrome.kind, codeBlockDarkTheme, codeBlockLightTheme, codeBlockThemes, deleteMessage, displayVersionOverrides, formatTime, getBubbleVariant, getDisplayMode, getModelDisplayInfo, getShareSelectBubbleStyles, handleBranchDisplayedVersion, handleDisplayModeChange, handleDisplayVersionOverride, handleEditMessage, handleGeneratedVersionCreated, handleRegenerateDisplayedVersion, handleSetContextVersion, handleShareSelectableClick, handleSwitchDisplayedVersionModel, isDarkMode, messageById, messages, multiModelDoneMessageIds, multiModelParentId, multiModelResponseParents, pendingCompanionModelCount, ragDisplayByMessageId, renderConvIconForChat, renderableVersionsByParentId, searchDisplayByMessageId, selectedShareMessageIds, settings, shareSelectMode, streaming, streamingMessageId, switchMessageVersion, t, thinkingActiveMessageIds, toggleShareMessage, token.colorPrimary, token.colorTextDescription, wrapShareSelectableContent]);
+
+  const aiRole = useCallback(
+    (bubbleData: BubbleItemType) => renderAiRole(bubbleData, null),
+    [renderAiRole],
+  );
 
   const contextClearRole = useCallback((bubbleData: BubbleItemType) => {
     const msgId = String(bubbleData.content ?? '');
@@ -4083,13 +2188,8 @@ export function ChatView() {
           >
             <span
               style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}
-              onClick={async () => {
-                const convId = activeConversationId;
-                if (!convId) return;
-                const summary = await getCompressionSummary(convId);
-                setSummaryModalText(summary?.summary_text ?? t('chat.noSummary'));
-                setSummaryModalSummary(summary ?? null);
-                setSummaryModalOpen(true);
+              onClick={() => {
+                void openCompressionSummaryModal();
               }}
             >
               <Zap size={14} /> {t('chat.contextCompressed')}
@@ -4117,7 +2217,7 @@ export function ChatView() {
         </div>
       ),
     };
-  }, [activeConversationId, deleteCompression, getCompressionSummary, t, token.colorPrimary, token.colorPrimaryBorder, token.colorTextTertiary]);
+  }, [activeConversationId, deleteCompression, openCompressionSummaryModal, t, token.colorPrimary, token.colorPrimaryBorder, token.colorTextTertiary]);
 
   const contextCompressingRole = useCallback(() => {
     return {
@@ -4154,9 +2254,17 @@ export function ChatView() {
     'context-compressing': contextCompressingRole,
   }), [aiRole, contextClearRole, contextCompressedRole, contextCompressingRole, userRole]);
 
+  const makeLaneRoles = useCallback((column: LaneColumn): RoleType => ({
+    user: (bubbleData) => ({ ...userRole(bubbleData), avatar: undefined }),
+    ai: (bubbleData) => renderAiRole(bubbleData, column),
+    'context-clear': contextClearRole,
+    'context-compressed': contextCompressedRole,
+    'context-compressing': contextCompressingRole,
+  }), [contextClearRole, contextCompressedRole, contextCompressingRole, renderAiRole, userRole]);
+
   // ── Render ─────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex flex-col h-full min-h-0 min-w-0">
       {/* Bubble style overrides */}
       <style>{`
         @keyframes aqbot-think-spin {
@@ -4315,6 +2423,7 @@ export function ChatView() {
       `}</style>
 
       {/* Top Bar */}
+      {chatChrome.kind !== 'popout' && (
       <div className="flex items-center gap-2 px-3 py-3">
         {activeConversation ? (
           <>
@@ -4387,12 +2496,13 @@ export function ChatView() {
           </>
         )}
       </div>
+      )}
 
       {/* Message Area */}
       <div
         ref={messageAreaRef}
         data-message-area
-        className={`flex-1 min-h-0 overflow-hidden relative bubble-${bubbleStyle || 'modern'}${userMessageAreaClass}${aiMessageAreaClass}`}
+        className={`flex-1 min-h-0 min-w-0 overflow-hidden relative bubble-${bubbleStyle || 'modern'}${userMessageAreaClass}${aiMessageAreaClass}`}
         style={messageAreaStyle}
       >
         {messages.length === 0 ? (
@@ -4408,27 +2518,7 @@ export function ChatView() {
             </div>
           ) : (
             roleIntro ? (
-              <div
-                className="flex flex-col items-center justify-center h-full"
-                style={{ padding: '0 24px', textAlign: 'center', gap: 16 }}
-              >
-                {roleIntro.openingMessage ? (
-                  <Typography.Text
-                    type="secondary"
-                    style={{ maxWidth: 620, fontSize: 15, lineHeight: 1.7 }}
-                  >
-                    {roleIntro.openingMessage}
-                  </Typography.Text>
-                ) : null}
-                {roleIntroPromptItems.length > 0 ? (
-                  <Prompts
-                    items={roleIntroPromptItems}
-                    onItemClick={handleRoleIntroPromptClick}
-                    wrap
-                    style={{ marginTop: 4, justifyContent: 'center' }}
-                  />
-                ) : null}
-              </div>
+              <RoleIntroPanel intro={roleIntro} onSelect={handleRoleIntroSelect} />
             ) : (
               <div className="flex flex-col items-center justify-center h-full" style={{ padding: '0 24px' }}>
                 <Typography.Title level={3} style={{ marginBottom: 24, fontWeight: 500 }}>
@@ -4445,6 +2535,38 @@ export function ChatView() {
           )
         ) : (
           <>
+            {useLaneWorkspace ? (
+              <div
+                style={{
+                  height: '100%',
+                  width: '100%',
+                  minWidth: 0,
+                  visibility: showingPreviousConversationWindow ? 'hidden' : undefined,
+                }}
+              >
+                <MultiModelLaneWorkspace
+                  columns={laneColumns}
+                  getModelDisplayInfo={getModelDisplayInfo}
+                  renderConversation={(column) => (
+                    <MultiModelColumnScroll>
+                      <Bubble.List
+                        items={finalBubbleItems}
+                        autoScroll
+                        onScroll={handleLaneBubbleScroll}
+                        role={makeLaneRoles(column)}
+                        style={{
+                          height: '100%',
+                          padding: popoutWidthMode === 'fit'
+                            ? '8px'
+                            : '10px 8px',
+                          overflowX: 'hidden',
+                        }}
+                      />
+                    </MultiModelColumnScroll>
+                  )}
+                />
+              </div>
+            ) : (
             <Bubble.List
               key={bubbleListThemeKey}
               ref={bubbleListRef}
@@ -4454,22 +2576,137 @@ export function ChatView() {
               role={roles}
               style={{
                 height: '100%',
+                visibility: showingPreviousConversationWindow ? 'hidden' : undefined,
                 padding: settings.chat_minimap_enabled && settings.chat_minimap_style === 'sticky'
                   ? '50px 24px 16px 24px'
                   : '16px 24px',
                 overflowX: 'hidden',
               }}
             />
-            <ChatScrollIndicator onUserScrollIntent={markUserScrollIntent} />
-            <MinimapScrollProvider scrollTo={minimapScrollTo} scrollBoxRef={scrollBoxRef}>
-              <ChatMinimap />
-            </MinimapScrollProvider>
+            )}
+            {shareSelectMode && (
+              <div
+                data-export-hide="true"
+                style={{
+                  position: 'absolute',
+                  left: '50%',
+                  bottom: 16,
+                  transform: 'translateX(-50%)',
+                  zIndex: 20,
+                  display: 'flex',
+                  flexDirection: 'row',
+                  flexWrap: 'nowrap',
+                  alignItems: 'center',
+                  gap: 12,
+                  padding: '10px 14px',
+                  borderRadius: 12,
+                  background: token.colorBgElevated,
+                  boxShadow: token.boxShadowSecondary,
+                  border: `1px solid ${token.colorBorderSecondary}`,
+                  maxWidth: 'min(720px, calc(100% - 32px))',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <Typography.Text style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>
+                  {t('chat.shareSelectedCount', { count: selectedShareMessageIds.length })}
+                </Typography.Text>
+                <Button size="small" onClick={selectAllShareMessages}>
+                  {t('chat.shareSelectAll')}
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<FileImage size={14} />}
+                  loading={shareExporting}
+                  disabled={selectedShareMessageIds.length === 0}
+                  onClick={() => { void exportSelectedShare('png'); }}
+                >
+                  {t('chat.exportPng')}
+                </Button>
+                <Dropdown
+                  menu={{
+                    items: [
+                      {
+                        key: 'md',
+                        icon: <FileCode size={14} />,
+                        label: t('chat.exportMd'),
+                        disabled: selectedShareMessageIds.length === 0 || shareExporting,
+                        onClick: () => { void exportSelectedShare('md'); },
+                      },
+                      {
+                        key: 'copy-md',
+                        icon: <Copy size={14} />,
+                        label: t('chat.copyMarkdown'),
+                        disabled: selectedShareMessageIds.length === 0 || shareExporting,
+                        onClick: () => { void exportSelectedShare('copy-md'); },
+                      },
+                    ],
+                  }}
+                  placement="top"
+                  trigger={['click']}
+                  disabled={selectedShareMessageIds.length === 0 || shareExporting}
+                >
+                  <Button
+                    size="small"
+                    disabled={selectedShareMessageIds.length === 0 || shareExporting}
+                  >
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      {t('chat.shareMoreFormats')}
+                      <ChevronDown size={12} />
+                    </span>
+                  </Button>
+                </Dropdown>
+                <Button size="small" icon={<X size={14} />} onClick={exitShareSelectMode}>
+                  {t('common.cancel')}
+                </Button>
+              </div>
+            )}
+            {!useLaneWorkspace && (
+              <ChatScrollIndicator
+                scrollRoot={messageAreaRef}
+                onUserScrollIntent={markUserScrollIntent}
+              />
+            )}
+            <MultiModelAnswerFocusLayer
+              open={Boolean(focusedAssistantMessageId)}
+              message={messages.find((message) => message.id === focusedAssistantMessageId) ?? null}
+              isVersionStreaming={Boolean(
+                focusedAssistantMessageId
+                && (focusedAssistantMessageId === streamingMessageId
+                  || messages.find((message) => message.id === focusedAssistantMessageId)?.status === 'partial'),
+              )}
+              getContainer={() => messageAreaRef.current}
+              renderContent={(message, isVersionStreaming) => focusContentRendererRef.current(message, isVersionStreaming)}
+              onClose={closeFocusedAssistant}
+            />
+            {!useLaneWorkspace && (
+              <MinimapScrollProvider scrollTo={minimapScrollTo} scrollBoxRef={scrollBoxRef}>
+                <ChatMinimap />
+              </MinimapScrollProvider>
+            )}
+            {showingPreviousConversationWindow && (
+              <div
+                className="absolute inset-0 flex flex-col items-center justify-center"
+                style={{
+                  gap: 12,
+                  padding: '0 24px',
+                  color: token.colorTextSecondary,
+                  background: token.colorBgContainer,
+                  zIndex: 1,
+                }}
+              >
+                <SyncOutlined spin style={{ fontSize: 20, color: token.colorPrimary }} />
+                <Typography.Text type="secondary">
+                  {t('chat.loadingConversation')}
+                </Typography.Text>
+              </div>
+            )}
           </>
         )}
       </div>
 
       {/* Agent status bar */}
-      {currentAgentStatus && (
+      {currentAgentStatusText && (
         <div
           style={{
             display: 'flex',
@@ -4480,13 +2717,13 @@ export function ChatView() {
             color: token.colorTextSecondary,
           }}
         >
-          <Spin size="small" /> {currentAgentStatus}
+          <Spin size="small" /> {currentAgentStatusText}
         </div>
       )}
 
       {/* Input Area */}
       <div className="relative">
-        {showScrollToBottom && (
+        {!useLaneWorkspace && showScrollToBottom && (
           <Button
             size="small"
             shape="round"
@@ -4512,32 +2749,106 @@ export function ChatView() {
         onCancel={() => {
           setSummaryModalOpen(false);
           setSummaryModalSummary(null);
+          setSummaryModalTab('summary');
         }}
-        footer={null}
+        footer={
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <Button
+              icon={<RotateCcw size={14} />}
+              loading={summaryRetrying || compressing}
+              disabled={!summaryModalSummary?.source_text}
+              onClick={async () => {
+                if (!summaryModalSummary?.source_text) {
+                  messageApi.warning(t('chat.retryCompressionNoSource'));
+                  return;
+                }
+                setSummaryRetrying(true);
+                try {
+                  const next = await retryCompression();
+                  if (next) {
+                    setSummaryModalSummary(next);
+                    setSummaryModalText(next.summary_text);
+                    setSummaryModalTab('summary');
+                    messageApi.success(t('chat.retryCompressionSuccess'));
+                  }
+                } catch {
+                  messageApi.error(t('chat.retryCompressionFailed'));
+                } finally {
+                  setSummaryRetrying(false);
+                }
+              }}
+            >
+              {t('chat.retryCompression')}
+            </Button>
+            <Button
+              onClick={() => {
+                setSummaryModalOpen(false);
+                setSummaryModalSummary(null);
+                setSummaryModalTab('summary');
+              }}
+            >
+              {t('common.close')}
+            </Button>
+          </div>
+        }
         width={640}
       >
         <div style={{ maxHeight: 480, overflow: 'auto', padding: '8px 0' }}>
           {summaryModalSummary && (
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
               {summaryModalSummary.model_used && (
-                <Tag>{t('chat.summaryModel', '模型')}: {summaryModalSummary.model_used}</Tag>
+                <Tag>{t('chat.summaryModel')}: {summaryModalSummary.model_used}</Tag>
               )}
               {summaryModalSummary.token_count != null && (
-                <Tag>{t('chat.summaryTokens', '摘要 tokens')}: {summaryModalSummary.token_count.toLocaleString()}</Tag>
+                <Tag>{t('chat.summaryTokens')}: {summaryModalSummary.token_count.toLocaleString()}</Tag>
               )}
               {summaryBoundaryLabel && (
-                <Tag>{t('chat.summaryBoundary', '压缩到')}: {summaryBoundaryLabel}</Tag>
+                <Tag>{t('chat.summaryBoundary')}: {summaryBoundaryLabel}</Tag>
               )}
             </div>
           )}
-          <NodeRenderer
-            content={summaryModalText}
-            isDark={isDarkMode}
-            customId="summary"
-            final
-            themes={codeBlockThemes}
-            codeBlockLightTheme={codeBlockLightTheme}
-            codeBlockDarkTheme={codeBlockDarkTheme}
+          <Tabs
+            activeKey={summaryModalTab}
+            onChange={(key) => setSummaryModalTab(key as 'summary' | 'source')}
+            items={[
+              {
+                key: 'summary',
+                label: t('chat.compressionSummary'),
+                children: (
+                  <NodeRenderer
+                    content={summaryModalText || t('chat.noSummary')}
+                    isDark={isDarkMode}
+                    customId="summary"
+                    final
+                    themes={codeBlockThemes}
+                    codeBlockLightTheme={codeBlockLightTheme}
+                    codeBlockDarkTheme={codeBlockDarkTheme}
+                  />
+                ),
+              },
+              {
+                key: 'source',
+                label: t('chat.compressionSource'),
+                children: summaryModalSummary?.source_text ? (
+                  <pre
+                    style={{
+                      margin: 0,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word',
+                      fontSize: 12,
+                      lineHeight: 1.5,
+                      color: token.colorText,
+                    }}
+                  >
+                    {summaryModalSummary.source_text}
+                  </pre>
+                ) : (
+                  <div style={{ color: token.colorTextSecondary, fontSize: 13 }}>
+                    {t('chat.noSourceText')}
+                  </div>
+                ),
+              },
+            ]}
           />
         </div>
       </Modal>

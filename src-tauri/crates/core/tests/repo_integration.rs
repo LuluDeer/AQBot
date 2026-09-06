@@ -110,6 +110,7 @@ async fn test_provider_crud() {
         provider_type: ProviderType::OpenAI,
         api_host: "https://api.openai.com".into(),
         api_path: None,
+        aws_region: None,
         enabled: true,
     };
     let prov = provider::create_provider(db, input).await.unwrap();
@@ -126,6 +127,7 @@ async fn test_provider_crud() {
         name: Some("OpenAI v2".into()),
         api_host: None,
         api_path: None,
+        aws_region: None,
         enabled: None,
         proxy_config: None,
         sort_order: None,
@@ -160,6 +162,7 @@ async fn test_provider_key_operations() {
             provider_type: ProviderType::Custom,
             api_host: "https://example.com".into(),
             api_path: None,
+            aws_region: None,
             enabled: true,
         },
     )
@@ -211,6 +214,7 @@ async fn test_provider_model_operations() {
             provider_type: ProviderType::Anthropic,
             api_host: "https://api.anthropic.com".into(),
             api_path: None,
+            aws_region: None,
             enabled: true,
         },
     )
@@ -224,9 +228,13 @@ async fn test_provider_model_operations() {
         group_name: Some("claude-3".into()),
         model_type: ModelType::Chat,
         capabilities: vec![ModelCapability::TextChat],
-        max_tokens: Some(4096),
+        context_window: Some(4096),
+        max_output_tokens: None,
         enabled: true,
         param_overrides: None,
+        image_config: None,
+        metadata_state: None,
+        aliases: Vec::new(),
     }];
 
     // save models
@@ -342,6 +350,16 @@ async fn test_conversation_update_input() {
         enabled_mcp_server_ids: Some(vec!["mcp-a".into(), "mcp-b".into()]),
         enabled_knowledge_base_ids: Some(vec!["kb-a".into()]),
         enabled_memory_namespace_ids: Some(vec!["mem-a".into()]),
+        context_compression: None,
+        context_message_limit: Some(Some(3)),
+        compression_keep_last_n: None,
+        context_strategy_override: None,
+        multi_model_display_mode_override: None,
+        multi_model_targets: None,
+        multi_model_continuation_mode: None,
+        category_id: None,
+        parent_conversation_id: None,
+        mode: None,
     };
     let updated = conversation::update_conversation(db, &conv.id, input)
         .await

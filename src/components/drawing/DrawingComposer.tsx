@@ -3,20 +3,51 @@ import { ArrowUp, GripHorizontal, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@/lib/invoke';
+import { loadStoredMediaSource } from '@/lib/storedMedia';
 import { useDrawingStore } from '@/stores/drawingStore';
-import type { DrawingImage, DrawingSettings } from '@/types';
+import { usePageTransientOpenState } from '@/components/layout/PageLifecycle';
+import type {
+  DrawingBackground,
+  DrawingGenerateInput,
+  DrawingImage,
+  DrawingOutputFormat,
+  DrawingQuality,
+  DrawingSettings,
+  ImageModelDescriptor,
+  ImageOperation,
+} from '@/types';
 
 interface Props {
   settings: DrawingSettings;
   prompt: string;
   onPromptChange: (value: string) => void;
   onHeightChange?: (height: number) => void;
+  supportedOperations?: ImageOperation[];
+  targetDescriptor?: ImageModelDescriptor;
+  targetAvailable?: boolean;
 }
 
 const TEXTAREA_MIN_HEIGHT = 72;
 const TEXTAREA_MAX_HEIGHT = 260;
 const PASTED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp']);
+const DRAWING_QUALITIES = new Set<DrawingQuality>([
+  'low',
+  'medium',
+  'high',
+  'standard',
+  'hd',
+  'auto',
+]);
+const DRAWING_OUTPUT_FORMATS = new Set<DrawingOutputFormat>(['png', 'jpeg', 'webp']);
+const DRAWING_BACKGROUNDS = new Set<DrawingBackground>(['auto', 'opaque', 'transparent']);
+
+function normalizedDrawingValue<T extends string>(
+  value: unknown,
+  allowed: Set<T>,
+  fallback: T,
+): T {
+  return typeof value === 'string' && allowed.has(value as T) ? value as T : fallback;
+}
 
 function clampTextareaHeight(value: number) {
   return Math.min(TEXTAREA_MAX_HEIGHT, Math.max(TEXTAREA_MIN_HEIGHT, value));
@@ -54,6 +85,7 @@ function DrawingEditPreview({ image, previewUrl }: { image: DrawingImage; previe
   const { t } = useTranslation();
   const { token } = theme.useToken();
   const [src, setSrc] = useState<string | null>(previewUrl);
+  const [previewOpen, setPreviewOpen] = usePageTransientOpenState();
 
   useEffect(() => {
     if (previewUrl) {
@@ -63,11 +95,11 @@ function DrawingEditPreview({ image, previewUrl }: { image: DrawingImage; previe
 
     let cancelled = false;
     setSrc(null);
-    invoke<string>('read_attachment_preview', { filePath: image.storage_path })
+    loadStoredMediaSource(image.stored_file_id, image.storage_path)
       .then((data) => { if (!cancelled) setSrc(data); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [image.storage_path, previewUrl]);
+  }, [image.storage_path, image.stored_file_id, previewUrl]);
 
   return (
     <div
@@ -80,7 +112,7 @@ function DrawingEditPreview({ image, previewUrl }: { image: DrawingImage; previe
       {src ? (
         <Image
           src={src}
-          alt={t('drawing.editPreview', '编辑预览')}
+          alt={t('drawing.editPreview')}
           width={36}
           height={36}
           style={{
@@ -90,14 +122,27 @@ function DrawingEditPreview({ image, previewUrl }: { image: DrawingImage; previe
             objectFit: 'cover',
             borderRadius: 6,
           }}
-          preview={{ mask: { blur: true }, scaleStep: 0.5 }}
+          preview={{
+            open: previewOpen,
+            onOpenChange: setPreviewOpen,
+            mask: { blur: true },
+            scaleStep: 0.5,
+          }}
         />
       ) : null}
     </div>
   );
 }
 
-export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChange }: Props) {
+export function DrawingComposer({
+  settings,
+  prompt,
+  onPromptChange,
+  onHeightChange,
+  supportedOperations,
+  targetDescriptor,
+  targetAvailable = true,
+}: Props) {
   const { t } = useTranslation();
   const { token } = theme.useToken();
   const { message } = App.useApp();
@@ -116,6 +161,14 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
   const [resizing, setResizing] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const resizeStateRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const requestedOperation: ImageOperation = editMaskFileId
+    ? 'mask_edit'
+    : editSourceImage || references.length > 0
+      ? 'edit'
+      : 'generate';
+  const operationSupported = supportedOperations === undefined
+    || supportedOperations.includes(requestedOperation);
+  const submissionAvailable = targetAvailable && operationSupported;
 
   const handleResizeStart = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -145,6 +198,8 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
     return () => {
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
+      resizeStateRef.current = null;
+      setResizing(false);
     };
   }, [resizing]);
 
@@ -165,32 +220,107 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
   }, [onHeightChange, textareaHeight, editSourceImage, editMaskFileId]);
 
   const handleSubmit = async () => {
+    if (!submissionAvailable) {
+      message.warning(t(
+        'drawing.operationUnavailable',
+      ));
+      return;
+    }
     if (!settings.providerId) {
-      message.warning(t('drawing.selectProvider', '选择 OpenAI Provider'));
+      message.warning(t('drawing.selectProvider'));
       return;
     }
     const promptText = prompt.trim();
     if (!promptText) {
-      message.warning(t('drawing.promptRequired', '请输入提示词'));
+      message.warning(t('drawing.promptRequired'));
       return;
     }
     try {
-      const base = {
+      const targetKey = `${settings.providerId}::${settings.modelId}`;
+      const storedParameters =
+        settings.parametersByTarget?.[targetKey] ?? settings.parameters ?? {};
+      const descriptorParameters = new Map(
+        targetDescriptor?.parameters.map((parameter) => [parameter.key, parameter]) ?? [],
+      );
+      const parameterValue = (key: string, legacy: unknown, fallback: unknown) => {
+        const descriptor = descriptorParameters.get(key);
+        const candidate = storedParameters[key] ?? legacy ?? descriptor?.default ?? fallback;
+        if (descriptor?.options.length && !descriptor.options.includes(candidate)) {
+          return descriptor.default;
+        }
+        if (descriptor?.kind === 'number') {
+          const number = Number(candidate);
+          if (
+            !Number.isFinite(number)
+            || (descriptor.min !== null && number < descriptor.min)
+            || (descriptor.max !== null && number > descriptor.max)
+          ) {
+            return descriptor.default;
+          }
+        }
+        return candidate;
+      };
+      const supportsParameter = (key: string) =>
+        targetDescriptor === undefined || descriptorParameters.has(key);
+      const outputFormat = supportsParameter('output_format')
+        ? normalizedDrawingValue(
+          parameterValue('output_format', settings.outputFormat, 'png'),
+          DRAWING_OUTPUT_FORMATS,
+          'png',
+        )
+        : 'png';
+      const storedCompression =
+        storedParameters.output_compression ?? settings.outputCompression;
+      const parameters = Object.fromEntries(
+        Object.entries(storedParameters).filter(([key]) =>
+          descriptorParameters.has(key)
+          && ![
+            'size',
+            'quality',
+            'output_format',
+            'background',
+            'output_compression',
+            'n',
+          ].includes(key),
+        ),
+      );
+      const base: DrawingGenerateInput = {
         provider_id: settings.providerId,
         model_id: settings.modelId,
         prompt: promptText,
-        size: settings.size,
-        quality: settings.quality,
-        output_format: settings.outputFormat,
-        background: settings.background,
-        output_compression: settings.outputCompression,
+        size: supportsParameter('size')
+          ? String(parameterValue('size', settings.size, 'auto'))
+          : 'auto',
+        quality: supportsParameter('quality')
+          ? normalizedDrawingValue(
+            parameterValue('quality', settings.quality, 'auto'),
+            DRAWING_QUALITIES,
+            'auto',
+          )
+          : 'auto',
+        output_format: outputFormat,
+        background: supportsParameter('background')
+          ? normalizedDrawingValue(
+            parameterValue('background', settings.background, 'auto'),
+            DRAWING_BACKGROUNDS,
+            'auto',
+          )
+          : 'auto',
+        output_compression: supportsParameter('output_compression')
+          && storedCompression !== undefined
+          && storedCompression !== null
+          ? Number(parameterValue('output_compression', storedCompression, 90))
+          : undefined,
         reference_image_mode: settings.referenceImageMode,
         reference_image_format: settings.referenceImageFormat,
         reference_image_param_name: settings.referenceImageParamName,
-        n: settings.n,
+        n: supportsParameter('n')
+          ? Number(parameterValue('n', settings.n, 1))
+          : 1,
         reference_file_ids: references.map((item) => item.id),
         generation_api_path: settings.generationApiPath,
         edit_api_path: settings.editApiPath,
+        parameters,
       };
       onPromptChange('');
       if (editSourceImage && editMaskFileId) {
@@ -217,7 +347,7 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
     void (async () => {
       try {
         await Promise.all(imageFiles.map((file) => uploadReferenceImage(file)));
-        message.success?.(t('drawing.referenceAdded', '已加入参考图'));
+        message.success?.(t('drawing.referenceAdded'));
       } catch (error) {
         message.error?.(String(error));
       }
@@ -262,7 +392,7 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
             <DrawingEditPreview image={editSourceImage} previewUrl={editPreviewUrl} />
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               <Tag color={editMaskFileId ? 'green' : 'blue'} style={{ width: 'fit-content', marginInlineEnd: 0 }}>
-                {editMaskFileId ? t('drawing.maskEditMode', '区域编辑模式') : t('drawing.editMode', '编辑模式')}
+                {editMaskFileId ? t('drawing.maskEditMode') : t('drawing.editMode')}
               </Tag>
               <span className="min-w-0 truncate" style={{ fontSize: 12, color: token.colorTextSecondary }}>
                 {editSourceImage.storage_path}
@@ -283,7 +413,7 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
               handleSubmit();
             }
           }}
-          placeholder={t('drawing.promptPlaceholder', '输入你想生成的画面')}
+          placeholder={t('drawing.promptPlaceholder')}
           rows={2}
           style={{
             width: '100%',
@@ -310,7 +440,7 @@ export function DrawingComposer({ settings, prompt, onPromptChange, onHeightChan
             size="small"
             icon={<ArrowUp size={14} />}
             loading={submitting}
-            disabled={!prompt.trim()}
+            disabled={!prompt.trim() || !submissionAvailable}
             onClick={handleSubmit}
           />
         </div>

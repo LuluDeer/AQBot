@@ -1,23 +1,37 @@
 import { useState, useMemo, useCallback, useEffect, useRef, memo } from 'react'
-import { Button, Input, App, theme, Tooltip, Avatar, Checkbox, Dropdown, Empty } from 'antd'
+import { Button, Input, App, theme, Tooltip, Checkbox, Dropdown, Empty } from 'antd'
 import { MessageSquarePlus, Search, Archive, ListTodo, Trash2, Pencil, Share, Pin, PinOff, Loader, X, Undo2, ArrowLeft, FileImage, FileCode, FileType, FileText, FolderPlus, FolderOpen, GripVertical, ChevronRight, MessageSquareText, Sparkles } from 'lucide-react'
-import { getConvIcon } from '@/lib/convIcon'
-import { exportAsMarkdown, exportAsText, exportAsPNG, exportAsJSON } from '@/lib/exportChat'
+import { exportAsMarkdown, exportAsText, exportMessagesAsPNG, exportAsJSON } from '@/lib/exportChat'
+import { buildExportOptions } from '@/lib/exportChatPresentation'
 import { invoke } from '@/lib/invoke'
-import Conversations from '@ant-design/x/es/conversations'
+import { useUserProfileStore } from '@/stores/userProfileStore'
+import { useResolvedAvatarSrc } from '@/hooks/useResolvedAvatarSrc'
 import type { ConversationItemType } from '@ant-design/x/es/conversations/interface'
 import { useTranslation } from 'react-i18next'
 import { useConversationStore, useProviderStore, useSettingsStore, useCategoryStore } from '@/stores'
+import { selectLiveStreamingConversationKey } from '@/stores/conversationStore'
+import { conversationIdsFromStreamingKey } from '@/stores/conversationRunRegistry'
 import { getShortcutBinding, formatShortcutForDisplay } from '@/lib/shortcuts'
 import type { ShortcutAction } from '@/lib/shortcuts'
 import type { Conversation, Message, ConversationCategory } from '@/types'
-import { useResolvedAvatarSrc } from '@/hooks/useResolvedAvatarSrc'
 import type { AvatarType } from '@/stores/userProfileStore'
 import { CategoryEditModal, type CategoryEditFormData } from './CategoryEditModal'
-import { ConversationModelIcon } from './ConversationModelIcon'
+import { ConversationIcon } from './ConversationIcon'
+import { ConversationList, type ConversationMenuFactory } from './ConversationList'
+import { ArchivedConversationList } from './ArchivedConversationList'
+import {
+  buildConversationRows,
+  compareConversationOrder,
+  getUncategorizedConversationGroup,
+  planConversationReorder,
+  UNCATEGORIZED_GROUP_ORDER,
+  type ConversationListRow,
+} from './conversationListModel'
+import { usePageSuspendCleanup } from '@/components/layout/PageLifecycle'
 import {
   DndContext,
   closestCenter,
+  pointerWithin,
   PointerSensor,
   useSensor,
   useSensors,
@@ -27,7 +41,52 @@ import {
   type DragEndEvent,
   type DragStartEvent,
   type DragOverEvent,
+  type CollisionDetection,
 } from '@dnd-kit/core'
+
+const categoryDragId = (categoryId: string) => `category:${categoryId}`
+const conversationDragId = (conversationId: string) => `conversation:${conversationId}`
+
+function parseNamespacedDragId(rawId: string | number): {
+  type: 'category' | 'conversation' | null
+  id: string
+} {
+  const id = String(rawId)
+  if (id.startsWith('category:')) return { type: 'category', id: id.slice('category:'.length) }
+  if (id.startsWith('conversation:')) return { type: 'conversation', id: id.slice('conversation:'.length) }
+  return { type: null, id }
+}
+
+interface ConversationDragSnapshot {
+  conversationId: string
+  group: string
+  categoryId: string | null
+  conversationIds: string[]
+  sortOrderById: Map<string, number>
+}
+
+function applyConversationOrder(conversationIds: readonly string[]) {
+  const sortOrderById = new Map(conversationIds.map((id, index) => [id, index]))
+  useConversationStore.setState((state) => ({
+    conversations: state.conversations.map((conversation) => {
+      const sortOrder = sortOrderById.get(conversation.id)
+      return sortOrder === undefined
+        ? conversation
+        : { ...conversation, sort_order: sortOrder }
+    }),
+  }))
+}
+
+function restoreConversationOrder(snapshot: ConversationDragSnapshot) {
+  useConversationStore.setState((state) => ({
+    conversations: state.conversations.map((conversation) => {
+      const sortOrder = snapshot.sortOrderById.get(conversation.id)
+      return sortOrder === undefined
+        ? conversation
+        : { ...conversation, sort_order: sortOrder }
+    }),
+  }))
+}
 
 type DeleteShortcutEvent = Pick<React.MouseEvent<HTMLElement>, 'ctrlKey' | 'metaKey'>
 
@@ -63,23 +122,6 @@ function ConversationTitleText({ title, className = '' }: { title: string; class
   )
 }
 
-function getDateGroup(timestamp: number): string {
-  const now = new Date()
-  const date = new Date(timestamp * 1000)
-
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const startOfYesterday = new Date(startOfToday.getTime() - 86400000)
-  const dayOfWeek = startOfToday.getDay()
-  const startOfWeek = new Date(startOfToday.getTime() - dayOfWeek * 86400000)
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1)
-
-  if (date >= startOfToday) return 'today'
-  if (date >= startOfYesterday) return 'yesterday'
-  if (date >= startOfWeek) return 'thisWeek'
-  if (date >= startOfMonth) return 'thisMonth'
-  return 'earlier'
-}
-
 const CategoryIcon = memo(function CategoryIcon({ cat, size = 14 }: { cat: ConversationCategory; size?: number }) {
   const resolvedSrc = useResolvedAvatarSrc((cat.icon_type as AvatarType) ?? 'icon', cat.icon_value ?? '')
   if (cat.icon_type === 'emoji' && cat.icon_value) {
@@ -95,92 +137,6 @@ const CategoryIcon = memo(function CategoryIcon({ cat, size = 14 }: { cat: Conve
   return <FolderOpen size={size - 1} />
 })
 
-const ConversationIcon = memo(function ConversationIcon({
-  conv,
-  isStreaming,
-}: {
-  conv: Conversation
-  isStreaming: boolean
-}) {
-  const { token } = theme.useToken()
-  const { t } = useTranslation()
-  const customIcon = getConvIcon(conv.id)
-  const resolvedSrc = useResolvedAvatarSrc((customIcon?.type as AvatarType) ?? 'icon', customIcon?.value ?? '')
-  let icon: React.ReactNode
-
-  if (customIcon) {
-    if (customIcon.type === 'emoji') {
-      icon = <Avatar size={20} style={{ fontSize: 12, backgroundColor: token.colorPrimaryBg }}>{customIcon.value}</Avatar>
-    } else {
-      const src = customIcon.type === 'file'
-        ? (resolvedSrc ?? (customIcon.value.startsWith('data:') ? customIcon.value : undefined))
-        : customIcon.value
-      icon = <Avatar size={20} src={src} />
-    }
-  } else if (conv.model_id) {
-    icon = <ConversationModelIcon model={conv.model_id} size={20} />
-  } else {
-    icon = <Avatar size={20} style={{ fontSize: 12, backgroundColor: token.colorPrimaryBg, color: token.colorPrimary }}>{(conv.title || '对')[0]}</Avatar>
-  }
-
-  const modeBadge = conv.mode === 'agent' ? t('common.agentMode') : conv.mode === 'role' ? t('nav.roles') : null
-  if (modeBadge) {
-    icon = (
-      <span style={{ position: 'relative', display: 'inline-flex', width: 20, height: 20 }}>
-        {icon}
-        <span
-          style={{
-            position: 'absolute',
-            top: -5,
-            right: -11,
-            display: 'inline-flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            boxSizing: 'border-box',
-            padding: '0 3px',
-            height: 10,
-            lineHeight: 1,
-            borderRadius: 5,
-            fontSize: 7,
-            fontWeight: 600,
-            whiteSpace: 'nowrap',
-            color: token.colorPrimary,
-            background: token.colorPrimaryBg,
-            border: `1px solid ${token.colorBgContainer}`,
-            pointerEvents: 'none',
-            transform: 'scale(0.9)',
-            transformOrigin: 'right top',
-          }}
-        >
-          {modeBadge}
-        </span>
-      </span>
-    )
-  }
-
-  if (isStreaming) {
-    icon = (
-      <span style={{ position: 'relative', display: 'inline-flex' }}>
-        {icon}
-        <Loader
-          size={10}
-          style={{
-            position: 'absolute',
-            bottom: -3,
-            right: -3,
-            color: token.colorPrimary,
-            background: token.colorBgContainer,
-            borderRadius: '50%',
-            animation: 'spin 1s linear infinite',
-          }}
-        />
-      </span>
-    )
-  }
-
-  return icon
-})
-
 function SortableCategoryLabel({
   cat,
   onCreateConversation,
@@ -190,6 +146,8 @@ function SortableCategoryLabel({
   newConversationLabel,
   editLabel,
   deleteLabel,
+  systemPromptLabel,
+  disabled,
 }: {
   cat: ConversationCategory
   onCreateConversation: () => void
@@ -199,9 +157,21 @@ function SortableCategoryLabel({
   newConversationLabel: string
   editLabel: string
   deleteLabel: string
+  systemPromptLabel: string
+  disabled: boolean
 }) {
-  const { attributes, listeners, setNodeRef: setDragRef, isDragging } = useDraggable({ id: cat.id })
-  const { setNodeRef: setDropRef } = useDroppable({ id: cat.id })
+  const dragId = categoryDragId(cat.id)
+  const dragData = { type: 'category', categoryId: cat.id }
+  const { attributes, listeners, setNodeRef: setDragRef, isDragging } = useDraggable({
+    id: dragId,
+    data: dragData,
+    disabled,
+  })
+  const { setNodeRef: setDropRef } = useDroppable({
+    id: dragId,
+    data: dragData,
+    disabled,
+  })
   const mergedRef = useCallback((node: HTMLDivElement | null) => {
     setDragRef(node)
     setDropRef(node)
@@ -237,12 +207,74 @@ function SortableCategoryLabel({
         <CategoryIcon cat={cat} size={14} />
         <span className="truncate">{cat.name}</span>
         {cat.system_prompt && (
-          <Tooltip title="System Prompt">
+          <Tooltip title={systemPromptLabel}>
             <MessageSquareText size={12} style={{ opacity: 0.45, flexShrink: 0 }} />
           </Tooltip>
         )}
       </div>
     </Dropdown>
+  )
+}
+
+function SortableConversationLabel({
+  conversation,
+  group,
+  reorderLabel,
+  children,
+}: {
+  conversation: Conversation
+  group: string
+  reorderLabel: string
+  children: React.ReactNode
+}) {
+  const dragId = conversationDragId(conversation.id)
+  const dragData = {
+    type: 'conversation',
+    conversationId: conversation.id,
+    group,
+  }
+  const {
+    attributes,
+    listeners,
+    setNodeRef: setDragRef,
+    setActivatorNodeRef,
+    isDragging,
+  } = useDraggable({ id: dragId, data: dragData })
+  const { setNodeRef: setDropRef } = useDroppable({
+    id: dragId,
+    data: dragData,
+  })
+  const mergedRef = useCallback((node: HTMLSpanElement | null) => {
+    setDragRef(node)
+    setDropRef(node)
+  }, [setDragRef, setDropRef])
+
+  return (
+    <span
+      ref={mergedRef}
+      className="aqbot-chat-conversation-label"
+      style={{ opacity: isDragging ? 0.35 : 1 }}
+    >
+      <span
+        ref={setActivatorNodeRef}
+        {...attributes}
+        {...listeners}
+        role="button"
+        aria-label={reorderLabel}
+        title={reorderLabel}
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          alignItems: 'center',
+          cursor: 'grab',
+          display: 'inline-flex',
+          flexShrink: 0,
+          lineHeight: 0,
+        }}
+      >
+        <GripVertical size={12} aria-hidden="true" style={{ opacity: 0.45 }} />
+      </span>
+      {children}
+    </span>
   )
 }
 
@@ -258,47 +290,83 @@ export function ChatSidebar() {
   const deleteConversation = useConversationStore((s) => s.deleteConversation)
   const updateConversation = useConversationStore((s) => s.updateConversation)
   const togglePin = useConversationStore((s) => s.togglePin)
+  const setConversationTabPinned = useConversationStore((s) => s.setConversationTabPinned)
   const toggleArchive = useConversationStore((s) => s.toggleArchive)
   const archivedConversations = useConversationStore((s) => s.archivedConversations)
   const fetchArchivedConversations = useConversationStore((s) => s.fetchArchivedConversations)
   const batchDelete = useConversationStore((s) => s.batchDelete)
   const batchArchive = useConversationStore((s) => s.batchArchive)
-  const streamingConversationId = useConversationStore((s) => s.streamingConversationId)
+  const batchMoveToCategory = useConversationStore((s) => s.batchMoveToCategory)
+  const reorderConversations = useConversationStore((s) => s.reorderConversations)
+  const streamingConversationIds = conversationIdsFromStreamingKey(
+    useConversationStore(selectLiveStreamingConversationKey),
+  )
   const titleGeneratingConversationId = useConversationStore((s) => s.titleGeneratingConversationId)
   const regenerateTitle = useConversationStore((s) => s.regenerateTitle)
 
   const providers = useProviderStore((s) => s.providers)
   const settings = useSettingsStore((s) => s.settings)
-  const settingsLoading = useSettingsStore((s) => s.loading)
+  const profile = useUserProfileStore((s) => s.profile)
 
   const categories = useCategoryStore((s) => s.categories)
-  const fetchCategories = useCategoryStore((s) => s.fetchCategories)
+  const ensureCategoriesLoaded = useCategoryStore((s) => s.ensureCategoriesLoaded)
   const createCategory = useCategoryStore((s) => s.createCategory)
   const updateCategory = useCategoryStore((s) => s.updateCategory)
   const deleteCategory = useCategoryStore((s) => s.deleteCategory)
   const setCollapsed = useCategoryStore((s) => s.setCollapsed)
+  const conversationById = useMemo(
+    () => new Map(conversations.map((conversation) => [conversation.id, conversation])),
+    [conversations],
+  )
+  const categoryById = useMemo(
+    () => new Map(categories.map((category) => [category.id, category])),
+    [categories],
+  )
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   )
+  const dndCollisionDetection = useCallback<CollisionDetection>((args) => {
+    const activeType = args.active.data.current?.type
+    if (activeType !== 'category' && activeType !== 'conversation') return []
+    const collisionDetection = activeType === 'conversation' ? pointerWithin : closestCenter
+    return collisionDetection({
+      ...args,
+      droppableContainers: args.droppableContainers.filter(
+        (container) => container.data.current?.type === activeType,
+      ),
+    })
+  }, [])
 
   const [activeDragCatId, setActiveDragCatId] = useState<string | null>(null)
+  const [activeDragConversationId, setActiveDragConversationId] = useState<string | null>(null)
+  const [conversationReorderSaving, setConversationReorderSaving] = useState(false)
   const dragInitialOrderRef = useRef<string[]>([])
+  const conversationDragSnapshotRef = useRef<ConversationDragSnapshot | null>(null)
+  const conversationDragPreviewOrderRef = useRef<string[] | null>(null)
+  const conversationDragLastOverIdRef = useRef<string | null>(null)
+  const conversationReorderSavingRef = useRef(false)
+  const conversationReorderQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   const handleCategoryDragStart = useCallback((event: DragStartEvent) => {
-    setActiveDragCatId(String(event.active.id))
+    const parsed = parseNamespacedDragId(event.active.id)
+    const categoryId = String(event.active.data.current?.categoryId ?? parsed.id)
+    setActiveDragCatId(categoryId)
     dragInitialOrderRef.current = categories.map((c) => c.id)
   }, [categories])
 
   const handleCategoryDragOver = useCallback((event: DragOverEvent) => {
     const { active, over } = event
     if (!over || active.id === over.id) return
+    if (active.data.current?.type !== 'category' || over.data.current?.type !== 'category') return
+    const activeId = String(active.data.current.categoryId ?? parseNamespacedDragId(active.id).id)
+    const overId = String(over.data.current.categoryId ?? parseNamespacedDragId(over.id).id)
     const ids = categories.map((c) => c.id)
-    const oldIndex = ids.indexOf(String(active.id))
-    const newIndex = ids.indexOf(String(over.id))
+    const oldIndex = ids.indexOf(activeId)
+    const newIndex = ids.indexOf(overId)
     if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) return
     const newIds = [...ids]
     newIds.splice(oldIndex, 1)
-    newIds.splice(newIndex, 0, String(active.id))
+    newIds.splice(newIndex, 0, activeId)
     useCategoryStore.setState((s) => ({
       categories: newIds
         .map((id, i) => {
@@ -340,8 +408,6 @@ export function ChatSidebar() {
     return `${label} (${formatShortcutForDisplay(binding)})`
   }, [settings])
 
-  const [searchText, setSearchText] = useState('')
-  const [searchVisible, setSearchVisible] = useState(false)
   const [multiSelectMode, setMultiSelectMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [showArchived, setShowArchived] = useState(false)
@@ -351,7 +417,16 @@ export function ChatSidebar() {
   const [categoryModalOpen, setCategoryModalOpen] = useState(false)
   const [editingCategory, setEditingCategory] = useState<ConversationCategory | null>(null)
   const [expandedParentIds, setExpandedParentIds] = useState<Set<string>>(new Set())
+  const [expandedKeys, setExpandedKeys] = useState<string[]>([])
   const [directDeleteMode, setDirectDeleteMode] = useState(false)
+  const listScrollRef = useRef<HTMLDivElement>(null)
+
+  usePageSuspendCleanup(() => {
+    setCategoryModalOpen(false)
+    setEditingCategory(null)
+    setRightClickedConvId(null)
+    setDirectDeleteMode(false)
+  })
 
   useEffect(() => {
     const updateFromKeyboard = (event: KeyboardEvent) => {
@@ -372,67 +447,28 @@ export function ChatSidebar() {
   // Auto-expand parent when active conversation is a child
   useEffect(() => {
     if (!activeConversationId) return
-    const active = conversations.find((c) => c.id === activeConversationId)
+    const active = conversationById.get(activeConversationId)
     if (active?.parent_conversation_id && !expandedParentIds.has(active.parent_conversation_id)) {
       setExpandedParentIds((prev) => new Set(prev).add(active.parent_conversation_id!))
     }
-  }, [activeConversationId, conversations])
+  }, [activeConversationId, conversationById, expandedParentIds])
 
-  // Auto-select conversation: restore last selected, or fall back to first
   useEffect(() => {
-    if (!activeConversationId && conversations.length > 0 && !settingsLoading) {
-      const lastId = settings.last_selected_conversation_id
-      const lastConv = lastId ? conversations.find((c) => c.id === lastId) : null
-      if (lastConv) {
-        setActiveConversation(lastConv.id)
-      } else {
-        const sorted = [...conversations].sort((a, b) => {
-          if (a.is_pinned !== b.is_pinned) return a.is_pinned ? -1 : 1
-          return b.updated_at - a.updated_at
-        })
-        setActiveConversation(sorted[0].id)
-      }
-    }
-  }, [activeConversationId, conversations, setActiveConversation, settings.last_selected_conversation_id, settingsLoading])
-
-  // Persist last selected conversation
-  useEffect(() => {
-    if (activeConversationId && activeConversationId !== settings.last_selected_conversation_id) {
-      let idleId: number | null = null
-      const win = window as Window & {
-        requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number
-        cancelIdleCallback?: (handle: number) => void
-      }
-      const timeoutId = window.setTimeout(() => {
-        const persist = () => {
-          void useSettingsStore.getState().saveSettings({ last_selected_conversation_id: activeConversationId })
-        }
-        if (typeof win.requestIdleCallback === 'function') {
-          idleId = win.requestIdleCallback(persist, { timeout: 1000 })
-        } else {
-          persist()
-        }
-      }, 250)
-      return () => {
-        window.clearTimeout(timeoutId)
-        if (idleId !== null && typeof win.cancelIdleCallback === 'function') {
-          win.cancelIdleCallback(idleId)
-        }
-      }
-    }
-  }, [activeConversationId, settings.last_selected_conversation_id])
-
-  useEffect(() => { void fetchCategories() }, [fetchCategories])
+    void ensureCategoriesLoaded().catch((error) => {
+      console.error('[ChatSidebar] category load failed:', error)
+      messageApi.error(String(error))
+    })
+  }, [ensureCategoriesLoaded, messageApi])
 
   const activeConversation = useMemo(
-    () => conversations.find((c) => c.id === activeConversationId) ?? null,
-    [activeConversationId, conversations],
+    () => activeConversationId ? conversationById.get(activeConversationId) ?? null : null,
+    [activeConversationId, conversationById],
   )
 
   const activeConversationCategory = useMemo(() => {
     if (!activeConversation?.category_id) return null
-    return categories.find((cat) => cat.id === activeConversation.category_id) ?? null
-  }, [activeConversation?.category_id, categories])
+    return categoryById.get(activeConversation.category_id) ?? null
+  }, [activeConversation?.category_id, categoryById])
 
   const handleNewConversation = useCallback(async (categoryId?: string | null) => {
     let provider: typeof providers[0] | undefined
@@ -506,35 +542,34 @@ export function ChatSidebar() {
     };
   }, [handleNewConversation]);
 
-  const handleSearch = useCallback(
-    (value: string) => {
-      setSearchText(value)
-    },
-    [],
-  )
+  const openGlobalSearch = useCallback(() => {
+    window.dispatchEvent(new CustomEvent('aqbot:open-conversation-search'))
+  }, [])
 
   const filteredConversations = useMemo(() => {
-    let filtered = conversations
-    if (searchText.trim()) {
-      const query = searchText.toLowerCase()
-      filtered = filtered.filter((c: Conversation) => c.title.toLowerCase().includes(query))
-    }
     // Categorized conversations first (by category sort_order), then uncategorized
-    const categorized = filtered.filter((c) => c.category_id)
-    const uncategorized = filtered.filter((c) => !c.category_id)
+    const categorized = conversations.filter((c) => c.category_id)
+    const uncategorized = conversations.filter((c) => !c.category_id)
     const catOrderMap = new Map(categories.map((cat) => [cat.id, cat.sort_order]))
+    const uncategorizedGroupOrder = new Map<string, number>(
+      UNCATEGORIZED_GROUP_ORDER.map((group, index) => [group, index]),
+    )
+    const nowSeconds = Date.now() / 1000
     categorized.sort((a, b) => {
       const oa = catOrderMap.get(a.category_id!) ?? 0
       const ob = catOrderMap.get(b.category_id!) ?? 0
       if (oa !== ob) return oa - ob
-      return b.updated_at - a.updated_at
+      return compareConversationOrder(a, b)
     })
     uncategorized.sort((a, b) => {
-      if (a.is_pinned !== b.is_pinned) return a.is_pinned ? -1 : 1
-      return b.updated_at - a.updated_at
+      const aGroup = getUncategorizedConversationGroup(a, nowSeconds)
+      const bGroup = getUncategorizedConversationGroup(b, nowSeconds)
+      const groupOrderDiff = (uncategorizedGroupOrder.get(aGroup) ?? Number.MAX_SAFE_INTEGER)
+        - (uncategorizedGroupOrder.get(bGroup) ?? Number.MAX_SAFE_INTEGER)
+      return groupOrderDiff || compareConversationOrder(a, b)
     })
     return [...categorized, ...uncategorized]
-  }, [conversations, searchText, categories])
+  }, [conversations, categories])
 
   const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -599,6 +634,22 @@ export function ChatSidebar() {
     messageApi.success(t('chat.archivedSuccess', { count: ids.length }))
   }, [selectedIds, batchArchive, exitMultiSelect, messageApi, t])
 
+  const handleBatchMoveToCategory = useCallback(async (categoryId: string | null) => {
+    const ids = filteredConversations
+      .filter((conversation) => selectedIds.has(conversation.id))
+      .map((conversation) => conversation.id)
+    if (ids.length === 0) return
+    try {
+      const moved = await batchMoveToCategory(ids, categoryId)
+      exitMultiSelect()
+      if (moved > 0) {
+        messageApi.success(t('chat.batchMovedSuccess', { count: moved }))
+      }
+    } catch {
+      messageApi.error(t('error.saveFailed'))
+    }
+  }, [selectedIds, filteredConversations, batchMoveToCategory, exitMultiSelect, messageApi, t])
+
   const handleShowArchived = useCallback(async () => {
     await fetchArchivedConversations()
     setShowArchived(true)
@@ -622,13 +673,26 @@ export function ChatSidebar() {
   }, [])
 
   const handleBatchUnarchive = useCallback(async () => {
-    const ids = Array.from(archivedSelectedIds)
+    const ids = archivedConversations
+      .filter((conversation) => archivedSelectedIds.has(conversation.id))
+      .map((conversation) => conversation.id)
     if (ids.length === 0) return
-    await Promise.all(ids.map(id => toggleArchive(id)))
+    try {
+      // Each unarchived root enters its target container at the top. Applying
+      // the visible selection in reverse preserves the original row order.
+      for (const id of [...ids].reverse()) {
+        await toggleArchive(id)
+      }
+    } catch (error) {
+      await fetchArchivedConversations()
+      useConversationStore.setState({ error: String(error) })
+      messageApi.error(t('error.saveFailed'))
+      return
+    }
     await fetchArchivedConversations()
     setArchivedSelectedIds(new Set())
     setArchivedMultiSelect(false)
-  }, [archivedSelectedIds, toggleArchive, fetchArchivedConversations])
+  }, [archivedConversations, archivedSelectedIds, toggleArchive, fetchArchivedConversations, messageApi, t])
 
   const handleBatchDeleteArchived = useCallback(async () => {
     const ids = Array.from(archivedSelectedIds)
@@ -648,8 +712,8 @@ export function ChatSidebar() {
   }, [archivedSelectedIds, batchDelete, fetchArchivedConversations, modal, t])
 
   const buildIcon = useCallback((conv: Conversation) => {
-    return <ConversationIcon conv={conv} isStreaming={streamingConversationId === conv.id} />
-  }, [streamingConversationId])
+    return <ConversationIcon conv={conv} isStreaming={streamingConversationIds.includes(conv.id)} />
+  }, [streamingConversationIds])
 
   const directDeleteShortcutLabel = useMemo(() => getDirectDeleteShortcutLabel(), [])
   const directDeleteHint = t('chat.directDeleteHint', { shortcut: directDeleteShortcutLabel })
@@ -681,174 +745,288 @@ export function ChatSidebar() {
     [deleteConversation, t, modal],
   )
 
+  const handleTabPin = useCallback((id: string, pinned: boolean) => {
+    void setConversationTabPinned(id, pinned).catch((error) => {
+      messageApi.error(String(error))
+    })
+  }, [messageApi, setConversationTabPinned])
+
   const syncDirectDeleteModeFromMouse = useCallback((event: DeleteShortcutEvent) => {
     const next = isDirectDeleteEvent(event)
     setDirectDeleteMode((current) => (current === next ? current : next))
   }, [])
 
-  const conversationItems: ConversationItemType[] = useMemo(
-    () => {
-      const items: ConversationItemType[] = []
+  const expandedGroupKeySet = useMemo(() => new Set(expandedKeys), [expandedKeys])
+  const conversationRows = useMemo(
+    () => buildConversationRows({
+      conversations: filteredConversations,
+      categories,
+      expandedParentIds,
+      expandedGroupKeys: expandedGroupKeySet,
+    }),
+    [categories, filteredConversations, expandedParentIds, expandedGroupKeySet],
+  )
 
-      // Build parent→children map (max 1 level nesting)
-      const childrenMap = new Map<string, Conversation[]>()
-      const topLevel: Conversation[] = []
-      filteredConversations.forEach((conv) => {
-        if (conv.parent_conversation_id) {
-          const arr = childrenMap.get(conv.parent_conversation_id) ?? []
-          arr.push(conv)
-          childrenMap.set(conv.parent_conversation_id, arr)
-        } else {
-          topLevel.push(conv)
-        }
+  const handleConversationDragStart = useCallback((event: DragStartEvent) => {
+    if (conversationReorderSavingRef.current) return
+    const parsed = parseNamespacedDragId(event.active.id)
+    const conversationId = String(event.active.data.current?.conversationId ?? parsed.id)
+    const activeRow = conversationRows.find((row) => (
+      row.type === 'conversation' && row.conversation.id === conversationId
+    ))
+    if (activeRow?.type !== 'conversation' || activeRow.isChild) return
+
+    const categoryId = activeRow.conversation.category_id ?? null
+    const conversationIds = conversationRows
+      .filter((row): row is Extract<ConversationListRow, { type: 'conversation' }> => (
+        row.type === 'conversation'
+        && !row.isChild
+        && (row.conversation.category_id ?? null) === categoryId
+      ))
+      .map((row) => row.conversation.id)
+    const sortOrderById = new Map(
+      useConversationStore.getState().conversations
+        .filter((conversation) => conversationIds.includes(conversation.id))
+        .map((conversation, index) => [
+          conversation.id,
+          Number.isFinite(conversation.sort_order) ? conversation.sort_order : index,
+        ]),
+    )
+    conversationDragSnapshotRef.current = {
+      conversationId,
+      group: activeRow.group,
+      categoryId,
+      conversationIds,
+      sortOrderById,
+    }
+    conversationDragPreviewOrderRef.current = conversationIds
+    conversationDragLastOverIdRef.current = null
+    setActiveDragConversationId(conversationId)
+    setActiveDragCatId(null)
+  }, [conversationRows])
+
+  const handleConversationDragOver = useCallback((event: DragOverEvent) => {
+    const { active, over } = event
+    if (!over || active.data.current?.type !== 'conversation') return
+    if (over.data.current?.type !== 'conversation') return
+    const activeId = String(
+      active.data.current.conversationId ?? parseNamespacedDragId(active.id).id,
+    )
+    const overId = String(
+      over.data.current.conversationId ?? parseNamespacedDragId(over.id).id,
+    )
+    if (conversationDragLastOverIdRef.current === overId) return
+    conversationDragLastOverIdRef.current = overId
+
+    const reorderPlan = planConversationReorder(conversationRows, activeId, overId)
+    if (!reorderPlan) return
+    const snapshot = conversationDragSnapshotRef.current
+    if (!snapshot || snapshot.categoryId !== reorderPlan.categoryId) return
+    conversationDragPreviewOrderRef.current = reorderPlan.conversationIds
+    applyConversationOrder(reorderPlan.conversationIds)
+  }, [conversationRows])
+
+  const resetConversationDragState = useCallback(() => {
+    setActiveDragConversationId(null)
+    conversationDragSnapshotRef.current = null
+    conversationDragPreviewOrderRef.current = null
+    conversationDragLastOverIdRef.current = null
+  }, [])
+
+  const handleConversationDragCancel = useCallback(() => {
+    const snapshot = conversationDragSnapshotRef.current
+    if (snapshot) restoreConversationOrder(snapshot)
+    resetConversationDragState()
+  }, [resetConversationDragState])
+
+  const handleConversationDragEnd = useCallback((event: DragEndEvent) => {
+    const snapshot = conversationDragSnapshotRef.current
+    const previewOrder = conversationDragPreviewOrderRef.current
+    const overData = event.over?.data.current
+    const overId = event.over
+      ? String(overData?.conversationId ?? parseNamespacedDragId(event.over.id).id)
+      : null
+    const isValidDrop = Boolean(
+      snapshot
+      && previewOrder
+      && overData?.type === 'conversation'
+      && typeof overData.conversationId === 'string'
+      && overData.group === snapshot.group
+      && overId !== snapshot.conversationId,
+    )
+    const orderChanged = Boolean(
+      snapshot
+      && previewOrder
+      && previewOrder.some((id, index) => id !== snapshot.conversationIds[index]),
+    )
+
+    resetConversationDragState()
+    if (!snapshot || !previewOrder || !isValidDrop || !orderChanged) {
+      if (snapshot) restoreConversationOrder(snapshot)
+      return
+    }
+
+    conversationReorderSavingRef.current = true
+    setConversationReorderSaving(true)
+    const savePromise = conversationReorderQueueRef.current
+      .catch(() => undefined)
+      .then(() => reorderConversations(snapshot.categoryId, previewOrder))
+    conversationReorderQueueRef.current = savePromise
+    void savePromise
+      .catch(() => {
+        restoreConversationOrder(snapshot)
+        messageApi.error(t('error.saveFailed'))
       })
-
-      // Group conversations by category_id for ordered insertion
-      const convsByCatId = new Map<string, Conversation[]>()
-      const uncategorizedConvs: Conversation[] = []
-      topLevel.forEach((conv) => {
-        if (conv.category_id) {
-          const arr = convsByCatId.get(conv.category_id) ?? []
-          arr.push(conv)
-          convsByCatId.set(conv.category_id, arr)
-        } else {
-          uncategorizedConvs.push(conv)
-        }
+      .finally(() => {
+        conversationReorderSavingRef.current = false
+        setConversationReorderSaving(false)
       })
+  }, [messageApi, reorderConversations, resetConversationDragState, t])
 
-      const hasChildren = (convId: string) => (childrenMap.get(convId)?.length ?? 0) > 0
-      const isExpanded = (convId: string) => expandedParentIds.has(convId)
+  const handleSidebarDragStart = useCallback((event: DragStartEvent) => {
+    if (event.active.data.current?.type === 'conversation') {
+      handleConversationDragStart(event)
+      return
+    }
+    if (event.active.data.current?.type === 'category') {
+      handleCategoryDragStart(event)
+    }
+  }, [handleCategoryDragStart, handleConversationDragStart])
 
-      const buildConvItem = (conv: Conversation, group: string, isChild = false): ConversationItemType => {
-        const icon = buildIcon(conv)
-        const childCount = childrenMap.get(conv.id)?.length ?? 0
-        const expanded = isExpanded(conv.id)
-        const isGeneratingTitle = titleGeneratingConversationId === conv.id
+  const handleSidebarDragOver = useCallback((event: DragOverEvent) => {
+    if (event.active.data.current?.type === 'conversation') {
+      handleConversationDragOver(event)
+      return
+    }
+    if (event.active.data.current?.type === 'category') {
+      handleCategoryDragOver(event)
+    }
+  }, [handleCategoryDragOver, handleConversationDragOver])
 
-        const pinNode = conv.is_pinned && !isChild
-          ? <Pin size={12} style={{ color: token.colorTextQuaternary, flexShrink: 0 }} />
-          : null
-        const generatingTitleNode = isGeneratingTitle ? (
-          <Tooltip title={t('chat.generatingTitle')}>
-            <span
-              className="aqbot-chat-conversation-title-generating"
-              role="status"
-              aria-label={t('chat.generatingTitle')}
-              style={{
-                color: token.colorPrimary,
-                width: 14,
-                height: 14,
-                minWidth: 14,
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
-              }}
-            >
-              <Loader size={12} aria-hidden="true" style={{ animation: 'spin 1s linear infinite' }} />
-            </span>
-          </Tooltip>
-        ) : null
-        const expandToggleNode = childCount > 0 ? (
-          <span
-            onClick={(e) => {
-              e.stopPropagation()
-              setExpandedParentIds((prev) => {
-                const next = new Set(prev)
-                if (next.has(conv.id)) next.delete(conv.id)
-                else next.add(conv.id)
-                return next
-              })
-            }}
-            style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', flexShrink: 0 }}
-          >
-            <ChevronRight
-              size={12}
-              style={{
-                color: token.colorTextQuaternary,
-                transition: 'transform 0.2s',
-                transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
-              }}
-            />
-          </span>
-        ) : null
-        const label: React.ReactNode = (
-          <span className="aqbot-chat-conversation-label">
-            {expandToggleNode}
-            <ConversationTitleText title={conv.title} className="flex-1" />
-            {generatingTitleNode}
-            {pinNode}
-          </span>
-        )
+  const handleSidebarDragEnd = useCallback((event: DragEndEvent) => {
+    if (event.active.data.current?.type === 'conversation') {
+      handleConversationDragEnd(event)
+      return
+    }
+    if (event.active.data.current?.type === 'category') {
+      handleCategoryDragEnd(event)
+    }
+  }, [handleCategoryDragEnd, handleConversationDragEnd])
 
-        if (multiSelectMode) {
-          return {
-            key: conv.id,
-            label,
-            icon: (
-              <span className="flex items-center gap-1.5">
-                <Checkbox
-                  checked={selectedIds.has(conv.id)}
-                  onChange={() => toggleSelect(conv.id)}
-                  onClick={(e: React.MouseEvent) => e.stopPropagation()}
-                />
-                {icon}
-              </span>
-            ),
-            group,
-            'data-conv-id': conv.id,
-            ...(isChild ? { style: { paddingLeft: 20 } } : {}),
-          }
-        }
+  const handleSidebarDragCancel = useCallback(() => {
+    if (conversationDragSnapshotRef.current) {
+      handleConversationDragCancel()
+      return
+    }
+    handleCategoryDragCancel()
+  }, [handleCategoryDragCancel, handleConversationDragCancel])
+
+  const getConversationItem = useCallback(
+    (row: Exclude<ConversationListRow, { type: 'groupHeader' }>): ConversationItemType => {
+      if (row.type === 'emptyCategory') {
         return {
-          key: conv.id,
-          label,
-          icon,
-          group,
-          'data-conv-id': conv.id,
-          ...(isChild ? { style: { paddingLeft: 20 } } : {}),
+          key: `__empty_cat_${row.category.id}`,
+          label: (
+            <span style={{ color: token.colorTextQuaternary, fontSize: 12, fontStyle: 'italic' }}>
+              {t('chat.noConversations')}
+            </span>
+          ),
+          icon: null,
+          group: row.group,
+          disabled: true,
+          style: { pointerEvents: 'none', minHeight: 28, opacity: 0.6 },
         }
       }
 
-      // Helper: push a conversation and its children (if expanded)
-      const pushConvWithChildren = (conv: Conversation, group: string) => {
-        items.push(buildConvItem(conv, group))
-        if (hasChildren(conv.id) && isExpanded(conv.id)) {
-          const children = childrenMap.get(conv.id)!
-          children.forEach((child) => items.push(buildConvItem(child, group, true)))
-        }
+      const { conversation: conv, isChild, childCount, expanded } = row
+      const icon = buildIcon(conv)
+      const isGeneratingTitle = titleGeneratingConversationId === conv.id
+      const pinNode = conv.is_pinned && !isChild
+        ? <Pin size={12} style={{ color: token.colorTextQuaternary, flexShrink: 0 }} />
+        : null
+      const generatingTitleNode = isGeneratingTitle ? (
+        <Tooltip title={t('chat.generatingTitle')}>
+          <span
+            className="aqbot-chat-conversation-title-generating"
+            role="status"
+            aria-label={t('chat.generatingTitle')}
+            style={{
+              color: token.colorPrimary,
+              width: 14,
+              height: 14,
+              minWidth: 14,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}
+          >
+            <Loader size={12} aria-hidden="true" style={{ animation: 'spin 1s linear infinite' }} />
+          </span>
+        </Tooltip>
+      ) : null
+      const expandToggleNode = childCount > 0 ? (
+        <span
+          onClick={(event) => {
+            event.stopPropagation()
+            setExpandedParentIds((previous) => {
+              const next = new Set(previous)
+              if (next.has(conv.id)) next.delete(conv.id)
+              else next.add(conv.id)
+              return next
+            })
+          }}
+          style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', flexShrink: 0 }}
+        >
+          <ChevronRight
+            size={12}
+            style={{
+              color: token.colorTextQuaternary,
+              transition: 'transform 0.2s',
+              transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+            }}
+          />
+        </span>
+      ) : null
+      const labelContent = (
+        <>
+          {expandToggleNode}
+          <ConversationTitleText title={conv.title} className="flex-1" />
+          {generatingTitleNode}
+          {pinNode}
+        </>
+      )
+      const label = isChild || multiSelectMode || conversationReorderSaving ? (
+        <span className="aqbot-chat-conversation-label">{labelContent}</span>
+      ) : (
+        <SortableConversationLabel
+          conversation={conv}
+          group={row.group}
+          reorderLabel={t('chat.reorderConversation')}
+        >
+          {labelContent}
+        </SortableConversationLabel>
+      )
+
+      return {
+        key: conv.id,
+        label,
+        icon: multiSelectMode ? (
+          <span className="flex items-center gap-1.5">
+            <Checkbox
+              checked={selectedIds.has(conv.id)}
+              onChange={() => toggleSelect(conv.id)}
+              onClick={(event: React.MouseEvent) => event.stopPropagation()}
+            />
+            {icon}
+          </span>
+        ) : icon,
+        group: row.group,
+        'data-conv-id': conv.id,
+        ...(isChild ? { style: { paddingInlineStart: 20 } } : {}),
       }
-
-      // Add category items in sort_order — ensures group rendering order matches drag order
-      categories.forEach((cat) => {
-        const catConvs = convsByCatId.get(cat.id)
-        if (catConvs && catConvs.length > 0) {
-          catConvs.forEach((conv) => pushConvWithChildren(conv, `cat:${cat.id}`))
-        } else {
-          items.push({
-            key: `__empty_cat_${cat.id}`,
-            label: (
-              <span style={{ color: token.colorTextQuaternary, fontSize: 12, fontStyle: 'italic' }}>
-                {t('chat.noConversations')}
-              </span>
-            ),
-            icon: null,
-            group: `cat:${cat.id}`,
-            disabled: true,
-            style: { pointerEvents: 'none', minHeight: 28, opacity: 0.6 },
-          })
-        }
-      })
-
-      // Add uncategorized conversations (pinned + time groups)
-      uncategorizedConvs.forEach((conv) => {
-        const group = conv.is_pinned ? 'pinned' : getDateGroup(conv.updated_at)
-        pushConvWithChildren(conv, group)
-      })
-
-      return items
     },
-    [filteredConversations, multiSelectMode, selectedIds, buildIcon, toggleSelect, token.colorTextQuaternary, token.colorPrimary, categories, t, expandedParentIds, titleGeneratingConversationId],
+    [buildIcon, conversationReorderSaving, multiSelectMode, selectedIds, t, titleGeneratingConversationId, toggleSelect, token.colorPrimary, token.colorTextQuaternary],
   )
 
   const groupLabels: Record<string, string> = useMemo(
@@ -868,9 +1046,6 @@ export function ChatSidebar() {
     },
     [t, categories],
   )
-
-  // Local state for expanded group keys (drives the UI immediately)
-  const [expandedKeys, setExpandedKeys] = useState<string[]>([])
 
   // Track known category IDs to detect new ones
   const knownCatIdsRef = useRef(new Set<string>())
@@ -897,13 +1072,13 @@ export function ChatSidebar() {
   const initialExpandDoneRef = useRef(false)
   useEffect(() => {
     if (initialExpandDoneRef.current || !activeConversationId || categories.length === 0) return
-    const activeConv = conversations.find((c) => c.id === activeConversationId)
+    const activeConv = conversationById.get(activeConversationId)
     if (activeConv?.category_id) {
       const key = `cat:${activeConv.category_id}`
       setExpandedKeys((prev) => (prev.includes(key) ? prev : [...prev, key]))
     }
     initialExpandDoneRef.current = true
-  }, [activeConversationId, conversations, categories])
+  }, [activeConversationId, categories, conversationById])
 
   // Guard to prevent menu clicks from triggering expand/collapse
   const menuActionRef = useRef(false)
@@ -925,6 +1100,13 @@ export function ChatSidebar() {
     [categories, setCollapsed],
   )
 
+  const handleGroupToggle = useCallback((group: string) => {
+    const nextKeys = expandedKeys.includes(group)
+      ? expandedKeys.filter((key) => key !== group)
+      : [...expandedKeys, group]
+    handleGroupExpand(nextKeys)
+  }, [expandedKeys, handleGroupExpand])
+
   const handleDeleteCategory = useCallback(
     async (catId: string) => {
       modal.confirm({
@@ -944,7 +1126,7 @@ export function ChatSidebar() {
     (group: string) => {
       if (group.startsWith('cat:')) {
         const catId = group.slice(4)
-        const cat = categories.find((c) => c.id === catId)
+        const cat = categoryById.get(catId)
         if (!cat) return group
 
         return (
@@ -955,6 +1137,8 @@ export function ChatSidebar() {
             newConversationLabel={t('chat.newConversation')}
             editLabel={t('chat.editCategory')}
             deleteLabel={t('chat.deleteCategory')}
+            systemPromptLabel={t('roles.systemPrompt')}
+            disabled={conversationReorderSaving}
             onEdit={() => {
               setEditingCategory(cat)
               setCategoryModalOpen(true)
@@ -965,7 +1149,7 @@ export function ChatSidebar() {
       }
       return groupLabels[group] ?? group
     },
-    [categories, groupLabels, t, handleDeleteCategory, handleNewConversation],
+    [categoryById, conversationReorderSaving, groupLabels, t, handleDeleteCategory, handleNewConversation],
   )
 
   const groupableConfig = useMemo(
@@ -1030,7 +1214,7 @@ export function ChatSidebar() {
 
   const handleRename = useCallback(
     (item: ConversationItemType) => {
-      const conversation = conversations.find((c) => c.id === String(item.key))
+      const conversation = conversationById.get(String(item.key))
       let newTitle = conversation?.title ?? (typeof item.label === 'string' ? item.label : '')
       modal.confirm({
         title: t('chat.rename'),
@@ -1050,7 +1234,7 @@ export function ChatSidebar() {
         },
       })
     },
-    [conversations, updateConversation, t, modal],
+    [conversationById, updateConversation, t, modal],
   )
 
   const handleGenerateTitle = useCallback(
@@ -1062,16 +1246,34 @@ export function ChatSidebar() {
   )
 
   const buildExportChildren = useCallback(
-    (convId: string, title: string) => [
+    (convId: string, title: string) => {
+      const conv = conversationById.get(convId)
+      const exportOptions = buildExportOptions({
+        userName: profile.name,
+        theme: {
+          colorPrimary: token.colorPrimary,
+          colorPrimaryBg: token.colorPrimaryBg,
+          colorPrimaryBorder: token.colorPrimaryBorder,
+          colorFillSecondary: token.colorFillSecondary,
+        },
+        providers,
+        conversationModelId: conv?.model_id,
+        conversationProviderId: conv?.provider_id,
+      })
+      return [
       {
         key: 'export-png',
         label: t('chat.exportPng'),
         icon: <FileImage size={14} />,
         onClick: async () => {
           try {
-            const el = document.querySelector('[data-message-area]') as HTMLElement
-            if (!el) { messageApi.warning(t('chat.noMessages')); return }
-            const ok = await exportAsPNG(el, title)
+            const msgs = await invoke<Message[]>('list_messages', { conversationId: convId })
+            const shareable = msgs.filter((m) => m.role === 'user' || m.role === 'assistant')
+            if (shareable.length === 0) { messageApi.warning(t('chat.noMessages')); return }
+            const ok = await exportMessagesAsPNG(shareable, title, {
+              ...exportOptions,
+              includeThinking: false,
+            })
             if (ok) messageApi.success(t('chat.exportSuccess'))
           } catch (e) {
             console.error('Export PNG failed:', e)
@@ -1087,7 +1289,7 @@ export function ChatSidebar() {
           try {
             const msgs = await invoke<Message[]>('list_messages', { conversationId: convId })
             if (msgs.length === 0) { messageApi.warning(t('chat.noMessages')); return }
-            const ok = await exportAsMarkdown(msgs, title)
+            const ok = await exportAsMarkdown(msgs, title, exportOptions)
             if (ok) messageApi.success(t('chat.exportSuccess'))
           } catch (e) {
             console.error('Export MD failed:', e)
@@ -1103,7 +1305,7 @@ export function ChatSidebar() {
           try {
             const msgs = await invoke<Message[]>('list_messages', { conversationId: convId })
             if (msgs.length === 0) { messageApi.warning(t('chat.noMessages')); return }
-            const ok = await exportAsText(msgs, title)
+            const ok = await exportAsText(msgs, title, exportOptions)
             if (ok) messageApi.success(t('chat.exportSuccess'))
           } catch (e) {
             console.error('Export TXT failed:', e)
@@ -1119,7 +1321,7 @@ export function ChatSidebar() {
           try {
             const msgs = await invoke<Message[]>('list_messages', { conversationId: convId })
             if (msgs.length === 0) { messageApi.warning(t('chat.noMessages')); return }
-            const ok = await exportAsJSON(msgs, title)
+            const ok = await exportAsJSON(msgs, title, exportOptions)
             if (ok) messageApi.success(t('chat.exportSuccess'))
           } catch (e) {
             console.error('Export JSON failed:', e)
@@ -1127,18 +1329,30 @@ export function ChatSidebar() {
           }
         },
       },
+      ]
+    },
+    [
+      conversationById,
+      messageApi,
+      profile.name,
+      providers,
+      t,
+      token.colorFillSecondary,
+      token.colorPrimary,
+      token.colorPrimaryBg,
+      token.colorPrimaryBorder,
     ],
-    [t, messageApi],
   )
 
-  const menuConfig = useCallback(
-    (item: ConversationItemType) => {
+  const menuConfig = useCallback<ConversationMenuFactory>(
+    (item, options) => {
       if (multiSelectMode) return { items: [] }
-      const conv = conversations.find((c) => c.id === String(item.key))
+      const includeItems = options?.includeItems ?? true
+      const conv = conversationById.get(String(item.key))
       const isPinned = conv?.is_pinned ?? false
       const isGeneratingTitle = titleGeneratingConversationId === String(item.key)
       const categoryItems: any[] = []
-      if (categories.length > 0) {
+      if (includeItems && categories.length > 0) {
         const moveChildren = moveToCategoryMenuItems.filter(
           (mi) => mi.key !== `move-to-cat:${conv?.category_id}`,
         )
@@ -1158,6 +1372,9 @@ export function ChatSidebar() {
       }
       return {
         trigger: (_conversation: ConversationItemType, info: { originNode: React.ReactNode }) => {
+          // Keep Tooltip as Dropdown's direct interactive child chain without an
+          // extra span around originNode: EllipsisOutlined uses stopPropagation,
+          // so an intermediate wrapper would swallow the click and never open the menu.
           if (!directDeleteMode) {
             return <Tooltip title={directDeleteHint}>{info.originNode}</Tooltip>
           }
@@ -1169,21 +1386,27 @@ export function ChatSidebar() {
                 size="small"
                 aria-label={t('chat.delete')}
                 className="ant-conversations-menu-icon aqbot-chat-conversation-menu-delete"
-                icon={<Trash2 size={14} />}
                 onClick={(event) => {
                   event.preventDefault()
                   event.stopPropagation()
                   handleDelete(item, event)
                 }}
-              />
+              >
+                <Trash2 size={14} strokeWidth={2} style={{ display: 'block' }} />
+              </Button>
             </Tooltip>
           )
         },
-        items: directDeleteMode ? [] : [
+        items: directDeleteMode || !includeItems ? [] : [
           {
             key: 'pin',
             label: isPinned ? t('chat.unpin') : t('chat.pin'),
             icon: isPinned ? <PinOff size={14} /> : <Pin size={14} />,
+          },
+          {
+            key: 'pin-tab',
+            label: conv?.tab_pin_order != null ? t('chat.unpinFromTab') : t('chat.pinToTab'),
+            icon: conv?.tab_pin_order != null ? <PinOff size={14} /> : <Pin size={14} />,
           },
           { key: 'archive', label: t('chat.archive'), icon: <Archive size={14} /> },
           ...categoryItems,
@@ -1217,6 +1440,9 @@ export function ChatSidebar() {
             case 'pin':
               togglePin(String(item.key))
               break
+            case 'pin-tab':
+              handleTabPin(String(item.key), conv?.tab_pin_order == null)
+              break
             case 'archive':
               toggleArchive(String(item.key))
               break
@@ -1233,7 +1459,7 @@ export function ChatSidebar() {
         },
       }
     },
-    [t, conversations, multiSelectMode, handleRename, handleGenerateTitle, handleDelete, togglePin, toggleArchive, buildExportChildren, categories, moveToCategoryMenuItems, updateConversation, directDeleteMode, directDeleteHint, titleGeneratingConversationId],
+    [t, conversationById, multiSelectMode, handleRename, handleGenerateTitle, handleDelete, togglePin, handleTabPin, toggleArchive, buildExportChildren, categories, moveToCategoryMenuItems, updateConversation, directDeleteMode, directDeleteHint, titleGeneratingConversationId],
   )
 
   const handleConversationClick = useCallback((key: string) => {
@@ -1246,7 +1472,7 @@ export function ChatSidebar() {
 
   const rightClickMenuConfig = useMemo(() => {
     if (!rightClickedConvId) return { items: [] as any[] }
-    const conv = conversations.find((c) => c.id === rightClickedConvId)
+    const conv = conversationById.get(rightClickedConvId)
     if (!conv) return { items: [] as any[] }
     const isPinned = conv.is_pinned ?? false
     const isGeneratingTitle = titleGeneratingConversationId === conv.id
@@ -1272,6 +1498,11 @@ export function ChatSidebar() {
     return {
       items: [
         { key: 'pin', label: isPinned ? t('chat.unpin') : t('chat.pin'), icon: isPinned ? <PinOff size={14} /> : <Pin size={14} /> },
+        {
+          key: 'pin-tab',
+          label: conv.tab_pin_order != null ? t('chat.unpinFromTab') : t('chat.pinToTab'),
+          icon: conv.tab_pin_order != null ? <PinOff size={14} /> : <Pin size={14} />,
+        },
         { key: 'archive', label: t('chat.archive'), icon: <Archive size={14} /> },
         ...categoryItems,
         { key: 'rename', label: t('chat.rename'), icon: <Pencil size={14} /> },
@@ -1303,6 +1534,7 @@ export function ChatSidebar() {
         const item = { key: conv.id, label: conv.title } as ConversationItemType
         switch (menuInfo.key) {
           case 'pin': togglePin(conv.id); break
+          case 'pin-tab': handleTabPin(conv.id, conv.tab_pin_order == null); break
           case 'archive': toggleArchive(conv.id); break
           case 'rename': handleRename(item); break
           case 'generate-title': handleGenerateTitle(conv.id); break
@@ -1310,7 +1542,7 @@ export function ChatSidebar() {
         }
       },
     }
-  }, [rightClickedConvId, conversations, t, togglePin, toggleArchive, handleRename, handleGenerateTitle, handleDelete, buildExportChildren, categories, moveToCategoryMenuItems, updateConversation, titleGeneratingConversationId])
+  }, [rightClickedConvId, conversationById, t, togglePin, handleTabPin, toggleArchive, handleRename, handleGenerateTitle, handleDelete, buildExportChildren, categories, moveToCategoryMenuItems, updateConversation, titleGeneratingConversationId])
 
   return (
     <div className="flex flex-col h-full">
@@ -1367,8 +1599,8 @@ export function ChatSidebar() {
                   type="text"
                   icon={<Search size={16} />}
                   size="small"
-                  onClick={() => setSearchVisible((v) => !v)}
-                  style={{ color: searchVisible ? token.colorPrimary : undefined }}
+                  aria-label={t('chat.searchPlaceholder')}
+                  onClick={openGlobalSearch}
                 />
               </Tooltip>
               <Tooltip title={t('chat.archived')}>
@@ -1376,6 +1608,7 @@ export function ChatSidebar() {
                   type="text"
                   icon={<Archive size={16} />}
                   size="small"
+                  aria-label={t('chat.archived')}
                   onClick={handleShowArchived}
                 />
               </Tooltip>
@@ -1384,6 +1617,7 @@ export function ChatSidebar() {
                   type="text"
                   icon={<FolderPlus size={16} />}
                   size="small"
+                  aria-label={t('chat.createCategory')}
                   onClick={() => { setEditingCategory(null); setCategoryModalOpen(true) }}
                 />
               </Tooltip>
@@ -1400,6 +1634,7 @@ export function ChatSidebar() {
                       type="text"
                       icon={<MessageSquarePlus size={16} />}
                       size="small"
+                      aria-label={t('chat.newConversation')}
                     />
                   </Dropdown>
                 ) : (
@@ -1407,6 +1642,7 @@ export function ChatSidebar() {
                     type="text"
                     icon={<MessageSquarePlus size={16} />}
                     size="small"
+                    aria-label={t('chat.newConversation')}
                     onClick={() => { void handleNewConversation(null) }}
                   />
                 )}
@@ -1419,7 +1655,14 @@ export function ChatSidebar() {
             archivedMultiSelect ? (
               <div className="flex items-center gap-1">
                 <Tooltip title={t('chat.unarchive')}>
-                  <Button type="text" icon={<Undo2 size={16} />} size="small" disabled={archivedSelectedIds.size === 0} onClick={handleBatchUnarchive} />
+                  <Button
+                    type="text"
+                    icon={<Undo2 size={16} />}
+                    size="small"
+                    aria-label={t('chat.unarchive')}
+                    disabled={archivedSelectedIds.size === 0}
+                    onClick={handleBatchUnarchive}
+                  />
                 </Tooltip>
                 <Tooltip title={t('chat.delete')}>
                   <Button type="text" danger icon={<Trash2 size={16} />} size="small" disabled={archivedSelectedIds.size === 0} onClick={handleBatchDeleteArchived} />
@@ -1431,17 +1674,61 @@ export function ChatSidebar() {
                   type="text"
                   icon={<ListTodo size={16} />}
                   size="small"
+                  aria-label={t('chat.multiSelect')}
                   onClick={() => setArchivedMultiSelect(true)}
                 />
               </Tooltip>
             )
           ) : multiSelectMode ? (
             <div className="flex items-center gap-1">
+              <Dropdown
+                disabled={selectedIds.size === 0}
+                menu={{
+                  items: [
+                    ...categories.map((cat) => ({
+                      key: `move-to-cat:${cat.id}`,
+                      label: (
+                        <span className="flex items-center gap-1.5">
+                          <CategoryIcon cat={cat} size={14} />
+                          <span>{cat.name}</span>
+                        </span>
+                      ),
+                    })),
+                    ...(categories.length > 0 ? [{ type: 'divider' as const }] : []),
+                    {
+                      key: 'remove-from-category',
+                      label: (
+                        <span className="flex items-center gap-1.5">
+                          <X size={13} />
+                          <span>{t('chat.removeFromCategory')}</span>
+                        </span>
+                      ),
+                    },
+                  ],
+                  onClick: ({ key }) => {
+                    if (key === 'remove-from-category') {
+                      void handleBatchMoveToCategory(null)
+                      return
+                    }
+                    if (key.startsWith('move-to-cat:')) {
+                      void handleBatchMoveToCategory(key.slice('move-to-cat:'.length))
+                    }
+                  },
+                }}
+              >
+                <Button
+                  type="text"
+                  icon={<FolderOpen size={16} />}
+                  size="small"
+                  aria-label={t('chat.moveToCategory')}
+                  disabled={selectedIds.size === 0}
+                />
+              </Dropdown>
               <Tooltip title={t('chat.archive')}>
-                <Button type="text" icon={<Archive size={16} />} size="small" disabled={selectedIds.size === 0} onClick={handleBatchArchive} />
+                <Button type="text" icon={<Archive size={16} />} size="small" aria-label={t('chat.archive')} disabled={selectedIds.size === 0} onClick={handleBatchArchive} />
               </Tooltip>
               <Tooltip title={t('chat.delete')}>
-                <Button type="text" danger icon={<Trash2 size={16} />} size="small" disabled={selectedIds.size === 0} onClick={handleBatchDelete} />
+                <Button type="text" danger icon={<Trash2 size={16} />} size="small" aria-label={t('chat.delete')} disabled={selectedIds.size === 0} onClick={handleBatchDelete} />
               </Tooltip>
             </div>
           ) : (
@@ -1450,6 +1737,7 @@ export function ChatSidebar() {
                 type="text"
                 icon={<ListTodo size={16} />}
                 size="small"
+                aria-label={t('chat.multiSelect')}
                 onClick={() => setMultiSelectMode(true)}
               />
             </Tooltip>
@@ -1457,28 +1745,12 @@ export function ChatSidebar() {
         </div>
       </div>
 
-      {/* Collapsible search */}
-      {!showArchived && searchVisible && !multiSelectMode && (
-        <div className="chat-sidebar-search" style={{ padding: '4px 12px 8px' }}>
-          <Input
-            prefix={<Search size={14} />}
-            placeholder={t('chat.searchPlaceholder')}
-            allowClear
-            value={searchText}
-            onChange={(e) => handleSearch(e.target.value)}
-            size="small"
-            autoFocus
-          />
-        </div>
-      )}
-
       {showArchived ? (
-        <div className="flex-1 overflow-y-auto">
-          {archivedConversations.length > 0 ? (
-            <div style={{ padding: '4px 0' }}>
-              {archivedConversations.map((conv) => (
+        archivedConversations.length > 0 ? (
+          <ArchivedConversationList
+            conversations={archivedConversations}
+            renderConversation={(conv) => (
                 <div
-                  key={conv.id}
                   className="flex items-center gap-2 cursor-pointer"
                   style={{ padding: '8px 12px', borderRadius: 6, margin: '0 8px' }}
                   onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = token.colorFillContent }}
@@ -1500,6 +1772,7 @@ export function ChatSidebar() {
                         <Button
                           type="text"
                           size="small"
+                          aria-label={t('chat.unarchive')}
                           icon={<Undo2 size={14} />}
                           onClick={async (e) => {
                             e.stopPropagation()
@@ -1524,21 +1797,20 @@ export function ChatSidebar() {
                     </div>
                   )}
                 </div>
-              ))}
-            </div>
-          ) : (
-            <div className="flex items-center justify-center py-8" style={{ color: token.colorTextSecondary }}>
-              {t('chat.noArchivedConversations')}
-            </div>
-          )}
-        </div>
+            )}
+          />
+        ) : (
+          <div className="flex flex-1 items-center justify-center py-8" style={{ color: token.colorTextSecondary }}>
+            {t('chat.noArchivedConversations')}
+          </div>
+        )
       ) : (
         <Dropdown
           menu={rightClickMenuConfig}
           trigger={['contextMenu']}
           onOpenChange={(open) => { if (!open) setRightClickedConvId(null) }}
         >
-          <div className="flex-1 overflow-y-auto">
+          <div ref={listScrollRef} className="flex-1 overflow-y-auto">
             <div
               onMouseMove={syncDirectDeleteModeFromMouse}
               onContextMenu={(e) => {
@@ -1556,9 +1828,46 @@ export function ChatSidebar() {
                 .ant-conversations .ant-conversations-item-active .ant-conversations-label {
                   color: ${token.colorPrimary} !important;
                 }
+                .ant-conversations .ant-conversations-icon {
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  flex-shrink: 0;
+                  line-height: 0;
+                }
                 .ant-conversations .ant-conversations-label {
                   min-width: 0;
                   overflow: hidden;
+                  display: flex !important;
+                  align-items: center;
+                  margin-bottom: 0 !important;
+                  line-height: 1.25;
+                }
+                .ant-conversations .ant-conversations-menu {
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  flex-shrink: 0;
+                  line-height: 0;
+                }
+                .ant-conversations .ant-conversations-item > div:has(.ant-conversations-menu-icon) {
+                  display: inline-flex;
+                  align-items: center;
+                  justify-content: center;
+                  flex-shrink: 0;
+                  line-height: 0;
+                }
+                .ant-conversations .ant-conversations-menu-icon {
+                  display: inline-flex !important;
+                  align-items: center;
+                  justify-content: center;
+                  width: 22px;
+                  height: 22px;
+                  min-width: 22px;
+                  line-height: 1;
+                  font-size: 16px;
+                  flex-shrink: 0;
+                  box-sizing: border-box;
                 }
                 .aqbot-chat-conversation-title-row {
                   min-width: 0;
@@ -1566,13 +1875,25 @@ export function ChatSidebar() {
                   overflow: hidden;
                 }
                 .aqbot-chat-conversation-menu-delete {
-                  width: 22px;
-                  height: 22px;
-                  min-width: 22px;
-                  padding: 0;
-                  display: inline-flex;
+                  width: 22px !important;
+                  height: 22px !important;
+                  min-width: 22px !important;
+                  padding: 0 !important;
+                  display: inline-flex !important;
                   align-items: center;
                   justify-content: center;
+                  line-height: 1;
+                }
+                .aqbot-chat-conversation-menu-delete .ant-btn-icon {
+                  display: inline-flex !important;
+                  align-items: center;
+                  justify-content: center;
+                  margin-inline-end: 0 !important;
+                  line-height: 0;
+                }
+                .aqbot-chat-conversation-menu-delete .ant-btn-icon > svg,
+                .aqbot-chat-conversation-menu-delete svg {
+                  display: block;
                 }
                 .ant-conversations .ant-conversations-item-active .aqbot-chat-conversation-menu-delete {
                   opacity: 0;
@@ -1602,37 +1923,52 @@ export function ChatSidebar() {
                   text-overflow: ellipsis;
                   white-space: nowrap;
                   display: block;
+                  line-height: 1.25;
                 }
                 @keyframes spin {
                   from { transform: rotate(0deg); }
                   to { transform: rotate(360deg); }
                 }
               `}</style>
-              {conversationItems.length > 0 ? (
+              {conversationRows.length > 0 ? (
                 <DndContext
                   sensors={dndSensors}
-                  collisionDetection={closestCenter}
-                  onDragStart={handleCategoryDragStart}
-                  onDragOver={handleCategoryDragOver}
-                  onDragEnd={handleCategoryDragEnd}
-                  onDragCancel={handleCategoryDragCancel}
+                  collisionDetection={dndCollisionDetection}
+                  onDragStart={handleSidebarDragStart}
+                  onDragOver={handleSidebarDragOver}
+                  onDragEnd={handleSidebarDragEnd}
+                  onDragCancel={handleSidebarDragCancel}
                 >
-                  <Conversations
-                    items={conversationItems}
+                  <ConversationList
+                    rows={conversationRows}
                     activeKey={multiSelectMode ? undefined : (activeConversationId ?? undefined)}
                     onActiveChange={handleConversationClick}
-                    groupable={groupableConfig}
+                    getItem={getConversationItem}
+                    renderGroupLabel={renderGroupLabel}
+                    onGroupToggle={handleGroupToggle}
+                    nativeGroupable={groupableConfig}
+                    scrollElementRef={listScrollRef}
                     menu={menuConfig}
                   />
                   <DragOverlay>
                     {activeDragCatId ? (() => {
-                      const cat = categories.find((c) => c.id === activeDragCatId)
+                      const cat = categoryById.get(activeDragCatId)
                       if (!cat) return null
                       return (
                         <div className="flex items-center gap-1" style={{ opacity: 0.8, cursor: 'grabbing', fontSize: 13 }}>
                           <GripVertical size={12} style={{ opacity: 0.4 }} />
                           <CategoryIcon cat={cat} size={14} />
                           <span>{cat.name}</span>
+                        </div>
+                      )
+                    })() : activeDragConversationId ? (() => {
+                      const conversation = conversationById.get(activeDragConversationId)
+                      if (!conversation) return null
+                      return (
+                        <div className="flex items-center gap-1" style={{ opacity: 0.85, cursor: 'grabbing', fontSize: 13 }}>
+                          <GripVertical size={12} style={{ opacity: 0.45 }} />
+                          {buildIcon(conversation)}
+                          <ConversationTitleText title={conversation.title} />
                         </div>
                       )
                     })() : null}

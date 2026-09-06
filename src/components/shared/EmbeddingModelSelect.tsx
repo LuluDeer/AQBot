@@ -1,8 +1,16 @@
-import { useMemo, useCallback, useEffect } from 'react';
-import { Select, theme } from 'antd';
+import { useMemo, useEffect, type CSSProperties } from 'react';
+import { Select } from 'antd';
 import { ModelIcon } from '@lobehub/icons';
+import { useTranslation } from 'react-i18next';
 import { useProviderStore } from '@/stores';
-import { parseModelValue, useProviderNameMap } from './ModelSelect';
+import { BUILTIN_EMBEDDING_REF, isBuiltinEmbeddingRef } from '@/lib/embeddingProfiles';
+import { useEmbeddingArtifact } from '@/lib/useEmbeddingArtifact';
+import {
+  MODEL_SELECT_CLASS,
+  useProviderNameMap,
+  useModelSelectLabelRender,
+  useModelSelectOptionRender,
+} from './ModelSelect';
 
 function isEmbeddingModel(model: { model_id: string; model_type?: string }) {
   return model.model_type === 'Embedding' || /embed/i.test(model.model_id);
@@ -10,17 +18,28 @@ function isEmbeddingModel(model: { model_id: string; model_type?: string }) {
 
 /** Hook: returns grouped Select options filtered to embedding-capable models */
 function useEmbeddingModelOptions() {
+  const { t } = useTranslation();
   const providers = useProviderStore((s) => s.providers);
-  const fetchProviders = useProviderStore((s) => s.fetchProviders);
+  const ensureProvidersLoaded = useProviderStore((s) => s.ensureProvidersLoaded);
 
   useEffect(() => {
-    if (providers.length === 0) {
-      void fetchProviders();
-    }
-  }, [fetchProviders, providers.length]);
+    void ensureProvidersLoaded();
+  }, [ensureProvidersLoaded]);
 
   return useMemo(() => {
-    return providers
+    const builtinGroup = {
+      label: t('settings.localRetrieval.builtinGroup'),
+      title: t('settings.localRetrieval.builtinGroup'),
+      options: [
+        {
+          label: t('settings.localRetrieval.builtinModelId'),
+          value: BUILTIN_EMBEDDING_REF,
+          modelId: 'multilingual-e5-small',
+          providerName: t('settings.localRetrieval.builtinGroup'),
+        },
+      ],
+    };
+    const remoteGroups = providers
       .filter((p) => p.enabled)
       .map((p) => {
         const embeddingModels = p.models.filter(
@@ -44,7 +63,8 @@ function useEmbeddingModelOptions() {
         };
       })
       .filter((opt): opt is NonNullable<typeof opt> => opt !== null);
-  }, [providers]);
+    return [builtinGroup, ...remoteGroups];
+  }, [providers, t]);
 }
 
 /**
@@ -56,58 +76,56 @@ export function EmbeddingModelSelect({
   placeholder,
   allowClear = true,
   style,
+  className,
 }: {
   value?: string;
   onChange: (value: string | undefined) => void;
   placeholder?: string;
   allowClear?: boolean;
-  style?: React.CSSProperties;
+  style?: CSSProperties;
+  className?: string;
 }) {
-  const { token } = theme.useToken();
+  const { t } = useTranslation();
+  const { currentStatus } = useEmbeddingArtifact();
   const embeddingOptions = useEmbeddingModelOptions();
   const providerNameMap = useProviderNameMap();
+  const labelMap = useMemo(() => {
+    const map = new Map(providerNameMap);
+    map.set('builtin', t('settings.localRetrieval.builtinGroup'));
+    return map;
+  }, [providerNameMap, t]);
+  const optionRender = useModelSelectOptionRender();
+  const labelRender = useModelSelectLabelRender(labelMap);
 
-  const optionRender = useCallback(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (option: any) => (
-      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-        <ModelIcon model={option.data?.modelId ?? ''} size={18} type="avatar" />
-        {option.label}
-      </span>
-    ),
-    [],
-  );
-
-  const labelRender = useCallback(
-    (props: { label?: React.ReactNode; value?: string | number }) => {
-      const parsed = parseModelValue(String(props.value ?? ''));
-      if (!parsed) return <span>{props.label}</span>;
-      const providerName = providerNameMap.get(parsed.providerId) ?? '';
-      return (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <ModelIcon model={parsed.modelId} size={18} type="avatar" />
-          {props.label}
-          <span style={{ fontSize: 11, color: token.colorTextSecondary }}>
-            ({providerName})
-          </span>
-        </span>
-      );
-    },
-    [providerNameMap, token.colorTextSecondary],
-  );
+  const width = style?.width ?? '100%';
 
   return (
-    <Select
-      value={value}
-      onChange={onChange}
-      placeholder={placeholder}
-      allowClear={allowClear}
-      showSearch
-      optionFilterProp="label"
-      optionRender={optionRender}
-      labelRender={labelRender}
-      options={embeddingOptions}
-      style={style}
-    />
+    <div className="aqbot-embedding-select" style={{ width, minWidth: 0 }}>
+      <Select
+        className={[MODEL_SELECT_CLASS, className].filter(Boolean).join(' ')}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        allowClear={allowClear}
+        showSearch
+        optionFilterProp="label"
+        optionRender={optionRender}
+        labelRender={labelRender}
+        options={embeddingOptions}
+        popupMatchSelectWidth
+        style={{ width: '100%' }}
+      />
+      {isBuiltinEmbeddingRef(value) ? (
+        <p className="aqbot-embedding-select-hint">
+          {t(
+            currentStatus === 'installed'
+              ? 'settings.localRetrieval.installedShort'
+              : currentStatus === 'downloading'
+                ? 'settings.localRetrieval.status.downloading'
+                : 'settings.localRetrieval.notInstalledShort',
+          )}
+        </p>
+      ) : null}
+    </div>
   );
 }

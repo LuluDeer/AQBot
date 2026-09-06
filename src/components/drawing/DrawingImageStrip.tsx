@@ -3,7 +3,8 @@ import { AtSign, Focus, Pencil } from 'lucide-react';
 import type { CSSProperties } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { invoke } from '@/lib/invoke';
+import { loadStoredMediaSource } from '@/lib/storedMedia';
+import { usePageTransientOpenState } from '@/components/layout/PageLifecycle';
 import type { DrawingImage } from '@/types';
 
 interface Props {
@@ -70,6 +71,7 @@ function DrawingPreviewImage({
   const tileRef = useRef<HTMLDivElement>(null);
   const [shouldLoad, setShouldLoad] = useState(false);
   const [src, setSrc] = useState<string | null>(null);
+  const [singlePreviewOpen, setSinglePreviewOpen] = usePageTransientOpenState();
 
   useEffect(() => {
     const node = tileRef.current;
@@ -92,7 +94,7 @@ function DrawingPreviewImage({
   useEffect(() => {
     if (!shouldLoad) return undefined;
     let cancelled = false;
-    invoke<string>('read_attachment_preview', { filePath: image.storage_path })
+    loadStoredMediaSource(image.stored_file_id, image.storage_path)
       .then((data) => {
         if (cancelled) return;
         setSrc(data);
@@ -100,7 +102,7 @@ function DrawingPreviewImage({
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [image.id, image.storage_path, onPreviewSourceReady, shouldLoad]);
+  }, [image.id, image.storage_path, image.stored_file_id, onPreviewSourceReady, shouldLoad]);
 
   const previewConfig = groupedPreview
     ? {
@@ -111,7 +113,12 @@ function DrawingPreviewImage({
         if (open) onOpenGroupedPreview?.(image);
       },
     }
-    : { mask: { blur: true }, scaleStep: 0.5 };
+    : {
+      open: singlePreviewOpen,
+      onOpenChange: setSinglePreviewOpen,
+      mask: { blur: true },
+      scaleStep: 0.5,
+    };
 
   return (
     <div
@@ -160,9 +167,9 @@ function DrawingPreviewImage({
       {src && (onUseAsReference || onEdit || onMaskEdit) && (
         <div className="drawing-image-hover-actions pointer-events-none absolute right-2 top-2 z-20 flex gap-1">
           {onUseAsReference && (
-            <Tooltip title={t('drawing.useAsReference', '作为参考图')}>
+            <Tooltip title={t('drawing.useAsReference')}>
               <Button
-                aria-label={t('drawing.useAsReference', '作为参考图')}
+                aria-label={t('drawing.useAsReference')}
                 className="drawing-image-action-button pointer-events-auto"
                 size="small"
                 shape="circle"
@@ -182,9 +189,9 @@ function DrawingPreviewImage({
             </Tooltip>
           )}
           {onEdit && (
-            <Tooltip title={t('drawing.reEdit', '重新编辑')}>
+            <Tooltip title={t('drawing.reEdit')}>
               <Button
-                aria-label={t('drawing.reEdit', '重新编辑')}
+                aria-label={t('drawing.reEdit')}
                 className="drawing-image-action-button pointer-events-auto"
                 size="small"
                 shape="circle"
@@ -204,9 +211,9 @@ function DrawingPreviewImage({
             </Tooltip>
           )}
           {onMaskEdit && (
-            <Tooltip title={t('drawing.maskEdit', '区域编辑')}>
+            <Tooltip title={t('drawing.maskEdit')}>
               <Button
-                aria-label={t('drawing.maskEdit', '区域编辑')}
+                aria-label={t('drawing.maskEdit')}
                 className="drawing-image-action-button pointer-events-auto"
                 size="small"
                 shape="circle"
@@ -263,7 +270,7 @@ export function DrawingImageStrip({
   onMaskEdit,
 }: Props) {
   const previewCacheRef = useRef(new Map<string, string>());
-  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewOpen, setPreviewOpen] = usePageTransientOpenState();
   const [previewCurrent, setPreviewCurrent] = useState(0);
   const [previewItems, setPreviewItems] = useState<string[]>([]);
   const groupedPreview = images.length > 1;
@@ -287,7 +294,7 @@ export function DrawingImageStrip({
     const cached = previewCacheRef.current.get(image.id);
     if (cached) return cached;
 
-    const data = await invoke<string>('read_attachment_preview', { filePath: image.storage_path });
+    const data = await loadStoredMediaSource(image.stored_file_id, image.storage_path);
     previewCacheRef.current.set(image.id, data);
     return data;
   }, []);

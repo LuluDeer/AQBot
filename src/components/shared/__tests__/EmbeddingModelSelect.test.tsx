@@ -4,7 +4,7 @@ import type { ProviderConfig } from '@/types';
 import { EmbeddingModelSelect } from '../EmbeddingModelSelect';
 
 const mocks = vi.hoisted(() => ({
-  fetchProviders: vi.fn(),
+  ensureProvidersLoaded: vi.fn(),
 }));
 
 let providers: ProviderConfig[] = [];
@@ -16,6 +16,7 @@ function makeProvider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
     provider_type: 'openai',
     api_host: 'https://api.example.com',
     api_path: '/v1/chat/completions',
+    aws_region: null,
     enabled: true,
     models: [],
     keys: [],
@@ -51,27 +52,49 @@ vi.mock('antd', () => ({
   },
 }));
 
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
 vi.mock('@/stores', () => ({
-  useProviderStore: (selector: (state: { providers: ProviderConfig[]; fetchProviders: () => Promise<void> }) => unknown) =>
+  useProviderStore: (selector: (state: { providers: ProviderConfig[]; ensureProvidersLoaded: () => Promise<void> }) => unknown) =>
     selector({
       providers,
-      fetchProviders: mocks.fetchProviders,
+      ensureProvidersLoaded: mocks.ensureProvidersLoaded,
     }),
 }));
 
+vi.mock('@/lib/invoke', () => ({
+  invoke: async () => ({
+    status: 'missing',
+    artifactId: 'multilingual-e5-small',
+    revision: '761b726',
+    path: '/tmp/model.onnx',
+    sizeBytes: 1,
+    downloadedBytes: 0,
+    license: 'MIT',
+  }),
+  listen: async () => () => {},
+}));
+
 vi.mock('../ModelSelect', () => ({
+  MODEL_SELECT_CLASS: 'aqbot-model-select',
   parseModelValue: (value: string) => {
     const [providerId, modelId] = value.split('::');
     return providerId && modelId ? { providerId, modelId } : null;
   },
   useProviderNameMap: () => new Map(providers.map((provider) => [provider.id, provider.name])),
+  useModelSelectOptionRender: () => (option: { label: string }) => option.label,
+  useModelSelectLabelRender: () => (props: { label?: string }) => props.label,
 }));
 
 describe('EmbeddingModelSelect', () => {
   beforeEach(() => {
     providers = [];
-    mocks.fetchProviders.mockReset();
-    mocks.fetchProviders.mockResolvedValue(undefined);
+    mocks.ensureProvidersLoaded.mockReset();
+    mocks.ensureProvidersLoaded.mockResolvedValue(undefined);
   });
 
   it('shows enabled models explicitly marked as embedding even when the model id does not contain embed', () => {
@@ -85,7 +108,7 @@ describe('EmbeddingModelSelect', () => {
             group_name: null,
             model_type: 'Embedding',
             capabilities: [],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -96,7 +119,7 @@ describe('EmbeddingModelSelect', () => {
             group_name: null,
             model_type: 'Chat',
             capabilities: ['TextChat'],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -114,7 +137,27 @@ describe('EmbeddingModelSelect', () => {
     render(<EmbeddingModelSelect onChange={vi.fn()} />);
 
     await waitFor(() => {
-      expect(mocks.fetchProviders).toHaveBeenCalledTimes(1);
+      expect(mocks.ensureProvidersLoaded).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('lists the builtin offline engine even when no remote embedding models exist', () => {
+    render(<EmbeddingModelSelect onChange={vi.fn()} />);
+
+    expect(screen.getByLabelText('settings.localRetrieval.builtinGroup')).toBeInTheDocument();
+    expect(screen.getByText('settings.localRetrieval.builtinModelId')).toBeInTheDocument();
+  });
+
+  it('keeps the builtin hint inside the select column width', () => {
+    const { container } = render(
+      <EmbeddingModelSelect
+        value="builtin::multilingual-e5-small"
+        onChange={vi.fn()}
+        style={{ width: 280 }}
+      />,
+    );
+    const wrap = container.querySelector('.aqbot-embedding-select');
+    expect(wrap).toHaveStyle({ width: '280px' });
+    expect(screen.getByText('settings.localRetrieval.notInstalledShort')).toBeInTheDocument();
   });
 });

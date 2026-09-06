@@ -6,7 +6,7 @@ import type { AppSettings } from '@/types';
 import { DefaultModelSettings } from '../DefaultModelSettings';
 
 const mocks = vi.hoisted(() => ({
-  fetchProviders: vi.fn(),
+  ensureProvidersLoaded: vi.fn(),
   saveSettings: vi.fn(),
 }));
 
@@ -26,7 +26,7 @@ vi.mock('@/components/shared/ModelSelect', () => ({
 vi.mock('@/stores', () => ({
   useProviderStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({
-      fetchProviders: mocks.fetchProviders,
+      ensureProvidersLoaded: mocks.ensureProvidersLoaded,
       providers: [],
     }),
   useSettingsStore: (selector: (state: Record<string, unknown>) => unknown) =>
@@ -58,6 +58,7 @@ describe('DefaultModelSettings', () => {
       compression_provider_id: null,
       compression_model_id: null,
       compression_prompt: null,
+      default_compression_keep_last_n: null,
     };
   });
 

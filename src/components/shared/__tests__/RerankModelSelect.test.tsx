@@ -4,7 +4,7 @@ import type { ProviderConfig } from '@/types';
 import { RerankModelSelect } from '../RerankModelSelect';
 
 const mocks = vi.hoisted(() => ({
-  fetchProviders: vi.fn(),
+  ensureProvidersLoaded: vi.fn(),
 }));
 
 let providers: ProviderConfig[] = [];
@@ -16,6 +16,7 @@ function makeProvider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
     provider_type: 'jina',
     api_host: 'https://api.jina.ai',
     api_path: null,
+    aws_region: null,
     enabled: true,
     models: [],
     keys: [],
@@ -52,26 +53,29 @@ vi.mock('antd', () => ({
 }));
 
 vi.mock('@/stores', () => ({
-  useProviderStore: (selector: (state: { providers: ProviderConfig[]; fetchProviders: () => Promise<void> }) => unknown) =>
+  useProviderStore: (selector: (state: { providers: ProviderConfig[]; ensureProvidersLoaded: () => Promise<void> }) => unknown) =>
     selector({
       providers,
-      fetchProviders: mocks.fetchProviders,
+      ensureProvidersLoaded: mocks.ensureProvidersLoaded,
     }),
 }));
 
 vi.mock('../ModelSelect', () => ({
+  MODEL_SELECT_CLASS: 'aqbot-model-select',
   parseModelValue: (value: string) => {
     const [providerId, modelId] = value.split('::');
     return providerId && modelId ? { providerId, modelId } : null;
   },
   useProviderNameMap: () => new Map(providers.map((provider) => [provider.id, provider.name])),
+  useModelSelectOptionRender: () => (option: { label: string }) => option.label,
+  useModelSelectLabelRender: () => (props: { label?: string }) => props.label,
 }));
 
 describe('RerankModelSelect', () => {
   beforeEach(() => {
     providers = [];
-    mocks.fetchProviders.mockReset();
-    mocks.fetchProviders.mockResolvedValue(undefined);
+    mocks.ensureProvidersLoaded.mockReset();
+    mocks.ensureProvidersLoaded.mockResolvedValue(undefined);
   });
 
   it('shows enabled rerank models and hides chat models', () => {
@@ -85,7 +89,7 @@ describe('RerankModelSelect', () => {
             group_name: null,
             model_type: 'Rerank',
             capabilities: [],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -96,7 +100,7 @@ describe('RerankModelSelect', () => {
             group_name: null,
             model_type: 'Embedding',
             capabilities: [],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -114,7 +118,7 @@ describe('RerankModelSelect', () => {
     render(<RerankModelSelect onChange={vi.fn()} />);
 
     await waitFor(() => {
-      expect(mocks.fetchProviders).toHaveBeenCalledTimes(1);
+      expect(mocks.ensureProvidersLoaded).toHaveBeenCalledTimes(1);
     });
   });
 });

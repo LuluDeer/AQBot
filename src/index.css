@@ -21,11 +21,13 @@ body,
   width: 100%;
   height: 100%;
   overflow: hidden;
+  font-family: var(--font-family, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  font-weight: var(--font-weight, 400);
+  font-style: var(--font-style, normal);
 }
 
 body {
   margin: 0;
-  font-weight: var(--font-weight, 400);
   user-select: none;
   -webkit-user-select: none;
 }
@@ -33,6 +35,10 @@ body {
 /* Remove antd focus outline (green border) globally */
 *:focus-visible {
   outline: none !important;
+}
+
+.aqbot-acp-tool-button:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 35%, transparent);
 }
 
 /* Re-enable text selection for content areas */
@@ -169,11 +175,14 @@ code,
   font-weight: var(--font-weight, 400) !important;
 }
 
-/* Fix icon alignment in dropdown menus (lucide SVGs) */
+/* Fix icon alignment + spacing from label in dropdown menus */
 .ant-dropdown-menu .ant-dropdown-menu-item-icon,
 .ant-dropdown-menu .ant-dropdown-menu-submenu-title > .ant-dropdown-menu-item-icon {
   display: inline-flex !important;
   align-items: center !important;
+  justify-content: center !important;
+  margin-inline-end: 8px !important;
+  flex-shrink: 0;
 }
 
 b, strong, th,
@@ -228,6 +237,11 @@ html[data-theme="dark"] .aqbot-input-textarea::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.34);
 }
 
+/* ACP nested model config choice rows */
+.aqbot-acp-model-choice[data-selected='false']:hover {
+  background: var(--ant-color-fill-tertiary, rgba(0, 0, 0, 0.04)) !important;
+}
+
 /* ── OverlayScrollbars custom theme ──────────────────────────────── */
 .os-theme-aqbot {
   --os-size: 5px;
@@ -270,6 +284,29 @@ html[data-theme="dark"] .chat-scroll-indicator-track:hover .chat-scroll-indicato
   background: rgba(255, 255, 255, 0.18);
 }
 html[data-theme="dark"] .chat-scroll-indicator-track.is-dragging .chat-scroll-indicator {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.aqbot-chat-tool-output-pre {
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(0, 0, 0, 0.22) transparent;
+}
+
+.aqbot-chat-tool-output-pre::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.aqbot-chat-tool-output-pre::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.aqbot-chat-tool-output-pre::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 999px;
+}
+
+html[data-theme="dark"] .aqbot-chat-tool-output-pre::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.28);
 }
 
@@ -379,6 +416,23 @@ html[data-theme="dark"] .drawing-image-action-button.ant-btn-variant-filled:hove
   background: var(--ant-color-bg-text-hover, rgba(0, 0, 0, 0.06));
 }
 
+.aqbot-layout-mode-button:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+/* Model sync picker/metadata rows: whole row is clickable to toggle selection */
+.model-sync-row {
+  cursor: pointer;
+  transition: background 0.15s ease-in-out;
+}
+.model-sync-row:hover {
+  background: var(--ant-color-fill-tertiary, rgba(0, 0, 0, 0.04));
+}
+.model-sync-group:hover {
+  background: var(--ant-color-fill-tertiary, rgba(0, 0, 0, 0.04)) !important;
+}
+
 /* Ant Design style overrides */
 .ant-layout {
   height: 100%;
@@ -396,13 +450,66 @@ svg.lucide {
   app-region: drag;
 }
 .title-bar-drag button,
-.title-bar-drag .ant-dropdown-trigger {
+.title-bar-drag .ant-dropdown-trigger,
+.title-bar-drag .conversation-tab,
+.title-bar-drag .conversation-tab-new,
+.title-bar-drag .conversation-tab-icon {
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }
 .title-bar-nodrag {
   -webkit-app-region: no-drag;
   app-region: no-drag;
+}
+
+.conversation-tab-scroller::-webkit-scrollbar {
+  display: none;
+}
+
+.conversation-tab {
+  background: transparent;
+  border: 1px solid var(--conversation-tab-border, var(--ant-color-border-secondary, rgba(0, 0, 0, 0.06)));
+  color: var(--conversation-tab-color, inherit);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+.conversation-tab:hover,
+.conversation-tab.is-hovered {
+  background: var(--conversation-tab-hover-bg, var(--ant-color-fill-tertiary, rgba(0, 0, 0, 0.04)));
+}
+.conversation-tab.is-active {
+  background: var(--conversation-tab-active-bg, var(--ant-color-primary-bg, #e6f4ff));
+  border-color: var(--conversation-tab-active-border, var(--ant-color-primary-border, #91caff));
+  color: var(--conversation-tab-active-color, var(--ant-color-primary, #1677ff));
+}
+.conversation-tab.is-active:hover,
+.conversation-tab.is-active.is-hovered {
+  background: var(--conversation-tab-active-hover-bg, var(--conversation-tab-active-bg, #bae0ff));
+}
+
+.conversation-tab-icon,
+.conversation-tab-new,
+.conversation-tab-close {
+  background: transparent;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+.conversation-tab-icon:hover,
+.conversation-tab-icon.is-hovered,
+.conversation-tab-new:hover,
+.conversation-tab-new.is-hovered,
+.conversation-tab-close:hover,
+.conversation-tab-close.is-hovered {
+  background: var(--conversation-tab-icon-hover-bg, var(--ant-color-fill-secondary, rgba(0, 0, 0, 0.06))) !important;
+  color: var(--conversation-tab-icon-hover-color, inherit);
+}
+
+.conversation-tab:focus-visible {
+  outline: 2px solid var(--ant-color-primary, #1677ff);
+  outline-offset: 1px;
 }
 
 /* Unify all Ant Design component borders via CSS variable */
@@ -432,6 +539,157 @@ svg.lucide {
   padding: 6px !important;
 }
 
+/*
+ * @lobehub/icons ModelIcon/ProviderIcon avatars use Center from @lobehub/ui.
+ * Center is a .lobe-flex element whose display:flex rules normally come from
+ * @lobehub/ui ThemeProvider GlobalStyle. We only depend on @lobehub/icons, so
+ * that GlobalStyle is never injected — without this polyfill the default Brain
+ * (and all other avatar glyphs) sit top-left inside the circle instead of
+ * being centered.
+ */
+:where(.lobe-flex) {
+  --lobe-flex: 0 1 auto;
+  --lobe-flex-direction: column;
+  --lobe-flex-wrap: nowrap;
+  --lobe-flex-justify: flex-start;
+  --lobe-flex-align: stretch;
+  --lobe-flex-width: auto;
+  --lobe-flex-height: auto;
+  --lobe-flex-padding: 0;
+  --lobe-flex-padding-inline: var(--lobe-flex-padding);
+  --lobe-flex-padding-block: var(--lobe-flex-padding);
+  --lobe-flex-gap: 0;
+
+  display: flex;
+  flex: var(--lobe-flex);
+  flex-flow: var(--lobe-flex-direction) var(--lobe-flex-wrap);
+  gap: var(--lobe-flex-gap);
+  align-items: var(--lobe-flex-align);
+  justify-content: var(--lobe-flex-justify);
+
+  width: var(--lobe-flex-width);
+  height: var(--lobe-flex-height);
+  padding: var(--lobe-flex-padding);
+  padding-block: var(--lobe-flex-padding-block);
+  padding-inline: var(--lobe-flex-padding-inline);
+}
+
+/* ── ModelSelect (antd Select with icon + provider suffix) ──────────────
+ * 1) Label / search text / caret vertically centered
+ * 2) Open state: text + icon gray out; while typing, hide selected label
+ * 3) Provider "(name)" uses opacity so open-state color inherits
+ */
+.aqbot-model-select.ant-select {
+  align-items: center;
+}
+
+/*
+ * Content box must stay at least one font line tall.
+ * Absolute search input fills this box; if it collapses to icon height (16px),
+ * typed characters are vertically clipped in half.
+ */
+.aqbot-model-select.ant-select-single .ant-select-content {
+  display: flex !important;
+  align-items: center;
+  min-width: 0;
+  min-height: var(--ant-select-font-height, 22px);
+  position: relative;
+}
+
+/* Match input line box to the content height so caret + typed text are centered */
+.aqbot-model-select.ant-select-single:not(.ant-select-customize) .ant-select-input {
+  line-height: var(--ant-select-font-height, 22px) !important;
+  height: 100% !important;
+  top: 0 !important;
+  bottom: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.aqbot-model-select-label,
+.aqbot-model-select-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: var(--ant-select-font-height, 22px);
+  line-height: var(--ant-select-line-height, var(--ant-line-height, 1.5714285714285714));
+  vertical-align: middle;
+}
+
+.aqbot-model-select-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  width: 16px;
+  height: 16px;
+  overflow: hidden;
+  /* Colored avatars ignore parent `color`; animate opacity/filter instead */
+  transition: opacity 0.2s ease, filter 0.2s ease;
+}
+
+.aqbot-model-select-icon > * {
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  width: 16px !important;
+  height: 16px !important;
+  margin: 0 !important;
+  line-height: 16px !important;
+}
+
+.ant-select-dropdown .aqbot-model-select-option {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+}
+
+.aqbot-embedding-select {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.aqbot-embedding-select-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.75;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.aqbot-model-select-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Opacity (not color) so .ant-select-open .ant-select-content color inherits */
+.aqbot-model-select-provider {
+  font-size: 11px;
+  opacity: 0.55;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+/* Open + no search text: dim selected icon (color/filter; avatars ignore `color`) */
+.aqbot-model-select.ant-select-open
+  .ant-select-content:not(.ant-select-content-has-search-value)
+  .aqbot-model-select-icon {
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+
+/* Open + typing: hide entire selected label so only search text is visible */
+.aqbot-model-select.ant-select-open
+  .ant-select-content-has-search-value
+  .aqbot-model-select-label {
+  visibility: hidden;
+}
+
 /* Multi-model streaming animation */
 @keyframes model-tag-spin {
   from { transform: rotate(0deg); }
@@ -452,13 +710,18 @@ svg.lucide {
   pointer-events: none;
 }
 
-.model-tag-pending {
-  animation: model-tag-pulse 1.5s ease-in-out infinite;
+.model-tag-waiting {
+  position: relative;
 }
-
-@keyframes model-tag-pulse {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 0.7; }
+.model-tag-waiting::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--model-tag-waiting-color, #faad14);
+  animation: model-tag-spin 1s linear infinite;
+  pointer-events: none;
 }
 
 @keyframes aqbot-drawing-shimmer {
@@ -478,11 +741,23 @@ html[data-theme="dark"] .markstream-react .thematic-break {
   font-size: var(--chat-font-size, 15px);
   line-height: var(--chat-line-height, 1.7);
   font-weight: var(--chat-font-weight, 400);
+  font-style: var(--chat-font-style, normal);
   color: var(--chat-text-color, var(--color-text));
 }
 
 html[data-theme="dark"] {
   --chat-text-color: rgba(255, 255, 255, 0.9);
+}
+
+.aqbot-chat-markdown .link-node,
+.aqbot-chat-markdown .link-loading {
+  color: var(--color-primary, #1677ff);
+}
+
+html[data-theme="dark"] .ms-tooltip[data-dark="true"] {
+  background-color: #000;
+  border-color: #000;
+  color: #fff;
 }
 
 .aqbot-chat-markdown p,
@@ -570,5 +845,43 @@ html[data-theme="dark"] .katex-display {
 }
 .ant-bubble:has(.aqbot-multi-model-scroll) .ant-bubble-content {
   overflow: hidden;
+  min-width: 0;
+}
+
+.aqbot-multi-model-scroll,
+.aqbot-multi-model-lane-scroll {
+  container-type: inline-size;
+  --os-size: 10px;
+}
+.aqbot-multi-model-track {
+  display: flex;
+  gap: 12px;
+  min-width: 100%;
+  width: max-content;
+  align-items: stretch;
+}
+.aqbot-multi-model-card {
+  flex: 0 0 auto;
+  min-width: 420px;
+  width: max(420px, calc((100cqw - 12px) / 2));
+}
+.aqbot-multi-model-card-fit {
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+}
+.aqbot-multi-model-card-custom {
+  flex: 0 0 auto;
+}
+.aqbot-multi-model-lane-scroll .ant-bubble {
+  padding-inline: 0;
+}
+.aqbot-multi-model-lane-scroll .ant-bubble-content-wrapper {
+  min-width: 0;
+}
+.aqbot-multi-model-card-fit .ant-bubble-start .ant-bubble-content-wrapper,
+.aqbot-multi-model-card-fit .ant-bubble-start .ant-bubble-body {
+  flex: 1;
+  width: 100%;
   min-width: 0;
 }

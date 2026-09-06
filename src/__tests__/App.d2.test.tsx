@@ -4,19 +4,24 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const enableD2 = vi.fn();
 const preloadChatRenderers = vi.fn();
 const setDefaultI18nMap = vi.fn();
+const setupAgentEventListeners = vi.fn(() => vi.fn());
 
 const settingsState = {
+  settingsMeta: { status: 'ready' },
+  error: null,
   settings: {
     theme_mode: 'dark',
     primary_color: '#17A93D',
     font_size: 14,
     font_weight: 400,
     font_family: '',
+    font_style: 'normal',
     code_font_family: '',
     chat_font_size: 16,
     chat_line_height: 1.8,
     chat_font_family: 'Inter',
     chat_font_weight: 500,
+    chat_font_style: 'normal',
     border_radius: 8,
     language: 'zh-CN',
     always_on_top: false,
@@ -33,6 +38,7 @@ const settingsState = {
 
 const uiState = {
   activePage: 'chat',
+  settingsSection: 'general' as const,
   enterSettings: vi.fn(),
   setSettingsSection: vi.fn(),
   setSelectedProviderId: vi.fn(),
@@ -90,8 +96,10 @@ vi.mock('react-i18next', () => ({
     init: () => {},
   },
   useTranslation: () => ({
+    t: (key: string) => key,
     i18n: {
       language: 'zh-CN',
+      dir: () => 'ltr',
       getFixedT: () => (_key: string) => _key,
       changeLanguage: vi.fn(),
     },
@@ -100,6 +108,10 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('@/components/layout/Sidebar', () => ({
   Sidebar: () => <div>sidebar</div>,
+}));
+
+vi.mock('@/components/layout/CrashRecoveryModal', () => ({
+  CrashRecoveryModal: () => null,
 }));
 
 vi.mock('@/components/layout/TitleBar', () => ({
@@ -121,6 +133,10 @@ vi.mock('@/hooks/useCommandPalette', () => ({
   }),
 }));
 
+vi.mock('@/hooks/useProviderDeepLink', () => ({
+  ProviderDeepLinkDialog: () => null,
+}));
+
 vi.mock('@/stores', () => ({
   useUIStore: (selector: (state: typeof uiState) => unknown) => selector(uiState),
   useProviderStore: (selector: (state: typeof providerState) => unknown) => selector(providerState),
@@ -129,6 +145,17 @@ vi.mock('@/stores', () => ({
     (selector: (state: typeof settingsState) => unknown) => selector(settingsState),
     {
       getState: () => settingsState,
+    },
+  ),
+  useMultiModelColumnLayoutStore: Object.assign(
+    (selector: (state: { layout: { popoutWidthMode: string }; ensureLoaded: () => Promise<void> }) => unknown) => selector({
+      layout: { popoutWidthMode: 'scroll' },
+      ensureLoaded: vi.fn().mockResolvedValue(undefined),
+    }),
+    {
+      getState: () => ({
+        ensureLoaded: vi.fn().mockResolvedValue(undefined),
+      }),
     },
   ),
 }));
@@ -149,8 +176,16 @@ vi.mock('@/lib/invoke', () => ({
   isTauri: () => false,
 }));
 
+vi.mock('@/hooks/useSystemFontFaces', () => ({
+  useSystemFontFaces: () => [],
+}));
+
 vi.mock('@/lib/preloadChatRenderers', () => ({
   preloadChatRenderers,
+}));
+
+vi.mock('@/stores/agentStore', () => ({
+  setupAgentEventListeners,
 }));
 
 vi.mock('markstream-react', () => ({
@@ -171,6 +206,7 @@ describe('AppRoot D2 setup', () => {
 
     expect(enableD2).toHaveBeenCalledTimes(1);
     expect(preloadChatRenderers).toHaveBeenCalledTimes(1);
+    expect(setupAgentEventListeners).toHaveBeenCalledTimes(1);
   });
 
   it('syncs chat typography settings to CSS variables', async () => {
@@ -181,8 +217,24 @@ describe('AppRoot D2 setup', () => {
     await waitFor(() => {
       expect(document.documentElement.style.getPropertyValue('--chat-font-size')).toBe('16px');
       expect(document.documentElement.style.getPropertyValue('--chat-line-height')).toBe('1.8');
-      expect(document.documentElement.style.getPropertyValue('--chat-font-family')).toBe('Inter');
+      expect(document.documentElement.style.getPropertyValue('--chat-font-family')).toBe(
+        '"Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      );
       expect(document.documentElement.style.getPropertyValue('--chat-font-weight')).toBe('500');
     });
+  });
+
+  it('routes quit requests directly by default and to confirmation when enabled', async () => {
+    const { runQuitFlow } = await import('../App');
+    const confirm = vi.fn();
+    const quit = vi.fn();
+
+    runQuitFlow(false, confirm, quit);
+    expect(quit).toHaveBeenCalledTimes(1);
+    expect(confirm).not.toHaveBeenCalled();
+
+    runQuitFlow(true, confirm, quit);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(quit).toHaveBeenCalledTimes(1);
   });
 });

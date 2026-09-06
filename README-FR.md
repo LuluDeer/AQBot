@@ -2,6 +2,7 @@
 
 [![AQBot](https://socialify.git.ci/AQBot-Desktop/AQBot/image?description=1&font=JetBrains+Mono&forks=1&issues=1&logo=https%3A%2F%2Fgithub.com%2FAQBot-Desktop%2FAQBot%2Fblob%2Fmain%2Fsrc%2Fassets%2Fimage%2Flogo.png%3Fraw%3Dtrue&name=1&owner=1&pattern=Floating+Cogs&pulls=1&stargazers=1&theme=Auto)](https://github.com/AQBot-Desktop/AQBot)
 
+AQBot est un espace de travail IA local pour ordinateur qui réunit chat multi-fournisseurs, agents ACP, bases de connaissances, outils MCP et passerelle API, tout en vous laissant le contrôle des données et fichiers stockés sur votre machine.
 
 ## Captures d'écran
 
@@ -36,9 +37,13 @@
 
 ### AI Agent
 
-- **Mode Agent** — Le modèle peut éditer des fichiers, exécuter des commandes et analyser du code dans un workflow contrôlé.
-- **Contrôle des permissions** — Choisissez revue standard, acceptation automatique des éditions ou accès complet avec sandbox de dossier de travail.
-- **Approbation et coûts** — Inspectez les appels d’outils, mémorisez les autorisations et suivez tokens/coûts par session.
+- **Deux façons d'utiliser les agents** — AQBot propose à la fois un agent intégré au chat et un atelier ACP indépendant. Le premier utilise les API de fournisseurs que vous avez configurées ; le second se connecte à des processus d'agents externes compatibles ACP, afin de choisir selon le modèle et le workflow.
+- **Agent de chat (API fournisseur)** — Passez une conversation ordinaire en mode Agent et utilisez directement l'API du fournisseur et du modèle configurés pour lire ou modifier des fichiers, exécuter des commandes et analyser du code dans un répertoire isolé.
+- **Contrôle de l'agent de chat** — Choisissez entre confirmation systématique, acceptation des modifications ou accès complet, examinez les appels d'outils et les autorisations en temps réel, et suivez les tokens et le coût de chaque exécution.
+- **Atelier d'agents ACP** — Exécutez des agents de programmation compatibles via l'[Agent Client Protocol (ACP)](https://agentclientprotocol.com/) dans un atelier dédié, avec réponses, raisonnement et appels d'outils en streaming.
+- **ACP Registry et intégrations personnalisées** — Ajoutez depuis le Registry des agents tels que Codex, Claude Agent, Gemini CLI, Cline, OpenCode et Grok Build, ou configurez commande, arguments, variables d'environnement et icône ; chaque agent peut être activé et réordonné librement.
+- **Projets ACP et discussions directes** — Classez les fils par projet, épinglez les sessions importantes et restaurez automatiquement votre dernier espace de travail, ou démarrez sans projet dans un répertoire de travail isolé.
+- **Interactions de session ACP complètes** — Changez les modèles, modes et options exposés par chaque agent et utilisez pièces jointes, questionnaires, validation de plans, suivi de progression et restauration de l'état après rechargement ; les demandes d'outils peuvent être autorisées une fois ou toujours pour la session en cours.
 
 ### Rôles
 

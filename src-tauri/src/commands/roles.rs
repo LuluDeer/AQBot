@@ -27,6 +27,35 @@ mod tests {
     }
 
     #[test]
+    fn marketplace_opening_questions_accept_strings_and_objects() {
+        let roles = parse_marketplace_index(
+            r#"{
+                "roles": [
+                    {
+                        "id": "prompt-1",
+                        "name": "Prompt",
+                        "systemPrompt": "prompt",
+                        "openingQuestions": ["旧问题", {"title": "短标题", "content": "完整\n正文"}],
+                        "sourceKind": "prompts-chat",
+                        "sourceRef": "prompts-chat://prompt",
+                        "marketplaceSource": "prompts-chat"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let input = entry_to_create_input(roles.into_iter().next().unwrap()).unwrap();
+
+        assert_eq!(input.opening_questions[0].content, "旧问题");
+        assert_eq!(input.opening_questions[0].title, None);
+        assert_eq!(input.opening_questions[1].title.as_deref(), Some("短标题"));
+        assert_eq!(input.opening_questions[1].content, "完整\n正文");
+        assert!(input.enabled_knowledge_base_ids.is_empty());
+        assert!(input.enabled_memory_namespace_ids.is_empty());
+    }
+
+    #[test]
     fn marketplace_search_rejects_unknown_source() {
         let roles = parse_marketplace_index(
             r#"{
@@ -153,7 +182,7 @@ struct RoleMarketplaceEntry {
     description: Option<String>,
     system_prompt: Option<String>,
     opening_message: Option<String>,
-    opening_questions: Option<Vec<String>>,
+    opening_questions: Option<Vec<aqbot_core::types::RoleOpeningQuestion>>,
     tags: Option<Vec<String>>,
     avatar: Option<String>,
     avatar_type: Option<String>,
@@ -356,6 +385,10 @@ fn entry_to_create_input(entry: RoleMarketplaceEntry) -> Result<CreateRoleInput,
         avatar_value: entry.avatar_value,
         temperature: entry.temperature,
         top_p: entry.top_p,
+        enabled_mcp_server_ids: Vec::new(),
+        enabled_skill_names: Vec::new(),
+        enabled_knowledge_base_ids: Vec::new(),
+        enabled_memory_namespace_ids: Vec::new(),
         source_kind: Some(entry.source_kind),
         source_ref: Some(entry.source_ref),
     })

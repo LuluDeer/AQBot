@@ -1,16 +1,34 @@
-import { Divider, Switch } from 'antd';
+import { Divider, Switch, App as AntdApp } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { useSettingsStore } from '@/stores';
 import { isTauri, invoke } from '@/lib/invoke';
 import { LANG_OPTIONS } from '@/lib/constants';
+import type { ModelCatalogSourcePreference, TrayIconStyle } from '@/types';
 import { SettingsGroup } from './SettingsGroup';
 import { SettingsSelect } from './SettingsSelect';
+import { TrayIconSettings } from './TrayIconSettings';
+
+function isMacOSPlatform() {
+  if (typeof navigator === 'undefined') return false;
+  return /Mac/i.test(navigator.platform || '') || /Mac OS X/i.test(navigator.userAgent || '');
+}
 
 export function GeneralSettings() {
   const { t, i18n } = useTranslation();
+  const { message } = AntdApp.useApp();
   const inTauri = isTauri();
+  const showTrayIconStyle = inTauri && isMacOSPlatform();
   const settings = useSettingsStore((s) => s.settings);
   const saveSettings = useSettingsStore((s) => s.saveSettings);
+
+  const persistSettings = async (partial: Parameters<typeof saveSettings>[0]) => {
+    const warnings = await saveSettings(partial);
+    if (warnings?.includes('tray_create_failed')) {
+      message.warning(t('settings.trayCreateFailed'));
+    } else if (warnings?.includes('tray_icon_update_failed')) {
+      message.warning(t('settings.trayIconUpdateFailed'));
+    }
+  };
 
   const handleLanguageChange = (language: string) => {
     i18n.changeLanguage(language);
@@ -32,6 +50,35 @@ export function GeneralSettings() {
               label: <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>{opt.icon} {opt.label}</span>,
               value: opt.key,
             }))}
+          />
+        </div>
+      </SettingsGroup>
+
+      {/* Model catalog */}
+      <SettingsGroup title={t('settings.groupModelCatalog')}>
+        <div style={rowStyle} className="flex items-center justify-between gap-4">
+          <div>
+            <div>{t('settings.modelCatalogSetting')}</div>
+            <div style={{ color: 'var(--ant-color-text-secondary)', fontSize: 12 }}>
+              {t('settings.modelCatalogSettingHint')}
+            </div>
+          </div>
+          <SettingsSelect
+            value={settings.model_catalog_source ?? 'builtin'}
+            onChange={(source) => saveSettings({
+              model_catalog_source: source as ModelCatalogSourcePreference,
+            })}
+            options={[
+              {
+                label: t('settings.modelCatalogBuiltinOption'),
+                value: 'builtin',
+              },
+              {
+                label: t('settings.modelCatalogOnlineOption'),
+                value: 'online',
+              },
+            ]}
+            style={{ flexShrink: 0 }}
           />
         </div>
       </SettingsGroup>
@@ -95,10 +142,54 @@ export function GeneralSettings() {
 
       {/* Tray & Window */}
       <SettingsGroup title={t('settings.groupTray')}>
+        <div style={rowStyle} className="flex items-center justify-between gap-4">
+          <div>
+            <div>{t('settings.trayEnabled')}</div>
+            <div style={{ color: 'var(--ant-color-text-secondary)', fontSize: 12 }}>
+              {t('settings.trayEnabledDesc')}
+            </div>
+          </div>
+          <Switch
+            checked={settings.tray_enabled ?? true}
+            onChange={(checked) => {
+              void persistSettings({ tray_enabled: checked });
+            }}
+            disabled={!inTauri}
+          />
+        </div>
+        {showTrayIconStyle && (
+          <>
+            <Divider style={{ margin: '4px 0' }} />
+            <div style={rowStyle} className="flex items-center justify-between gap-4">
+              <div>
+                <div>{t('settings.trayIconStyle')}</div>
+                <div style={{ color: 'var(--ant-color-text-secondary)', fontSize: 12 }}>
+                  {t('settings.trayIconStyleDesc')}
+                </div>
+              </div>
+              <SettingsSelect
+                value={settings.tray_icon_style ?? 'color'}
+                disabled={!(settings.tray_enabled ?? true) || Boolean(settings.tray_icon_file_id)}
+                onChange={(style) => {
+                  void persistSettings({ tray_icon_style: style as TrayIconStyle });
+                }}
+                options={[
+                  { label: t('settings.trayIconStyleColor'), value: 'color' },
+                  { label: t('settings.trayIconStyleMonochrome'), value: 'monochrome' },
+                ]}
+                style={{ flexShrink: 0 }}
+              />
+            </div>
+          </>
+        )}
+        <Divider style={{ margin: '4px 0' }} />
+        <TrayIconSettings monochrome={showTrayIconStyle && settings.tray_icon_style === 'monochrome'} />
+        <Divider style={{ margin: '4px 0' }} />
         <div style={rowStyle} className="flex items-center justify-between">
           <span>{t('settings.minimizeToTray')}</span>
           <Switch
             checked={settings.minimize_to_tray}
+            disabled={!inTauri || !(settings.tray_enabled ?? true)}
             onChange={(checked) => {
               saveSettings({ minimize_to_tray: checked });
               if (inTauri) {
@@ -111,14 +202,25 @@ export function GeneralSettings() {
         <div style={rowStyle} className="flex items-center justify-between">
           <span>{t('settings.releaseWebviewOnTray')}</span>
           <Switch
-            checked={settings.minimize_to_tray ? (settings.release_webview_on_tray ?? false) : false}
-            disabled={!inTauri || !settings.minimize_to_tray}
+            checked={(settings.tray_enabled ?? true) && settings.minimize_to_tray
+              ? (settings.release_webview_on_tray ?? false)
+              : false}
+            disabled={!inTauri || !(settings.tray_enabled ?? true) || !settings.minimize_to_tray}
             onChange={(checked) => {
               saveSettings({ release_webview_on_tray: checked });
               if (inTauri) {
                 invoke('set_release_webview_on_tray', { enabled: checked }).catch(() => {});
               }
             }}
+          />
+        </div>
+        <Divider style={{ margin: '4px 0' }} />
+        <div style={rowStyle} className="flex items-center justify-between">
+          <span>{t('settings.confirmOnQuit')}</span>
+          <Switch
+            checked={settings.confirm_on_quit ?? true}
+            onChange={(checked) => saveSettings({ confirm_on_quit: checked })}
+            disabled={!inTauri}
           />
         </div>
       </SettingsGroup>

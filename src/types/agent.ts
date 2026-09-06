@@ -40,13 +40,16 @@ export interface ToolResultEvent {
   isError: boolean;
 }
 
+export type AgentRiskLevel = 'read_only' | 'write' | 'execute';
+
 export interface PermissionRequestEvent {
   conversationId: string;
   assistantMessageId: string;
   toolUseId: string;
   toolName: string;
   input: Record<string, unknown>;
-  riskLevel: 'read_only' | 'write' | 'execute';
+  riskLevel: AgentRiskLevel;
+  workingDirectory?: string;
 }
 
 export interface AskUserEvent {
@@ -59,6 +62,7 @@ export interface AskUserEvent {
 
 export interface AgentDoneEvent {
   conversationId: string;
+  runId?: string;
   assistantMessageId: string;
   text: string;
   usage?: { input_tokens: number; output_tokens: number };
@@ -68,6 +72,7 @@ export interface AgentDoneEvent {
 
 export interface AgentErrorEvent {
   conversationId: string;
+  runId?: string;
   assistantMessageId?: string;
   message: string;
 }
@@ -78,9 +83,21 @@ export interface AgentCancelledEvent {
   reason: string;
 }
 
+export type AgentWaitStage =
+  | 'preparing_resources'
+  | 'preparing_skills'
+  | 'preparing_context'
+  | 'waiting_model'
+  | 'streaming';
+
 export interface AgentStatusEvent {
   conversationId: string;
-  message: string;
+  runId?: string;
+  stage?: AgentWaitStage;
+  stageStartedAt?: number;
+  message?: string;
+  retryAttempt?: number;
+  retryWaitMs?: number;
 }
 
 export interface AgentRateLimitEvent {
@@ -91,19 +108,30 @@ export interface AgentRateLimitEvent {
 
 export interface AgentStreamTextEvent {
   conversationId: string;
+  runId?: string;
   assistantMessageId: string;
   text: string;
 }
 
 export interface AgentStreamThinkingEvent {
   conversationId: string;
+  runId?: string;
   assistantMessageId: string;
   thinking: string;
+}
+
+export interface ToolOutputEvent {
+  conversationId: string;
+  assistantMessageId: string;
+  toolUseId: string;
+  toolName: string;
+  content: string;
 }
 
 // --- Frontend runtime state ---
 
 export interface ToolCallState {
+  conversationId: string;
   toolUseId: string;
   toolName: string;
   input: Record<string, unknown>;

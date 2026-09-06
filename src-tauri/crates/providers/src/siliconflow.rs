@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use crate::openai_compat::{OpenAICompatAdapter, OpenAICompatPolicy};
@@ -84,6 +85,91 @@ impl SiliconFlowAdapter {
             _ => Ok(self.client.clone()),
         }
     }
+
+    async fn list_image_models(&self, ctx: &ProviderRequestContext) -> Result<Vec<Model>> {
+        let response = crate::apply_request_headers(
+            self.get_client(ctx)?
+                .get(format!(
+                    "{}/models",
+                    Self::base_url(ctx).trim_end_matches('/')
+                ))
+                .query(&[("type", "image")])
+                .bearer_auth(&ctx.api_key),
+            ctx,
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            AQBotError::Provider(format!("SiliconFlow image model discovery failed: {error}"))
+        })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AQBotError::Provider(format!(
+                "SiliconFlow image model discovery failed ({status}): {body}"
+            )));
+        }
+        let payload: SiliconFlowModelsResponse = response.json().await.map_err(|error| {
+            AQBotError::Provider(format!(
+                "SiliconFlow image model discovery response was invalid: {error}"
+            ))
+        })?;
+        Ok(parse_siliconflow_image_models(&ctx.provider_id, payload))
+    }
+}
+
+fn parse_siliconflow_image_models(
+    provider_id: &str,
+    payload: SiliconFlowModelsResponse,
+) -> Vec<Model> {
+    payload
+        .data
+        .into_iter()
+        .map(|item| Model {
+            provider_id: provider_id.to_string(),
+            name: item.id.clone(),
+            model_id: item.id,
+            group_name: Some("image".into()),
+            model_type: ModelType::Image,
+            capabilities: vec![],
+            context_window: None,
+            max_output_tokens: None,
+            enabled: true,
+            param_overrides: None,
+            image_config: None,
+            metadata_state: None,
+            aliases: Vec::new(),
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct SiliconFlowModelsResponse {
+    #[serde(default)]
+    data: Vec<SiliconFlowModelItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SiliconFlowModelItem {
+    id: String,
+}
+
+fn merge_siliconflow_image_models(mut models: Vec<Model>, image_models: Vec<Model>) -> Vec<Model> {
+    let mut positions = models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| (model.model_id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for image_model in image_models {
+        if let Some(index) = positions.get(&image_model.model_id).copied() {
+            models[index].model_type = ModelType::Image;
+            models[index].capabilities.clear();
+        } else {
+            positions.insert(image_model.model_id.clone(), models.len());
+            models.push(image_model);
+        }
+    }
+    models
 }
 
 pub(crate) fn build_siliconflow_rerank_body(request: &RerankRequest) -> serde_json::Value {
@@ -141,7 +227,15 @@ impl ProviderAdapter for SiliconFlowAdapter {
     }
 
     async fn list_models(&self, ctx: &ProviderRequestContext) -> Result<Vec<Model>> {
-        self.inner.list_models(ctx).await
+        let models = self.inner.list_models(ctx).await?;
+        let image_models = match self.list_image_models(ctx).await {
+            Ok(image_models) => image_models,
+            Err(error) => {
+                tracing::warn!("SiliconFlow image model discovery failed: {error}");
+                Vec::new()
+            }
+        };
+        Ok(merge_siliconflow_image_models(models, image_models))
     }
 
     async fn embed(
@@ -227,5 +321,79 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn official_image_model_fixture_marks_only_returned_models_as_image() {
+        let parsed = parse_siliconflow_image_models(
+            "siliconflow",
+            SiliconFlowModelsResponse {
+                data: vec![
+                    SiliconFlowModelItem {
+                        id: "Kwai-Kolors/Kolors".into(),
+                    },
+                    SiliconFlowModelItem {
+                        id: "Qwen/Qwen-Image-Edit-2509".into(),
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed
+            .iter()
+            .all(|model| model.model_type == ModelType::Image));
+    }
+
+    #[test]
+    fn merge_promotes_existing_ids_and_appends_image_only_models() {
+        let chat = Model {
+            provider_id: "siliconflow".into(),
+            model_id: "Kwai-Kolors/Kolors".into(),
+            name: "Kwai-Kolors/Kolors".into(),
+            group_name: None,
+            model_type: ModelType::Chat,
+            capabilities: vec![ModelCapability::TextChat],
+            context_window: None,
+            max_output_tokens: None,
+            enabled: true,
+            param_overrides: None,
+            image_config: None,
+            metadata_state: None,
+            aliases: Vec::new(),
+        };
+        let extra = Model {
+            model_id: "Qwen/Qwen-Image-Edit-2509".into(),
+            name: "Qwen/Qwen-Image-Edit-2509".into(),
+            model_type: ModelType::Image,
+            capabilities: vec![],
+            group_name: Some("image".into()),
+            ..chat.clone()
+        };
+        let merged = merge_siliconflow_image_models(
+            vec![chat],
+            vec![
+                Model {
+                    model_id: "Kwai-Kolors/Kolors".into(),
+                    name: "Kwai-Kolors/Kolors".into(),
+                    model_type: ModelType::Image,
+                    capabilities: vec![],
+                    group_name: Some("image".into()),
+                    provider_id: "siliconflow".into(),
+                    context_window: None,
+                    max_output_tokens: None,
+                    enabled: true,
+                    param_overrides: None,
+                    image_config: None,
+                    metadata_state: None,
+                    aliases: Vec::new(),
+                },
+                extra,
+            ],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].model_type, ModelType::Image);
+        assert_eq!(merged[1].model_id, "Qwen/Qwen-Image-Edit-2509");
+        assert_eq!(merged[1].model_type, ModelType::Image);
     }
 }

@@ -1,3 +1,4 @@
+use crate::tray::PendingTrayAction;
 use crate::AppState;
 use std::sync::atomic::Ordering;
 use tauri::Manager;
@@ -47,11 +48,18 @@ pub async fn apply_startup_settings(
     always_on_top: bool,
     close_to_tray: bool,
     release_webview_on_tray: bool,
+    tray_enabled: Option<bool>,
 ) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("Only the main window can apply application startup settings".into());
+    }
     window
         .set_always_on_top(always_on_top)
         .map_err(|e| e.to_string())?;
     let state = app.state::<AppState>();
+    if let Some(tray_enabled) = tray_enabled {
+        state.tray_enabled.store(tray_enabled, Ordering::Relaxed);
+    }
     state.close_to_tray.store(close_to_tray, Ordering::Relaxed);
     state
         .release_webview_on_tray
@@ -65,6 +73,18 @@ pub async fn force_quit(app: tauri::AppHandle) -> Result<(), String> {
     state.is_quitting.store(true, Ordering::Relaxed);
     app.exit(0);
     Ok(())
+}
+
+/// Rebuild tray menu (recent conversations, selection-toolbar check, i18n labels).
+#[tauri::command]
+pub async fn refresh_tray_menu(app: tauri::AppHandle) -> Result<(), String> {
+    crate::tray::sync_tray_menu(&app).await
+}
+
+/// Drain a tray action queued while the main webview was destroyed or not yet ready.
+#[tauri::command]
+pub fn take_pending_tray_action(app: tauri::AppHandle) -> Option<PendingTrayAction> {
+    crate::tray::take_pending_action(&app)
 }
 
 #[tauri::command]
@@ -96,6 +116,20 @@ pub async fn get_window_state() -> Result<serde_json::Value, String> {
         "maximized": false,
         "visible": true
     }))
+}
+
+#[tauri::command]
+pub async fn open_conversation_popout(
+    app: tauri::AppHandle,
+    conversation_id: String,
+) -> Result<(), String> {
+    crate::conversation_popout::open_or_focus_and_wait(&app, &conversation_id).await
+}
+
+#[tauri::command]
+pub async fn report_conversation_popout_ready(conversation_id: String) -> Result<(), String> {
+    crate::conversation_popout::report_ready(&conversation_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -161,16 +195,4 @@ pub async fn test_proxy(
         Ok(Err(e)) => Ok(serde_json::json!({ "ok": false, "error": e.to_string() })),
         Err(_) => Ok(serde_json::json!({ "ok": false, "error": "Connection timed out (5s)" })),
     }
-}
-
-#[tauri::command]
-pub async fn list_system_fonts() -> Result<Vec<String>, String> {
-    tokio::task::spawn_blocking(|| {
-        let source = font_kit::source::SystemSource::new();
-        let mut families = source.all_families().map_err(|e| e.to_string())?;
-        families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-        Ok(families)
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }

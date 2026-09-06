@@ -145,6 +145,8 @@ struct GeminiModelsResponse {
 struct GeminiModel {
     name: String,
     display_name: Option<String>,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -719,7 +721,11 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     async fn list_models(&self, ctx: &ProviderRequestContext) -> Result<Vec<Model>> {
-        let url = format!("{}?key={}", crate::resolve_models_url(&Self::base_url(ctx)), ctx.api_key);
+        let url = format!(
+            "{}?key={}",
+            crate::resolve_models_url(&Self::base_url(ctx)),
+            ctx.api_key
+        );
 
         let resp = crate::apply_request_headers(self.get_client(ctx)?.get(&url), ctx)
             .send()
@@ -748,27 +754,40 @@ impl ProviderAdapter for GeminiAdapter {
                     .unwrap_or(&m.name)
                     .to_string();
                 let name = m.display_name.unwrap_or_else(|| model_id.clone());
-                let model_type = ModelType::detect(&model_id);
-                let mut caps = match model_type {
-                    ModelType::Chat => vec![ModelCapability::TextChat],
-                    ModelType::Embedding => vec![],
-                    ModelType::Image => vec![],
-                    ModelType::Rerank => vec![],
-                    ModelType::Voice => vec![ModelCapability::RealtimeVoice],
-                };
-                if model_id.contains("pro") || model_id.contains("flash") {
-                    caps.push(ModelCapability::Vision);
-                }
+                let (model_type, capabilities) =
+                    infer_model_type_and_capabilities(&model_id, &name);
+                let image_config = (model_type == ModelType::Image).then(|| {
+                    let normalized = model_id.to_ascii_lowercase();
+                    let mode = if normalized.starts_with("imagen-")
+                        || m.supported_generation_methods
+                            .iter()
+                            .any(|method| method.eq_ignore_ascii_case("predict"))
+                    {
+                        "predict"
+                    } else if normalized.contains("3.1-flash-image")
+                        || normalized.contains("3.1-flash-lite-image")
+                        || normalized.contains("3-pro-image")
+                    {
+                        "interactions"
+                    } else {
+                        "generate_content"
+                    };
+                    serde_json::json!({ "gemini_api_mode": mode })
+                });
                 Model {
                     provider_id: ctx.provider_id.clone(),
                     model_id: model_id.clone(),
                     name,
                     group_name: None,
                     model_type,
-                    capabilities: caps,
-                    max_tokens: None,
+                    capabilities,
+                    context_window: None,
+                    max_output_tokens: None,
                     enabled: true,
                     param_overrides: None,
+                    image_config,
+                    metadata_state: None,
+                    aliases: Vec::new(),
                 }
             })
             .collect())

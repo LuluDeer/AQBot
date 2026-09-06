@@ -1,3 +1,7 @@
+import type { SelectionToolbarSettings } from './selectionToolbar';
+export * from './crashDiagnostics';
+export * from './selectionToolbar';
+
 // === Provider System ===
 export type ProviderType =
   | 'openai'
@@ -11,6 +15,7 @@ export type ProviderType =
   | 'jina'
   | 'cohere'
   | 'voyage'
+  | 'bedrock'
   | 'custom';
 
 export interface ProviderConfig {
@@ -19,6 +24,7 @@ export interface ProviderConfig {
   provider_type: ProviderType;
   api_host: string;
   api_path: string | null;
+  aws_region: string | null;
   enabled: boolean;
   models: Model[];
   keys: ProviderKey[];
@@ -49,11 +55,18 @@ export interface ProviderProxyConfig {
   proxy_port: number | null;
 }
 
+export interface BedrockCredentialInput {
+  access_key_id: string;
+  secret_access_key: string;
+  session_token?: string | null;
+}
+
 export interface CreateProviderInput {
   name: string;
   provider_type: ProviderType;
   api_host: string;
   api_path?: string | null;
+  aws_region?: string | null;
   enabled: boolean;
 }
 
@@ -62,6 +75,7 @@ export interface UpdateProviderInput {
   provider_type?: ProviderType;
   api_host?: string;
   api_path?: string | null;
+  aws_region?: string | null;
   enabled?: boolean;
   proxy_config?: ProviderProxyConfig;
   custom_headers?: string | null;
@@ -118,8 +132,12 @@ export interface ThirdPartyImportSummary {
   messageCount: number;
   fileCount: number;
   importableProviderCount: number;
+  /** Cherry Studio assistants importable as roles */
+  importableRoleCount?: number;
   skippedEmptyTopicCount: number;
+  skippedEmptyAssistantCount?: number;
   duplicateConversationCount: number;
+  duplicateRoleCount?: number;
   warnings: ThirdPartyImportWarning[];
 }
 
@@ -132,7 +150,10 @@ export interface ThirdPartyImportResult {
   importedMessageCount: number;
   importedFileCount: number;
   importedProviderCount: number;
+  importedRoleCount?: number;
   skippedDuplicateConversationCount: number;
+  skippedDuplicateRoleCount?: number;
+  skippedEmptyAssistantCount?: number;
   warnings: ThirdPartyImportWarning[];
 }
 
@@ -165,6 +186,20 @@ export interface ChatGptImportResult {
 // === Model System ===
 export type ModelCapability = 'TextChat' | 'Vision' | 'FunctionCalling' | 'Reasoning' | 'RealtimeVoice';
 export type ModelType = 'Chat' | 'Voice' | 'Embedding' | 'Image' | 'Rerank';
+export type ModelMetadataSource = 'catalog' | 'provider' | 'heuristic' | 'default' | 'user';
+
+export interface ModelMetadataState {
+  schema_version: number;
+  catalog_key: string | null;
+  catalog_mode: string | null;
+  model_type: ModelMetadataSource;
+  capabilities: ModelMetadataSource;
+  context_window: ModelMetadataSource;
+  max_output_tokens: ModelMetadataSource;
+  no_system_role: ModelMetadataSource;
+  omit_sampling_params: ModelMetadataSource;
+  reasoning_options: ModelMetadataSource;
+}
 
 export interface Model {
   provider_id: string;
@@ -173,9 +208,125 @@ export interface Model {
   group_name?: string | null;
   model_type: ModelType;
   capabilities: ModelCapability[];
-  max_tokens: number | null;
+  context_window: number | null;
+  max_output_tokens?: number | null;
   enabled: boolean;
   param_overrides: ModelParamOverrides | null;
+  image_config?: ImageAdapterConfig | null;
+  metadata_state?: ModelMetadataState | null;
+  /** Gateway request aliases; requests using an alias are rewritten to model_id. */
+  aliases?: string[];
+}
+
+export type ImageOperation = 'generate' | 'edit' | 'mask_edit';
+export type ImageParameterKind = 'string' | 'number' | 'boolean' | 'select';
+
+export interface ImageParameterDescriptor {
+  key: string;
+  kind: ImageParameterKind;
+  default: unknown;
+  options: unknown[];
+  min: number | null;
+  max: number | null;
+}
+
+export interface ImageModelDescriptor {
+  adapter_id: string;
+  operations: ImageOperation[];
+  parameters: ImageParameterDescriptor[];
+  max_batch_size: number;
+  max_reference_images: number;
+  warnings: ImageModelWarning[];
+}
+
+export interface ImageModelWarning {
+  code: string;
+  message: string;
+  deadline: string | null;
+  replacement_model_id: string | null;
+}
+
+export interface ImageAdapterConfig {
+  adapter_id?: string | null;
+  endpoint?: string | null;
+  edit_endpoint?: string | null;
+  poll_endpoint?: string | null;
+  cancel_endpoint?: string | null;
+  auth_mode?: 'bearer' | 'api_key_header' | 'query' | 'none';
+  auth_header?: string | null;
+  extra_body?: Record<string, unknown>;
+  mapping?: Record<string, unknown>;
+  poll_interval_secs?: number;
+  timeout_secs?: number;
+  operation_overrides?: ImageOperation[] | null;
+  gemini_api_mode?: 'auto' | 'interactions' | 'generate_content' | 'predict';
+  descriptor_override?: ImageModelDescriptor | null;
+  /** Built-in parameter schema preset, e.g. `openai_gpt_image_2`. */
+  param_profile?: string | null;
+}
+
+/** Built-in drawing parameter presets (must stay aligned with backend). */
+export const IMAGE_PARAM_PROFILES = [
+  'openai_gpt_image_2',
+  'openai_gpt_image_legacy',
+  'openai_dalle_2',
+  'openai_dalle_3',
+  'xai_imagine',
+  'gemini_3_1_flash',
+  'gemini_3_1_flash_lite',
+  'gemini_3_pro',
+  'gemini_2_5',
+  'imagen_4',
+  'imagen_4_ultra',
+  'imagen_4_fast',
+  'glm_image',
+  'cogview',
+  'siliconflow_kolors',
+  'siliconflow_qwen',
+  'siliconflow_qwen_edit',
+] as const;
+
+export type ImageParamProfileId = (typeof IMAGE_PARAM_PROFILES)[number];
+
+export type ModelCatalogSourcePreference = 'builtin' | 'online';
+export type ModelCatalogSource = 'builtin' | 'network' | 'cache' | 'unavailable';
+export type ModelCatalogFreshness = 'fresh' | 'stale' | 'unknown';
+
+export interface ModelCatalogStatus {
+  configured_source: ModelCatalogSourcePreference;
+  source: ModelCatalogSource;
+  freshness: ModelCatalogFreshness;
+  matched_context_windows: number;
+  total_chat_models: number;
+  matched_models: number;
+  autofilled_fields: number;
+  inferred_types: number;
+  unsupported_models: number;
+  checked_at: number | null;
+  warning: string | null;
+}
+
+export interface RemoteModelSyncResult {
+  candidates: ModelSyncCandidate[];
+  catalog: ModelCatalogStatus;
+}
+
+export type ModelSyncStatus = 'synced' | 'local-only' | 'remote-only' | 'unsupported';
+
+export interface ModelMetadataChange {
+  field: string;
+  previous: unknown;
+  proposed: unknown;
+  source: ModelMetadataSource;
+}
+
+export interface ModelSyncCandidate {
+  proposed_model: Model;
+  status: ModelSyncStatus;
+  catalog_mode: string | null;
+  inference_source: ModelMetadataSource;
+  changes: ModelMetadataChange[];
+  unsupported_reason: string | null;
 }
 
 export interface ModelParamOverrides {
@@ -185,6 +336,7 @@ export interface ModelParamOverrides {
   frequency_penalty?: number;
   use_max_completion_tokens?: boolean;
   no_system_role?: boolean;
+  omit_sampling_params?: boolean;
   force_max_tokens?: boolean;
   thinking_param_style?: string;
   reasoning_profile?: string;
@@ -195,6 +347,84 @@ export interface ModelParamOverrides {
 
 // === Conversation & Message ===
 export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
+export type ContextStrategy = 'smart_summary' | 'raw_truncate' | 'raw_strict';
+export type MultiModelDisplayMode = 'tabs' | 'side-by-side' | 'stacked';
+export type MultiModelContinuationMode = 'selected' | 'per_model';
+export type MultiModelExecutionMode = 'parallel' | 'sequential';
+export type MultiModelSideBySideWidthMode = 'fit' | 'scroll';
+export const DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS = 3;
+export const MAX_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS = 300;
+
+export interface MultiModelTarget {
+  providerId: string;
+  modelId: string;
+  /**
+   * Per-target thinking override.
+   * - omitted/undefined: follow the conversation's unified thinking setting
+   * - null: use this model's default
+   * - string: specified reasoning option key
+   */
+  thinkingLevel?: string | null;
+}
+
+export type MultiModelTargetRunState =
+  | 'queued'
+  | 'starting'
+  | 'streaming'
+  | 'complete'
+  | 'error'
+  | 'skipped';
+
+export type MultiModelRunPhase = 'starting' | 'running' | 'waiting' | 'stopping';
+
+export interface MultiModelTargetSnapshot {
+  index: number;
+  target: MultiModelTarget;
+  state: MultiModelTargetRunState;
+  streamId?: string;
+  messageId?: string;
+  error?: string;
+}
+
+export interface MultiModelRunSnapshot {
+  runId: string;
+  conversationId: string;
+  parentMessageId: string | null;
+  mode: MultiModelExecutionMode;
+  intervalSeconds: number;
+  phase: MultiModelRunPhase;
+  nextStartAt: number | null;
+  targets: MultiModelTargetSnapshot[];
+}
+
+export interface MultiModelRunEnvelope {
+  conversationId: string;
+  revision: number;
+  activeRun: MultiModelRunSnapshot | null;
+}
+
+export type ConversationRunMode = 'chat' | 'agent' | 'multi-model';
+export type ConversationRunPhase =
+  | 'preparing'
+  | 'streaming'
+  | 'stopping'
+  | 'complete'
+  | 'error'
+  | 'cancelled';
+
+export interface ConversationRunSnapshot {
+  conversationId: string;
+  runId: string;
+  streamId: string | null;
+  messageId: string | null;
+  mode: ConversationRunMode;
+  phase: ConversationRunPhase;
+  revision: number;
+  content: string;
+  thinking: string | null;
+  pendingPermission: import('./agent').PermissionRequestEvent | null;
+  pendingAsk: import('./agent').AskUserEvent | null;
+}
 
 export interface ConversationCategory {
   id: string;
@@ -231,11 +461,30 @@ export interface Conversation {
   enabled_mcp_server_ids: string[];
   enabled_knowledge_base_ids: string[];
   enabled_memory_namespace_ids: string[];
+  /** Per-conversation multi-model layout. null = use the global default. */
+  multi_model_display_mode_override: MultiModelDisplayMode | null;
+  /** Ordered companion models for one-question-many-answers. Empty means single-model. */
+  multi_model_targets: MultiModelTarget[];
+  /** Follow-up history strategy for multi-model replies. */
+  multi_model_continuation_mode: MultiModelContinuationMode;
   is_pinned: boolean;
+  /** Null means the conversation is not pinned to the top tab bar. */
+  tab_pin_order: number | null;
   is_archived: boolean;
+  /** Legacy compatibility flag. Prefer context_strategy_override. */
   context_compression: boolean;
+  /** Per-conversation strategy override. null = use the global default. */
+  context_strategy_override: ContextStrategy | null;
+  /** Per-conversation history message cap. null = use global default. ≥50 = unlimited. */
+  context_message_limit: number | null;
+  /**
+   * Keep the last N compressible messages out of compression.
+   * null = default (3). 0 = keep none.
+   */
+  compression_keep_last_n: number | null;
   category_id: string | null;
   parent_conversation_id: string | null;
+  sort_order: number;
   mode?: 'chat' | 'agent' | 'role';
   message_count: number;
   created_at: number;
@@ -338,6 +587,8 @@ export interface ConversationSummary {
   conversation_id: string;
   summary_text: string;
   compressed_until_message_id: string | null;
+  /** Compression input text for viewing / retry. Absent on legacy summaries. */
+  source_text?: string | null;
   token_count: number | null;
   model_used: string | null;
   created_at: number;
@@ -352,11 +603,18 @@ export interface CompressionEvent {
 
 export interface ContextUsage {
   used_tokens: number;
-  max_tokens: number | null;
+  context_window: number | null;
   threshold_tokens: number | null;
   has_summary: boolean;
   compressed_until_message_id: string | null;
   messages_after_boundary: number;
+  /** New strategy-aware fields. Optional while older backends remain supported. */
+  effective_strategy?: ContextStrategy;
+  raw_tokens?: number;
+  sent_tokens?: number;
+  excluded_message_count?: number;
+  exclusion_reason?: string | null;
+  overflow?: boolean;
 }
 
 export interface UpdateConversationInput {
@@ -377,7 +635,18 @@ export interface UpdateConversationInput {
   enabled_mcp_server_ids?: string[];
   enabled_knowledge_base_ids?: string[];
   enabled_memory_namespace_ids?: string[];
+  /** Set null to clear the override and use the global default layout. */
+  multi_model_display_mode_override?: MultiModelDisplayMode | null;
+  multi_model_targets?: MultiModelTarget[];
+  multi_model_continuation_mode?: MultiModelContinuationMode;
+  /** Legacy compatibility flag. Prefer context_strategy_override. */
   context_compression?: boolean;
+  /** Set null to clear the override and use the global default strategy. */
+  context_strategy_override?: ContextStrategy | null;
+  /** Set null to clear override and use global default. ≥50 = unlimited. */
+  context_message_limit?: number | null;
+  /** Set null to clear and use default keep-last-N (3). */
+  compression_keep_last_n?: number | null;
   category_id?: string | null;
   mode?: 'chat' | 'agent' | 'role';
 }
@@ -478,12 +747,50 @@ export interface GatewaySettings {
 export const DEFAULT_MCP_TOOL_LOOP_MAX_ITERATIONS = 100;
 export const DEFAULT_AGENT_WORKSPACE_NAME_STRATEGY = 'uuid';
 export const DEFAULT_AGENT_WORKSPACE_DATETIME_FORMAT = 'YYYY-MM-DD-HH-mm-ss';
+export const CHAT_INPUT_ACTIONS_SCALE_MIN = 50;
+export const CHAT_INPUT_ACTIONS_SCALE_MAX = 150;
+export const CHAT_INPUT_ACTIONS_SCALE_STEP = 10;
+export const DEFAULT_CHAT_INPUT_ACTIONS_SCALE = 100;
+
+export function normalizeChatInputActionsScale(
+  value: number | string | null | undefined,
+): number {
+  const numericValue = typeof value === 'number'
+    ? value
+    : Number(value ?? DEFAULT_CHAT_INPUT_ACTIONS_SCALE);
+  if (!Number.isFinite(numericValue)) return DEFAULT_CHAT_INPUT_ACTIONS_SCALE;
+  const steppedValue = Math.round(numericValue / CHAT_INPUT_ACTIONS_SCALE_STEP)
+    * CHAT_INPUT_ACTIONS_SCALE_STEP;
+  return Math.min(
+    CHAT_INPUT_ACTIONS_SCALE_MAX,
+    Math.max(CHAT_INPUT_ACTIONS_SCALE_MIN, steppedValue),
+  );
+}
+
 export type AgentWorkspaceNameStrategy =
   | 'uuid'
   | 'conversation_id'
   | 'created_timestamp'
   | 'created_datetime';
 export type ChatMessageAreaStyle = 'none' | 'background' | 'border';
+export type SettingsSidebarDensity = 'compact' | 'standard' | 'spacious';
+export type TrayIconStyle = 'color' | 'monochrome';
+
+/** Toggleable title bar action icons (settings is always visible). */
+export type TitlebarIconId =
+  | 'pin'
+  | 'theme'
+  | 'language'
+  | 'backup'
+  | 'github'
+  | 'update'
+  | 'reload'
+  | 'settings';
+
+export type TitlebarToggleableIconId = Exclude<TitlebarIconId, 'settings'>;
+
+/** Per-icon visibility; missing key or true = visible, false = hidden. */
+export type TitlebarIconVisibility = Partial<Record<TitlebarToggleableIconId, boolean>>;
 
 export interface AppSettings {
   language: string;
@@ -494,13 +801,17 @@ export interface AppSettings {
   show_on_start: boolean;
   minimize_to_tray: boolean;
   font_size: number;
+  settings_sidebar_density: SettingsSidebarDensity;
   font_weight: number;
   font_family: string;
+  font_style: string;
   code_font_family: string;
   chat_font_size: number;
   chat_line_height: number;
   chat_font_family: string;
   chat_font_weight: number;
+  chat_font_style: string;
+  chat_input_actions_scale: number;
   bubble_style: string;
   chat_user_message_area_style: ChatMessageAreaStyle;
   chat_user_message_area_light_color: string;
@@ -519,6 +830,8 @@ export interface AppSettings {
   default_top_p: number | null;
   default_frequency_penalty: number | null;
   default_context_count: number | null;
+  /** Default context handling strategy for conversations without an override. */
+  default_context_strategy: ContextStrategy;
   title_summary_provider_id: string | null;
   title_summary_model_id: string | null;
   title_summary_temperature: number | null;
@@ -534,6 +847,9 @@ export interface AppSettings {
   compression_top_p: number | null;
   compression_frequency_penalty: number | null;
   compression_prompt: string | null;
+  /** Global default keep-last-N when compressing. null → 3. Per-conversation override wins. */
+  default_compression_keep_last_n: number | null;
+  model_catalog_source: ModelCatalogSourcePreference;
   proxy_type: string | null;
   proxy_address: string | null;
   proxy_port: number | null;
@@ -560,9 +876,16 @@ export interface AppSettings {
   gateway_ssl_key_path: string | null;
   gateway_ssl_port: number;
   gateway_force_ssl: boolean;
+  /** When true, pool same model id/alias across providers and fail over. */
+  gateway_auto_model_routing?: boolean;
   // Desktop integration
   always_on_top?: boolean;
   tray_enabled?: boolean;
+  /** macOS menu-bar icon appearance. Ignored on Windows and Linux. */
+  tray_icon_style: TrayIconStyle;
+  tray_icon_file_id: string | null;
+  /** When true, the same custom image also replaces the running Dock / taskbar icon. */
+  use_tray_icon_as_app_icon: boolean;
   global_shortcuts_enabled?: boolean;
   shortcut_registration_logs_enabled?: boolean;
   shortcut_trigger_toast_enabled?: boolean;
@@ -571,6 +894,7 @@ export interface AppSettings {
   start_minimized?: boolean;
   close_to_tray?: boolean;
   release_webview_on_tray?: boolean;
+  confirm_on_quit?: boolean;
   notify_backup?: boolean;
   notify_import?: boolean;
   notify_errors?: boolean;
@@ -597,6 +921,8 @@ export interface AppSettings {
   last_selected_conversation_id?: string | null;
   /** Custom documents root override (overrides ~/Documents/aqbot/) */
   documents_root_override?: string | null;
+  /** Automatically check for app updates on startup and periodically. Default: true */
+  auto_check_update?: boolean;
   /** Auto update check interval in minutes (default 60, min 1) */
   update_check_interval?: number;
   /** Global system prompt fallback — used when a conversation has no custom system prompt */
@@ -608,6 +934,8 @@ export interface AppSettings {
   chat_sidebar_collapsed?: boolean;
   /** Inherit current conversation capability preferences when creating a new conversation. Default: true */
   inherit_conversation_preferences_on_create?: boolean;
+  /** Show conversation tabs in the main window title bar. Default: false */
+  conversation_tabs_enabled?: boolean;
   /** Timeout before the first chat stream packet in seconds. 0 disables. */
   chat_stream_first_packet_timeout_secs?: number;
   /** Timeout between chat stream packets in seconds. 0 disables. */
@@ -619,7 +947,15 @@ export interface AppSettings {
   /** Include Image models in the conversation model selector. Default: false */
   show_image_models_in_model_selector?: boolean;
   /** Multi-model response display mode */
-  multi_model_display_mode?: 'tabs' | 'side-by-side' | 'stacked';
+  multi_model_display_mode?: MultiModelDisplayMode;
+  /** Global multi-model run strategy. Default: parallel. */
+  multi_model_execution_mode?: MultiModelExecutionMode;
+  /** Delay in seconds after a sequential target settles before starting the next. Default: 3. */
+  multi_model_sequential_interval_seconds?: number;
+  /** Main-window side-by-side width: fit all columns, or keep a readable width and scroll. */
+  multi_model_side_by_side_width_mode?: MultiModelSideBySideWidthMode;
+  /** Independent-window side-by-side width: fit all columns, or keep a readable width and scroll. */
+  multi_model_popout_side_by_side_width_mode?: MultiModelSideBySideWidthMode;
   /** Render user messages as Markdown (like AI messages). Default: false */
   render_user_markdown?: boolean;
   /** Agent default workspace root. Null uses ~/.aqbot/workspace. */
@@ -628,6 +964,19 @@ export interface AppSettings {
   agent_workspace_name_strategy?: AgentWorkspaceNameStrategy;
   /** Agent workspace datetime naming format. Default: YYYY-MM-DD-HH-mm-ss. */
   agent_workspace_datetime_format?: string | null;
+  /** Agent bash/sh executable path. Null uses PATH auto-detection. */
+  agent_bash_path?: string | null;
+  /** When false, the conversation Agent keeps the historical full tool registry. */
+  agent_allowed_tools_enabled?: boolean;
+  /** Selected built-in tools and Skill. Ignored while the whitelist is off. */
+  agent_allowed_tools?: string[];
+  /** Cross-application text-selection toolbar. */
+  selection_toolbar: SelectionToolbarSettings;
+  /**
+   * Title bar action icon visibility. Missing keys default to visible.
+   * The settings icon cannot be hidden and is not stored here.
+   */
+  titlebar_icon_visibility?: TitlebarIconVisibility;
 }
 
 // === Streaming ===
@@ -684,13 +1033,13 @@ export interface RealtimeConfig {
 }
 
 // === UI State ===
-export type PageKey = 'chat' | 'drawing' | 'knowledge' | 'memory' | 'gateway' | 'files' | 'settings' | 'skills' | 'roles';
+export type PageKey = 'chat' | 'drawing' | 'knowledge' | 'memory' | 'gateway' | 'files' | 'settings' | 'skills' | 'roles' | 'agent';
 
 // === Drawing ===
-export type DrawingModelId = 'gpt-image-2' | 'gpt-image-1.5' | 'gpt-image-1' | 'gpt-image-1-mini';
+export type DrawingModelId = string;
 export type DrawingAction = 'generate' | 'reference_generate' | 'edit' | 'mask_edit';
-export type DrawingStatus = 'running' | 'succeeded' | 'failed' | 'stopped';
-export type DrawingQuality = 'low' | 'medium' | 'high' | 'auto';
+export type DrawingStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'stopped';
+export type DrawingQuality = 'low' | 'medium' | 'high' | 'standard' | 'hd' | 'auto';
 export type DrawingOutputFormat = 'png' | 'jpeg' | 'webp';
 export type DrawingBackground = 'auto' | 'opaque' | 'transparent';
 export type DrawingReferenceImageMode = 'multipart' | 'base64';
@@ -710,6 +1059,22 @@ export interface DrawingSettings {
   n: number;
   generationApiPath: string;
   editApiPath: string;
+  parameters?: Record<string, unknown>;
+  parametersByTarget?: Record<string, Record<string, unknown>>;
+}
+
+export interface DrawingTarget {
+  provider_id: string;
+  provider_name: string;
+  model_id: string;
+  model_name: string;
+  adapter_id: string;
+  descriptor: ImageModelDescriptor;
+}
+
+export interface DrawingTargetCatalog {
+  targets: DrawingTarget[];
+  unavailable_reasons: string[];
 }
 
 export interface DrawingStoredFile {
@@ -749,6 +1114,15 @@ export interface DrawingGeneration {
   error_message: string | null;
   response_id: string | null;
   usage_json: string | null;
+  adapter_id?: string | null;
+  adapter_config_snapshot?: string | null;
+  remote_task_id?: string | null;
+  remote_status?: string | null;
+  opaque_state_json?: string | null;
+  poll_count?: number;
+  consecutive_errors?: number;
+  last_polled_at?: number | null;
+  deadline_at?: number | null;
   created_at: number;
   completed_at: number | null;
   images: DrawingImage[];
@@ -773,6 +1147,7 @@ export interface DrawingGenerateInput {
   generation_api_path?: string;
   edit_api_path?: string;
   reference_file_ids: string[];
+  parameters?: Record<string, unknown>;
 }
 
 export interface DrawingEditInput extends DrawingGenerateInput {
@@ -782,7 +1157,7 @@ export interface DrawingEditInput extends DrawingGenerateInput {
 export interface DrawingMaskEditInput extends DrawingEditInput {
   mask_file_id: string;
 }
-export type SettingsSection = 'providers' | 'defaultModel' | 'conversationSettings' | 'general' | 'display' | 'proxy' | 'shortcuts' | 'data' | 'storage' | 'about' | 'searchProviders' | 'mcpServers' | 'backup';
+export type SettingsSection = 'providers' | 'defaultModel' | 'conversationSettings' | 'general' | 'display' | 'proxy' | 'shortcuts' | 'data' | 'storage' | 'about' | 'searchProviders' | 'mcpServers' | 'backup' | 'selectionToolbar' | 'acpAgents' | 'localModels';
 
 // === Files Module ===
 export type FileCategory = 'images' | 'files';
@@ -791,6 +1166,8 @@ export type FileSortKey = 'createdAt' | 'size' | 'name';
 
 export interface FileRow {
   id: string;
+  /** Raw stored_files.id used by the read-only aqbot-media protocol. */
+  storedFileId?: string;
   name: string;
   path: string;
   storagePath?: string;
@@ -804,6 +1181,7 @@ export interface FileRow {
 
 export interface FilesPageEntry {
   id: string;
+  storedFileId?: string | null;
   sourceKind: string;
   category: FileCategory;
   displayName: string;
@@ -851,6 +1229,8 @@ export interface MarketplaceSkill {
   name: string;
   description: string;
   repo: string;
+  skillId?: string;
+  installRef?: string;
   stars: number;
   installs: number;
   installed: boolean;
@@ -863,19 +1243,62 @@ export interface SkillUpdateInfo {
   sourceRef: string;
 }
 
+export interface SkillAvailabilityReason {
+  code: string;
+  params: Record<string, string>;
+}
+
+export interface SkillInspectItem {
+  name: string;
+  description: string;
+  source: string;
+  sourcePath: string;
+  enabled: boolean;
+  disableModelInvocation: boolean;
+  userInvocable: boolean;
+  group?: string;
+  effective: boolean;
+  effectiveSourcePath?: string | null;
+  callable: boolean;
+  reasons: SkillAvailabilityReason[];
+}
+
+export interface SkillInspectScanError {
+  path: string;
+  code: string;
+  message: string;
+  line?: number | null;
+  column?: number | null;
+}
+
+export interface SkillInspectReport {
+  items: SkillInspectItem[];
+  scanErrors: SkillInspectScanError[];
+  skillToolAllowed: boolean;
+}
+
+export interface RoleOpeningQuestion {
+  title: string | null;
+  content: string;
+}
+
 export interface Role {
   id: string;
   name: string;
   description: string | null;
   system_prompt: string;
   opening_message: string | null;
-  opening_questions: string[];
+  opening_questions: RoleOpeningQuestion[];
   tags: string[];
   avatar: string | null;
   avatar_type: string | null;
   avatar_value: string | null;
   temperature: number | null;
   top_p: number | null;
+  enabled_mcp_server_ids: string[];
+  enabled_skill_names: string[];
+  enabled_knowledge_base_ids: string[];
+  enabled_memory_namespace_ids: string[];
   source_kind: string;
   source_ref: string | null;
   created_at: number;
@@ -887,13 +1310,17 @@ export interface CreateRoleInput {
   description?: string | null;
   system_prompt: string;
   opening_message?: string | null;
-  opening_questions: string[];
+  opening_questions: RoleOpeningQuestion[];
   tags: string[];
   avatar?: string | null;
   avatar_type?: string | null;
   avatar_value?: string | null;
   temperature?: number | null;
   top_p?: number | null;
+  enabled_mcp_server_ids?: string[];
+  enabled_skill_names?: string[];
+  enabled_knowledge_base_ids?: string[];
+  enabled_memory_namespace_ids?: string[];
   source_kind?: string | null;
   source_ref?: string | null;
 }
@@ -903,13 +1330,17 @@ export interface UpdateRoleInput {
   description?: string | null;
   system_prompt?: string;
   opening_message?: string | null;
-  opening_questions?: string[];
+  opening_questions?: RoleOpeningQuestion[];
   tags?: string[];
   avatar?: string | null;
   avatar_type?: string | null;
   avatar_value?: string | null;
   temperature?: number | null;
   top_p?: number | null;
+  enabled_mcp_server_ids?: string[];
+  enabled_skill_names?: string[];
+  enabled_knowledge_base_ids?: string[];
+  enabled_memory_namespace_ids?: string[];
 }
 
 export interface MarketplaceRole {

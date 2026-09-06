@@ -8,6 +8,492 @@ type GatewayTemplate = {
   content: string;
 };
 
+function mockConversation(id: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id,
+    category_id: null,
+    parent_conversation_id: null,
+    is_archived: false,
+    sort_order: 0,
+    updated_at: 100,
+    multi_model_display_mode_override: null,
+    ...overrides,
+  };
+}
+
+const EXPECTED_SHUAI_API_PROVIDER = {
+  id: 'builtin-shuaiapi',
+  builtin_id: 'shuaiapi',
+  name: 'SHUAI API',
+  provider_type: 'openai',
+  api_host: 'https://api.shuaiapi.com',
+  api_path: null,
+  enabled: false,
+  models: [],
+  keys: [],
+  proxy_config: null,
+  sort_order: 9,
+  created_at: 1700000000000,
+  updated_at: 1700000000000,
+};
+
+const EXPECTED_GPTNB_PROVIDER = {
+  id: 'builtin-gptnb',
+  builtin_id: 'gptnb',
+  name: 'GPTNB',
+  provider_type: 'openai',
+  api_host: 'https://goapi.gptnb.ai',
+  api_path: null,
+  enabled: false,
+  models: [],
+  keys: [],
+  proxy_config: null,
+  sort_order: 10,
+  created_at: 1700000000000,
+  updated_at: 1700000000000,
+};
+
+const EXPECTED_NEW_API_PROVIDER = {
+  id: 'builtin-newapi',
+  builtin_id: 'newapi',
+  name: 'New API',
+  provider_type: 'openai',
+  api_host: '',
+  api_path: null,
+  enabled: false,
+  models: [],
+  keys: [],
+  proxy_config: null,
+  sort_order: 11,
+  created_at: 1700000000000,
+  updated_at: 1700000000000,
+};
+
+describe('browserMock built-in providers', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('initializes SHUAI API, GPTNB and New API with the expected fields and ordering', async () => {
+    const providers = await handleCommand<any[]>('list_providers');
+    const shuaiApi = providers.find((provider) => provider.id === 'builtin-shuaiapi');
+    const gptnb = providers.find((provider) => provider.id === 'builtin-gptnb');
+    const newApi = providers.find((provider) => provider.id === 'builtin-newapi');
+
+    expect(shuaiApi).toEqual(EXPECTED_SHUAI_API_PROVIDER);
+    expect(gptnb).toEqual(EXPECTED_GPTNB_PROVIDER);
+    expect(newApi).toEqual(EXPECTED_NEW_API_PROVIDER);
+    expect(providers.map((provider) => provider.id)).toEqual(expect.arrayContaining([
+      'builtin-minimax',
+      'builtin-shuaiapi',
+      'builtin-gptnb',
+      'builtin-newapi',
+      'builtin-jina',
+    ]));
+    expect(providers.findIndex((provider) => provider.id === 'builtin-shuaiapi')).toBe(
+      providers.findIndex((provider) => provider.id === 'builtin-minimax') + 1,
+    );
+    expect(providers.findIndex((provider) => provider.id === 'builtin-gptnb')).toBe(
+      providers.findIndex((provider) => provider.id === 'builtin-shuaiapi') + 1,
+    );
+    expect(providers.findIndex((provider) => provider.id === 'builtin-newapi')).toBe(
+      providers.findIndex((provider) => provider.id === 'builtin-gptnb') + 1,
+    );
+    expect(providers.findIndex((provider) => provider.id === 'builtin-jina')).toBe(
+      providers.findIndex((provider) => provider.id === 'builtin-newapi') + 1,
+    );
+    expect(providers.find((provider) => provider.id === 'builtin-jina')?.sort_order).toBe(12);
+    expect(providers.find((provider) => provider.id === 'builtin-cohere')?.sort_order).toBe(13);
+    expect(providers.find((provider) => provider.id === 'builtin-voyage')?.sort_order).toBe(14);
+  });
+
+  it('adds the complete SHUAI API provider to existing localStorage', async () => {
+    const providers = await handleCommand<any[]>('list_providers');
+    const legacySortOrders: Record<string, number> = {
+      'builtin-jina': 9,
+      'builtin-cohere': 10,
+      'builtin-voyage': 11,
+    };
+    const legacyProviders = providers
+      .filter((provider) =>
+        provider.id !== 'builtin-shuaiapi'
+        && provider.id !== 'builtin-gptnb'
+        && provider.id !== 'builtin-newapi')
+      .map((provider) => ({
+        ...provider,
+        sort_order: legacySortOrders[provider.id] ?? provider.sort_order,
+      }));
+    localStorage.setItem(
+      'aqbot_providers',
+      JSON.stringify(legacyProviders),
+    );
+
+    const upgradedProviders = await handleCommand<any[]>('list_providers');
+    const shuaiApi = upgradedProviders.find((provider) => provider.id === 'builtin-shuaiapi');
+    const gptnb = upgradedProviders.find((provider) => provider.id === 'builtin-gptnb');
+    const newApi = upgradedProviders.find((provider) => provider.id === 'builtin-newapi');
+    const persistedProviders = JSON.parse(localStorage.getItem('aqbot_providers') ?? '[]');
+
+    expect(shuaiApi).toEqual(EXPECTED_SHUAI_API_PROVIDER);
+    expect(gptnb).toEqual(EXPECTED_GPTNB_PROVIDER);
+    expect(newApi).toEqual(EXPECTED_NEW_API_PROVIDER);
+    expect(persistedProviders.find((provider: any) => provider.id === 'builtin-shuaiapi'))
+      .toEqual(EXPECTED_SHUAI_API_PROVIDER);
+    expect(persistedProviders.find((provider: any) => provider.id === 'builtin-gptnb'))
+      .toEqual(EXPECTED_GPTNB_PROVIDER);
+    expect(persistedProviders.find((provider: any) => provider.id === 'builtin-newapi'))
+      .toEqual(EXPECTED_NEW_API_PROVIDER);
+    expect(upgradedProviders.findIndex((provider) => provider.id === 'builtin-shuaiapi')).toBe(
+      upgradedProviders.findIndex((provider) => provider.id === 'builtin-minimax') + 1,
+    );
+    expect(upgradedProviders.findIndex((provider) => provider.id === 'builtin-gptnb')).toBe(
+      upgradedProviders.findIndex((provider) => provider.id === 'builtin-shuaiapi') + 1,
+    );
+    expect(upgradedProviders.findIndex((provider) => provider.id === 'builtin-newapi')).toBe(
+      upgradedProviders.findIndex((provider) => provider.id === 'builtin-gptnb') + 1,
+    );
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-jina')?.sort_order).toBe(12);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-cohere')?.sort_order).toBe(13);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-voyage')?.sort_order).toBe(14);
+  });
+
+  it('adds GPTNB to existing localStorage that already has SHUAI API', async () => {
+    const providers = await handleCommand<any[]>('list_providers');
+    const legacySortOrders: Record<string, number> = {
+      'builtin-jina': 10,
+      'builtin-cohere': 11,
+      'builtin-voyage': 12,
+    };
+    const legacyProviders = providers
+      .filter((provider) => provider.id !== 'builtin-gptnb' && provider.id !== 'builtin-newapi')
+      .map((provider) => ({
+        ...provider,
+        sort_order: legacySortOrders[provider.id] ?? provider.sort_order,
+      }));
+    localStorage.setItem('aqbot_providers', JSON.stringify(legacyProviders));
+
+    const upgradedProviders = await handleCommand<any[]>('list_providers');
+    const gptnb = upgradedProviders.find((provider) => provider.id === 'builtin-gptnb');
+
+    expect(gptnb).toEqual(EXPECTED_GPTNB_PROVIDER);
+    expect(upgradedProviders.findIndex((provider) => provider.id === 'builtin-gptnb')).toBe(
+      upgradedProviders.findIndex((provider) => provider.id === 'builtin-shuaiapi') + 1,
+    );
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-jina')?.sort_order).toBe(12);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-cohere')?.sort_order).toBe(13);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-voyage')?.sort_order).toBe(14);
+  });
+
+  it('adds New API to existing localStorage that already has SHUAI API and GPTNB', async () => {
+    const providers = await handleCommand<any[]>('list_providers');
+    const legacySortOrders: Record<string, number> = {
+      'builtin-jina': 11,
+      'builtin-cohere': 12,
+      'builtin-voyage': 13,
+    };
+    const legacyProviders = providers
+      .filter((provider) => provider.id !== 'builtin-newapi')
+      .map((provider) => ({
+        ...provider,
+        sort_order: legacySortOrders[provider.id] ?? provider.sort_order,
+      }));
+    localStorage.setItem('aqbot_providers', JSON.stringify(legacyProviders));
+
+    const upgradedProviders = await handleCommand<any[]>('list_providers');
+    const newApi = upgradedProviders.find((provider) => provider.id === 'builtin-newapi');
+
+    expect(newApi).toEqual(EXPECTED_NEW_API_PROVIDER);
+    expect(upgradedProviders.findIndex((provider) => provider.id === 'builtin-newapi')).toBe(
+      upgradedProviders.findIndex((provider) => provider.id === 'builtin-gptnb') + 1,
+    );
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-jina')?.sort_order).toBe(12);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-cohere')?.sort_order).toBe(13);
+    expect(upgradedProviders.find((provider) => provider.id === 'builtin-voyage')?.sort_order).toBe(14);
+  });
+
+  it('does not share mutable built-in provider data across initializations', async () => {
+    const providers = await handleCommand<any[]>('list_providers');
+    const shuaiApi = providers.find((provider) => provider.id === 'builtin-shuaiapi');
+    const gptnb = providers.find((provider) => provider.id === 'builtin-gptnb');
+    const newApi = providers.find((provider) => provider.id === 'builtin-newapi');
+    shuaiApi.keys.push({ id: 'temporary-key' });
+    gptnb.keys.push({ id: 'temporary-key' });
+    newApi.keys.push({ id: 'temporary-key' });
+
+    localStorage.clear();
+    const reinitializedProviders = await handleCommand<any[]>('list_providers');
+
+    expect(reinitializedProviders.find((provider) => provider.id === 'builtin-shuaiapi'))
+      .toEqual(EXPECTED_SHUAI_API_PROVIDER);
+    expect(reinitializedProviders.find((provider) => provider.id === 'builtin-gptnb'))
+      .toEqual(EXPECTED_GPTNB_PROVIDER);
+    expect(reinitializedProviders.find((provider) => provider.id === 'builtin-newapi'))
+      .toEqual(EXPECTED_NEW_API_PROVIDER);
+  });
+});
+
+describe('browserMock conversation ordering', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('lists conversations in backend order and includes sort order', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('third', { sort_order: 2, updated_at: 100 }),
+      mockConversation('second', { sort_order: 2, updated_at: 200 }),
+      mockConversation('first', { sort_order: 0, updated_at: 50 }),
+      mockConversation('pinned', { is_pinned: true, sort_order: 4, updated_at: 25 }),
+      mockConversation('archived', { sort_order: -1, is_archived: true }),
+    ]));
+
+    const conversations = await handleCommand<any[]>('list_conversations');
+
+    expect(conversations.map((conversation) => conversation.id)).toEqual([
+      'pinned',
+      'second',
+      'third',
+      'first',
+    ]);
+    expect(conversations.map((conversation) => conversation.sort_order)).toEqual([4, 2, 2, 0]);
+  });
+
+  it('creates conversations at the top of the uncategorized container', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('uncategorized', { sort_order: 3 }),
+      mockConversation('categorized', { category_id: 'category', sort_order: -10 }),
+    ]));
+
+    const created = await handleCommand<any>('create_conversation', {
+      title: 'Created',
+      modelId: 'model',
+      providerId: 'provider',
+    });
+
+    expect(created.sort_order).toBe(2);
+    const persisted = JSON.parse(localStorage.getItem('aqbot_conversations') ?? '[]');
+    expect(persisted.find((conversation: any) => conversation.id === 'uncategorized').sort_order).toBe(3);
+    expect(persisted.find((conversation: any) => conversation.id === 'categorized').sort_order).toBe(-10);
+  });
+
+  it('defaults legacy and newly created conversation layout overrides to null', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('legacy', { multi_model_display_mode_override: undefined }),
+    ]));
+
+    const [legacy] = await handleCommand<any[]>('list_conversations');
+    const created = await handleCommand<any>('create_conversation', {
+      title: 'Created',
+      modelId: 'model',
+      providerId: 'provider',
+    });
+
+    expect([
+      legacy.multi_model_display_mode_override,
+      created.multi_model_display_mode_override,
+    ]).toEqual([null, null]);
+    expect([legacy.multi_model_targets, created.multi_model_targets]).toEqual([[], []]);
+    expect([
+      legacy.multi_model_continuation_mode,
+      created.multi_model_continuation_mode,
+    ]).toEqual(['selected', 'selected']);
+  });
+
+  it('sets, preserves, and clears a conversation layout override', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('conversation'),
+    ]));
+
+    const setOverride = await handleCommand<any>('update_conversation', {
+      id: 'conversation',
+      input: { multi_model_display_mode_override: 'side-by-side' },
+    });
+    const preserved = await handleCommand<any>('update_conversation', {
+      id: 'conversation',
+      input: { title: 'Renamed' },
+    });
+    const cleared = await handleCommand<any>('update_conversation', {
+      id: 'conversation',
+      input: { multi_model_display_mode_override: null },
+    });
+
+    expect([
+      setOverride.multi_model_display_mode_override,
+      preserved.multi_model_display_mode_override,
+      cleared.multi_model_display_mode_override,
+    ]).toEqual(['side-by-side', 'side-by-side', null]);
+  });
+
+  it('atomically reorders a complete top-level conversation container without changing timestamps', async () => {
+    const conversations = [
+      mockConversation('first', { sort_order: 0, updated_at: 101 }),
+      mockConversation('second', { sort_order: 1, updated_at: 202 }),
+      mockConversation('child', { parent_conversation_id: 'first', sort_order: 7, updated_at: 303 }),
+      mockConversation('archived', { is_archived: true, sort_order: 8, updated_at: 404 }),
+      mockConversation('categorized', { category_id: 'category', sort_order: 9, updated_at: 505 }),
+    ];
+    localStorage.setItem('aqbot_conversations', JSON.stringify(conversations));
+    localStorage.setItem('aqbot_conversation_categories', JSON.stringify([{ id: 'category' }]));
+
+    await handleCommand('reorder_conversations', {
+      categoryId: null,
+      conversationIds: ['second', 'first'],
+    });
+
+    const persisted = JSON.parse(localStorage.getItem('aqbot_conversations') ?? '[]');
+    expect(persisted.find((conversation: any) => conversation.id === 'second')).toMatchObject({
+      sort_order: 0,
+      updated_at: 202,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'first')).toMatchObject({
+      sort_order: 1,
+      updated_at: 101,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'child').sort_order).toBe(7);
+    expect(persisted.find((conversation: any) => conversation.id === 'archived').sort_order).toBe(8);
+    expect(persisted.find((conversation: any) => conversation.id === 'categorized').sort_order).toBe(9);
+  });
+
+  it('rejects invalid reorder payloads without persisting partial changes', async () => {
+    const conversations = [
+      mockConversation('first', { sort_order: 0 }),
+      mockConversation('second', { sort_order: 1 }),
+      mockConversation('child', { parent_conversation_id: 'first', sort_order: 2 }),
+      mockConversation('categorized', { category_id: 'category', sort_order: 3 }),
+    ];
+    const original = JSON.stringify(conversations);
+    localStorage.setItem('aqbot_conversations', original);
+    localStorage.setItem('aqbot_conversation_categories', JSON.stringify([{ id: 'category' }]));
+
+    await expect(handleCommand('reorder_conversations', {
+      categoryId: null,
+      conversationIds: ['first'],
+    })).rejects.toThrow('every conversation');
+    await expect(handleCommand('reorder_conversations', {
+      categoryId: null,
+      conversationIds: ['first', 'first'],
+    })).rejects.toThrow('duplicates');
+    await expect(handleCommand('reorder_conversations', {
+      categoryId: null,
+      conversationIds: ['first', 'child'],
+    })).rejects.toThrow('every conversation');
+    await expect(handleCommand('reorder_conversations', {
+      categoryId: 'missing',
+      conversationIds: [],
+    })).rejects.toThrow('Category not found');
+
+    expect(localStorage.getItem('aqbot_conversations')).toBe(original);
+  });
+
+  it('strictly reorders categorized conversations', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('first', { category_id: 'category', sort_order: 0, updated_at: 101 }),
+      mockConversation('second', { category_id: 'category', sort_order: 1, updated_at: 202 }),
+      mockConversation('uncategorized', { sort_order: 4 }),
+    ]));
+    localStorage.setItem('aqbot_conversation_categories', JSON.stringify([{ id: 'category' }]));
+
+    await handleCommand('reorder_conversations', {
+      categoryId: 'category',
+      conversationIds: ['second', 'first'],
+    });
+
+    const persisted = JSON.parse(localStorage.getItem('aqbot_conversations') ?? '[]');
+    expect(persisted.find((conversation: any) => conversation.id === 'second')).toMatchObject({
+      sort_order: 0,
+      updated_at: 202,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'first')).toMatchObject({
+      sort_order: 1,
+      updated_at: 101,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'uncategorized').sort_order).toBe(4);
+  });
+
+  it('moves single conversations to the top when their visible container membership changes', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('uncategorized-first', { sort_order: 0 }),
+      mockConversation('uncategorized-moved', { sort_order: 1 }),
+      mockConversation('category-first', { category_id: 'category', sort_order: 0 }),
+      mockConversation('archived', { category_id: 'category', is_archived: true, sort_order: 10 }),
+    ]));
+    localStorage.setItem('aqbot_conversation_categories', JSON.stringify([{ id: 'category' }]));
+
+    const moved = await handleCommand<any>('update_conversation', {
+      id: 'uncategorized-moved',
+      input: { category_id: 'category' },
+    });
+    const pinned = await handleCommand<any>('toggle_pin_conversation', {
+      id: 'uncategorized-first',
+    });
+    const unarchived = await handleCommand<any>('toggle_archive_conversation', {
+      id: 'archived',
+    });
+
+    expect(moved.sort_order).toBe(-1);
+    expect(pinned.sort_order).toBe(0);
+    expect(unarchived.sort_order).toBe(-2);
+  });
+
+  it('moves a deleted category into an ordered block at the uncategorized top', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('uncategorized', { sort_order: 0 }),
+      mockConversation('category-second', { category_id: 'category', sort_order: 1 }),
+      mockConversation('category-first', { category_id: 'category', sort_order: 0 }),
+      mockConversation('category-child', {
+        category_id: 'category',
+        parent_conversation_id: 'category-first',
+        sort_order: 9,
+      }),
+    ]));
+    localStorage.setItem('aqbot_conversation_categories', JSON.stringify([{ id: 'category' }]));
+
+    await handleCommand('delete_conversation_category', { id: 'category' });
+
+    const persisted = JSON.parse(localStorage.getItem('aqbot_conversations') ?? '[]');
+    expect(persisted.find((conversation: any) => conversation.id === 'category-first')).toMatchObject({
+      category_id: null,
+      sort_order: -2,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'category-second')).toMatchObject({
+      category_id: null,
+      sort_order: -1,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'category-child')).toMatchObject({
+      category_id: null,
+      sort_order: 9,
+    });
+    expect(persisted.find((conversation: any) => conversation.id === 'uncategorized').sort_order).toBe(0);
+  });
+
+  it('pins conversations to the tab bar without changing updated_at or sidebar pin state', async () => {
+    localStorage.setItem('aqbot_conversations', JSON.stringify([
+      mockConversation('first', { is_pinned: false, sort_order: 0, updated_at: 11, tab_pin_order: null }),
+      mockConversation('second', { is_pinned: true, sort_order: 1, updated_at: 22, tab_pin_order: null }),
+      mockConversation('archived', { is_archived: true, updated_at: 33, tab_pin_order: 1 }),
+    ]));
+
+    const first = await handleCommand<any>('set_conversation_tab_pinned', { id: 'first', pinned: true });
+    const second = await handleCommand<any>('set_conversation_tab_pinned', { id: 'second', pinned: true });
+    const firstAgain = await handleCommand<any>('set_conversation_tab_pinned', { id: 'first', pinned: true });
+    await expect(handleCommand('set_conversation_tab_pinned', {
+      id: 'archived',
+      pinned: true,
+    })).rejects.toThrow(/archived/);
+
+    expect(first.tab_pin_order).toBe(1);
+    expect(second.tab_pin_order).toBe(2);
+    expect(firstAgain.tab_pin_order).toBe(1);
+    expect(firstAgain.updated_at).toBe(11);
+    expect(firstAgain.is_pinned).toBe(false);
+    expect(second.is_pinned).toBe(true);
+
+    const unpinned = await handleCommand<any>('set_conversation_tab_pinned', { id: 'first', pinned: false });
+    expect(unpinned.tab_pin_order).toBeNull();
+    const archived = await handleCommand<any>('toggle_archive_conversation', { id: 'second' });
+    expect(archived.tab_pin_order).toBeNull();
+  });
+});
+
 describe('browserMock gateway templates', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -43,6 +529,27 @@ describe('browserMock gateway templates', () => {
 
     const backups = await handleCommand<any[]>('list_backups');
     expect(backups).toHaveLength(0);
+  });
+
+  it('exposes raw stored-file ids for files-page image protocol URLs', async () => {
+    localStorage.setItem('aqbot_drawing_files', JSON.stringify([{
+      id: 'stored-image-1',
+      original_name: 'preview.png',
+      mime_type: 'image/png',
+      size_bytes: 68,
+      storage_path: 'images/preview.png',
+      data: 'ignored-by-files-page-list',
+    }]));
+
+    const rows = await handleCommand<any[]>('list_files_page_entries', { category: 'images' });
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        id: 'attachment::stored-image-1',
+        storedFileId: 'stored-image-1',
+        storagePath: 'images/preview.png',
+      }),
+    ]);
   });
 
   it('stores S3 config and supports S3 backup list/delete commands', async () => {

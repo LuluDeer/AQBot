@@ -1,10 +1,11 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SkillsPage } from '../SkillsPage';
-import type { Skill } from '@/types';
+import type { MarketplaceSkill, Skill } from '@/types';
 
 const mocks = vi.hoisted(() => ({
+  ensureSkillsLoaded: vi.fn(),
   loadSkills: vi.fn(),
   getSkill: vi.fn(),
   toggleSkill: vi.fn(),
@@ -13,8 +14,22 @@ const mocks = vi.hoisted(() => ({
   uninstallSkillGroup: vi.fn(),
   openSkillDir: vi.fn(),
   searchMarketplace: vi.fn(),
+  inspectSkills: vi.fn(async () => null),
   clearSelectedSkill: vi.fn(),
 }));
+
+const marketplaceSkills: MarketplaceSkill[] = [
+  {
+    name: 'frontend-design',
+    description: 'Frontend design skill',
+    repo: 'vercel-labs/agent-skills',
+    skillId: 'frontend-design',
+    installRef: 'vercel-labs/agent-skills@frontend-design',
+    stars: 0,
+    installs: 12,
+    installed: false,
+  },
+];
 
 const skills: Skill[] = [
   {
@@ -44,7 +59,9 @@ vi.mock('react-i18next', () => ({
         'skills.mySkills': 'My Skills',
         'skills.marketplace': 'Marketplace',
         'skills.installUrlPlaceholder': 'Enter owner/repo or GitHub URL',
+        'skills.install': 'Install',
         'skills.installFromUrl': 'Install from URL',
+        'skills.searchMarketplace': 'Search marketplace',
         'skills.sourceAll': 'All',
         'skills.openDir': 'Open Directory',
         'skills.empty': 'No Skills',
@@ -64,20 +81,25 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('@lobehub/icons', () => ({
   Claude: {
-    Color: () => <span data-testid="claude-icon" />,
+    Color: () => <span />,
   },
   Codex: {
-    Avatar: () => <span data-testid="codex-icon" />,
+    Avatar: () => <span />,
+    Color: () => <span />,
   },
 }));
 
 vi.mock('@/stores', () => ({
   useSkillStore: () => ({
     skills,
-    marketplaceSkills: [],
+    marketplaceSkills,
     loading: false,
     marketplaceLoading: false,
     selectedSkill: null,
+    inspectReport: null,
+    inspectLoading: false,
+    inspectSkills: mocks.inspectSkills,
+    ensureSkillsLoaded: mocks.ensureSkillsLoaded,
     loadSkills: mocks.loadSkills,
     getSkill: mocks.getSkill,
     toggleSkill: mocks.toggleSkill,
@@ -124,8 +146,53 @@ describe('SkillsPage Codex source', () => {
     await user.type(screen.getByPlaceholderText('Enter owner/repo or GitHub URL'), 'owner/repo');
     await user.click(screen.getByRole('button', { name: 'Install from URL' }));
 
+    const menu = await screen.findByRole('menu');
+    expect(within(menu).getByText('Codex')).toBeInTheDocument();
+    expect(within(menu).getByText('~/.codex/skills/')).toBeInTheDocument();
+  });
+
+  it('shows brand icons for every install target', async () => {
+    const user = userEvent.setup();
+
+    render(<SkillsPage />);
+
+    await user.type(screen.getByPlaceholderText('Enter owner/repo or GitHub URL'), 'owner/repo');
+    await user.click(screen.getByRole('button', { name: 'Install from URL' }));
+
+    const menu = await screen.findByRole('menu');
+    expect(within(menu).getByTestId('aqbot-icon')).toBeInTheDocument();
+    expect(within(menu).getByTestId('codex-icon')).toBeInTheDocument();
+    expect(within(menu).getByTestId('claude-icon')).toBeInTheDocument();
+    expect(within(menu).getByTestId('agents-icon')).toBeInTheDocument();
+  });
+});
+
+describe('SkillsPage marketplace', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.installSkill.mockResolvedValue('frontend-design');
+  });
+
+  it('installs a marketplace skill as owner/repo@skill', async () => {
+    const user = userEvent.setup();
+
+    render(<SkillsPage />);
+
+    await user.click(screen.getByRole('tab', { name: /Marketplace/ }));
+
+    expect(mocks.searchMarketplace).toHaveBeenCalled();
+    expect(screen.getByText('frontend-design')).toBeInTheDocument();
+    expect(screen.getByText('vercel-labs/agent-skills@frontend-design')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Install' }));
+    const menu = await screen.findByRole('menu');
+    await user.click(within(menu).getByText('AQBot'));
+
     await waitFor(() => {
-      expect(screen.getByText('Codex (~/.codex/skills/)')).toBeInTheDocument();
+      expect(mocks.installSkill).toHaveBeenCalledWith(
+        'vercel-labs/agent-skills@frontend-design',
+        'aqbot',
+      );
     });
   });
 });

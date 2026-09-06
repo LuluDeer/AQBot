@@ -8,6 +8,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sea-orm = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -24,6 +25,7 @@ reqwest = { version = "0.13", features = ["json", "stream"] }
 futures = "0.3"
 rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 regex = "1"
+unicode-normalization = "0.1"
 hex = "0.4"
 toml_edit = "0.22"
 sqlite-vec = { workspace = true }
@@ -32,10 +34,12 @@ pdf-extract = "0.7"
 zip = "2"
 litchi = "0.0.1"
 dirs = "5"
+tempfile = "3"
+urlencoding = "2"
 aqbot-migration = { path = "../migration" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
-tempfile = "3"
+sea-orm = { workspace = true, features = ["mock"] }

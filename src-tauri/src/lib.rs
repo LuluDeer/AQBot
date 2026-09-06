@@ -17,15 +17,24 @@ pub struct StreamCancelEntry {
     pub flag: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+pub struct AgentCancelEntry {
+    pub run_id: String,
+    pub token: open_agent_sdk::CancellationToken,
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub sea_db: DatabaseConnection,
     pub master_key: [u8; 32],
+    pub mcp_stdio_clients: Arc<aqbot_core::mcp_client::StdioClientManager>,
     pub gateway: Arc<Mutex<Option<aqbot_gateway::server::GatewayServer>>>,
     pub close_to_tray: Arc<AtomicBool>,
     pub release_webview_on_tray: Arc<AtomicBool>,
     pub main_window_released_to_tray: Arc<AtomicBool>,
     pub main_window_restoring: Arc<AtomicBool>,
     pub is_quitting: Arc<AtomicBool>,
+    pub(crate) model_catalog: Arc<model_catalog::ModelCatalogService>,
     pub app_data_dir: PathBuf,
     pub db_path: String,
     pub auto_backup_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -34,26 +43,50 @@ pub struct AppState {
     pub vector_store: Arc<aqbot_core::vector_store::VectorStore>,
     pub knowledge_index_scheduler: Arc<knowledge_index_scheduler::KnowledgeIndexScheduler>,
     pub stream_cancel_flags: Arc<Mutex<std::collections::HashMap<String, StreamCancelEntry>>>,
-    pub agent_cancel_tokens:
-        Arc<Mutex<std::collections::HashMap<String, open_agent_sdk::CancellationToken>>>,
+    pub agent_cancel_tokens: Arc<Mutex<std::collections::HashMap<String, AgentCancelEntry>>>,
     pub agent_permission_senders:
         Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
     pub agent_ask_senders:
         Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>>,
     pub agent_always_allowed:
         Arc<Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>>,
+    pub selection_toolbar: Arc<selection_toolbar::SelectionToolbarRuntime>,
+    /// Tray actions that must survive main-window webview destroy/restore.
+    pub pending_tray_action: Arc<std::sync::Mutex<Option<tray::PendingTrayAction>>>,
+    pub multi_model_runs: Arc<multi_model_run::MultiModelRunManager>,
+    pub conversation_runs: conversation_run::ConversationRunRegistry,
+    pub tray_enabled: Arc<AtomicBool>,
+    pub tray_available: Arc<AtomicBool>,
 }
 
+mod app_icon;
 mod commands;
 mod context_manager;
+mod conversation_popout;
+mod conversation_run;
+mod crash_diagnostics;
+mod diagnostic_log;
 mod diagnostics;
+mod embedding_runtime;
 mod indexing;
 pub mod knowledge_index_scheduler;
 #[cfg(any(target_os = "linux", test))]
 mod linux_webkit;
+mod macos_crash_report;
+mod media_protocol;
+mod model_catalog;
+#[doc(hidden)]
+pub mod model_catalog_tools;
+pub mod multi_model_run;
+mod onnxruntime_dylib;
 mod paths;
+mod selection_toolbar;
 mod startup_diagnostics;
+#[cfg(any(target_os = "windows", test))]
+mod startup_messages;
 mod tray;
+mod tray_icon;
+mod tray_icon_image;
 mod window_lifecycle;
 mod window_state;
 
@@ -62,22 +95,29 @@ mod windows_utils;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     diagnostics::init_tracing();
+    let startup_phase = startup_diagnostics::StartupPhase::new("process.start");
+    startup_diagnostics::install_process_startup_phase(startup_phase.clone());
     diagnostics::install_panic_hook();
+    let watchdog = startup_diagnostics::start_startup_watchdog(startup_phase.clone());
+    startup_phase.set("process.environment");
     diagnostics::log_process_startup();
     startup_diagnostics::log_startup_env_switches();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     #[cfg(target_os = "linux")]
     linux_webkit::apply_startup_workarounds();
 
     #[allow(unused_mut)]
     let mut builder = {
+        startup_phase.set("builder.create");
         tracing::info!("Creating Tauri application builder");
         let builder = tauri::Builder::default();
         tracing::info!("Created Tauri application builder");
         builder
     };
+    builder = builder.manage(startup_phase.clone());
+    builder = media_protocol::register(builder);
 
     let minimal_plugins = {
         #[cfg(target_os = "linux")]
@@ -167,6 +207,15 @@ pub fn run() {
             "aqbot_diag_after_clipboard_manager",
         ));
 
+        #[cfg(target_os = "macos")]
+        {
+            builder =
+                startup_diagnostics::register_plugin(builder, "nspanel", tauri_nspanel::init());
+            builder = builder.plugin(startup_diagnostics::diagnostic_marker_plugin(
+                "aqbot_diag_after_nspanel",
+            ));
+        }
+
         builder = startup_diagnostics::register_plugin(
             builder,
             "updater",
@@ -215,8 +264,10 @@ pub fn run() {
         context
     };
 
-    let startup_phase = startup_diagnostics::StartupPhase::new("attaching invoke handler");
-    let watchdog = startup_diagnostics::start_linux_startup_watchdog(startup_phase.clone());
+    tracing::info!(
+        app_version = %context.package_info().version,
+        "AQBot application version"
+    );
 
     tracing::info!("Attaching Tauri invoke handler");
     startup_phase.set("attaching invoke handler");
@@ -232,36 +283,55 @@ pub fn run() {
         commands::providers::toggle_provider,
         commands::providers::add_provider_key,
         commands::providers::update_provider_key,
+        commands::providers::add_bedrock_credentials,
+        commands::providers::update_bedrock_credentials,
         commands::providers::delete_provider_key,
         commands::providers::toggle_provider_key,
         commands::providers::get_decrypted_provider_key,
+        commands::providers::get_decrypted_bedrock_credentials,
         commands::providers::validate_provider_key,
         commands::providers::save_models,
         commands::providers::toggle_model,
         commands::providers::update_model_params,
         commands::providers::fetch_remote_models,
+        commands::providers::infer_model_metadata,
+        commands::providers::apply_model_sync,
+        commands::providers::update_model_metadata,
+        commands::providers::reset_model_metadata,
         commands::providers::test_model,
         commands::providers::reorder_providers,
         // drawing
+        commands::drawing::list_drawing_targets,
         commands::drawing::list_drawing_generations,
         commands::drawing::upload_drawing_reference,
+        commands::drawing::create_drawing_generation,
         commands::drawing::generate_drawing_images,
         commands::drawing::edit_drawing_image,
         commands::drawing::edit_drawing_image_with_mask,
+        commands::drawing::cancel_drawing_generation,
         commands::drawing::delete_drawing_generation,
         // conversations
         commands::conversations::list_conversations,
+        commands::conversations::get_conversation_snapshot,
         commands::conversations::create_conversation,
         commands::conversations::update_conversation,
+        commands::conversations::reorder_conversations,
         commands::conversations::delete_conversation,
         commands::conversations::branch_conversation,
         commands::conversations::search_conversations,
         commands::conversations::send_message,
+        commands::conversations::list_active_conversation_runs,
+        commands::conversations::get_conversation_run_snapshot,
         commands::conversations::toggle_pin_conversation,
+        commands::conversations::set_conversation_tab_pinned,
         commands::conversations::toggle_archive_conversation,
         commands::conversations::list_archived_conversations,
         commands::conversations::regenerate_message,
         commands::conversations::regenerate_with_model,
+        commands::conversations::start_multi_model_run,
+        commands::conversations::get_multi_model_run_snapshot,
+        commands::conversations::skip_multi_model_target,
+        commands::conversations::stop_multi_model_run,
         commands::conversations::cancel_stream,
         commands::conversations::list_message_versions,
         commands::conversations::list_message_versions_batch,
@@ -270,6 +340,7 @@ pub fn run() {
         commands::conversations::send_system_message,
         commands::conversations::compress_context,
         commands::conversations::get_compression_summary,
+        commands::conversations::retry_compression,
         commands::conversations::get_context_usage,
         commands::conversations::delete_compression,
         commands::conversations::regenerate_conversation_title,
@@ -283,6 +354,13 @@ pub fn run() {
         // settings
         commands::settings::get_settings,
         commands::settings::save_settings,
+        commands::tray_icon::set_custom_tray_icon,
+        commands::tray_icon::reset_tray_icon,
+        commands::tray_icon::set_tray_icon_app_scope,
+        commands::tray_icon::get_tray_icon_status,
+        commands::settings::get_multi_model_column_layout,
+        commands::settings::set_multi_model_side_by_side_width_mode,
+        commands::settings::set_multi_model_column_width,
         // gateway
         commands::gateway::list_gateway_keys,
         commands::gateway::create_gateway_key,
@@ -313,6 +391,7 @@ pub fn run() {
         commands::gateway::generate_self_signed_cert,
         // messages
         commands::messages::list_messages,
+        commands::messages::list_inline_media_diagnostics,
         commands::messages::list_messages_page,
         commands::messages::list_message_summaries,
         commands::messages::list_messages_window,
@@ -375,6 +454,12 @@ pub fn run() {
         commands::knowledge::rebuild_knowledge_document,
         commands::knowledge::add_knowledge_chunk,
         // memory
+        commands::memory::get_memory_l1,
+        commands::memory::save_memory_l1,
+        commands::embedding_artifact::get_embedding_artifact_status,
+        commands::embedding_artifact::install_embedding_artifact,
+        commands::embedding_artifact::cancel_embedding_artifact_install,
+        commands::embedding_artifact::uninstall_embedding_artifact,
         commands::memory::list_memory_namespaces,
         commands::memory::create_memory_namespace,
         commands::memory::delete_memory_namespace,
@@ -434,9 +519,50 @@ pub fn run() {
         commands::desktop::test_proxy,
         commands::desktop::open_devtools,
         commands::desktop::write_diagnostic_log,
-        commands::desktop::list_system_fonts,
+        commands::startup::report_startup_presented,
+        commands::system_fonts::list_system_fonts,
+        commands::system_fonts::list_system_font_faces,
         commands::desktop::minimize_window,
         commands::desktop::toggle_maximize_window,
+        commands::desktop::refresh_tray_menu,
+        commands::desktop::take_pending_tray_action,
+        commands::desktop::open_conversation_popout,
+        commands::desktop::report_conversation_popout_ready,
+        // crash diagnostics
+        commands::crash_diagnostics::get_previous_crash_report,
+        commands::crash_diagnostics::acknowledge_previous_crash_report,
+        // selection toolbar
+        commands::selection_toolbar::selection_toolbar_get_runtime_status,
+        commands::selection_toolbar::selection_toolbar_get_snapshot,
+        commands::selection_toolbar::selection_toolbar_get_input,
+        commands::selection_toolbar::selection_toolbar_read_image,
+        commands::selection_toolbar::selection_toolbar_clear_capture_error,
+        commands::selection_toolbar::selection_toolbar_register_screenshot_shortcut,
+        commands::selection_toolbar::selection_toolbar_capture_screenshot,
+        selection_toolbar::capture::overlay::capture_overlay_snapshot,
+        selection_toolbar::capture::overlay::capture_overlay_image,
+        selection_toolbar::capture::overlay::capture_overlay_confirm,
+        selection_toolbar::capture::overlay::capture_overlay_cancel,
+        commands::selection_toolbar::selection_toolbar_open_permission_settings,
+        commands::selection_toolbar::selection_toolbar_request_permission,
+        commands::selection_toolbar::selection_toolbar_retry_monitoring,
+        commands::selection_toolbar::selection_toolbar_trigger,
+        commands::selection_toolbar::selection_toolbar_frontend_ready,
+        commands::selection_toolbar::selection_toolbar_set_surface,
+        commands::selection_toolbar::selection_toolbar_prepare_overflow,
+        commands::selection_toolbar::selection_toolbar_execute_tool,
+        commands::selection_toolbar::selection_toolbar_follow_up,
+        commands::selection_toolbar::selection_toolbar_regenerate,
+        commands::selection_toolbar::selection_toolbar_set_pinned,
+        commands::selection_toolbar::selection_toolbar_drag_ended,
+        commands::selection_toolbar::selection_toolbar_set_translate_target,
+        commands::selection_toolbar::selection_toolbar_stop_generation,
+        commands::selection_toolbar::selection_toolbar_copy_selection,
+        commands::selection_toolbar::selection_toolbar_search_selection,
+        commands::selection_toolbar::selection_toolbar_copy_result,
+        commands::selection_toolbar::selection_toolbar_close,
+        commands::selection_toolbar::selection_toolbar_resolve_app_paths,
+        commands::selection_toolbar::selection_toolbar_resolve_app_icons,
         // files
         commands::files::upload_file,
         commands::files::download_file,
@@ -470,8 +596,53 @@ pub fn run() {
         commands::agent::agent_respond_ask,
         commands::agent::agent_backup_and_clear_sdk_context,
         commands::agent::agent_restore_sdk_context_from_backup,
+        // ACP external agents
+        commands::acp::acp_get_registry,
+        commands::acp::acp_refresh_registry,
+        commands::acp::acp_get_config,
+        commands::acp::acp_save_general,
+        commands::acp::acp_preview_registry_agent,
+        commands::acp::acp_add_agent_from_registry,
+        commands::acp::acp_upsert_custom_agent,
+        commands::acp::acp_set_agent_enabled,
+        commands::acp::acp_reorder_agents,
+        commands::acp::acp_remove_agent,
+        commands::acp::acp_list_enabled_agents,
+        commands::acp::acp_probe_agent,
+        commands::acp::acp_probe_all,
+        commands::acp::acp_resolve_launch,
+        commands::acp::acp_list_projects,
+        commands::acp::acp_reorder_projects,
+        commands::acp::acp_create_project,
+        commands::acp::acp_ensure_recent_draft,
+        commands::acp::acp_update_project,
+        commands::acp::acp_delete_project,
+        commands::acp::acp_list_threads,
+        commands::acp::acp_list_all_threads,
+        commands::acp::acp_create_thread,
+        commands::acp::acp_create_recent_thread,
+        commands::acp::acp_delete_thread,
+        commands::acp::acp_rename_thread,
+        commands::acp::acp_toggle_thread_pin,
+        commands::acp::acp_reorder_threads,
+        commands::acp::acp_duplicate_thread,
+        commands::acp::acp_list_messages,
+        commands::acp::acp_prewarm_enabled_agents,
+        commands::acp::acp_prepare_draft,
+        commands::acp::acp_prepare_session,
+        commands::acp::acp_set_config_option,
+        commands::acp::acp_set_mode,
+        commands::acp::acp_cancel,
+        commands::acp::acp_prompt,
+        commands::acp::acp_respond_permission,
+        commands::acp::acp_cancel_interaction,
+        commands::acp::acp_respond_questionnaire,
+        commands::acp::acp_registry_source,
+        commands::acp::acp_git_info,
+        commands::acp::acp_git_checkout,
         // skills
         commands::skills::list_skills,
+        commands::skills::inspect_skills,
         commands::skills::get_skill,
         commands::skills::toggle_skill,
         commands::skills::install_skill,
@@ -496,6 +667,8 @@ pub fn run() {
     tracing::info!("Attaching Tauri setup handler");
     startup_phase.set("attaching setup handler");
     let builder = builder.setup(|app| {
+            let startup_phase = app.state::<startup_diagnostics::StartupPhase>();
+            startup_phase.set("setup.storage");
             tracing::info!("AQBot setup closure entered");
 
             // Force overlay (auto-hide) scrollbar style on macOS.
@@ -529,6 +702,36 @@ pub fn run() {
             // %USERPROFILE%\.aqbot\ on Windows).
             let app_dir = paths::aqbot_home();
             std::fs::create_dir_all(&app_dir).expect("failed to create AQBot home dir");
+            app.manage(crash_diagnostics::CrashDiagnosticsState::initialize(
+                &app_dir,
+                app.package_info().version.to_string(),
+                app.config().identifier.clone(),
+                diagnostic_log::path(),
+            ));
+            startup_phase.set("setup.pending_restore");
+            match aqbot_core::pending_restore::apply_pending_restore(&app_dir) {
+                Ok(aqbot_core::pending_restore::PendingRestoreOutcome::Applied) => {
+                    tracing::info!("Pending restore applied before database startup")
+                }
+                Ok(aqbot_core::pending_restore::PendingRestoreOutcome::NotPending) => {}
+                Ok(aqbot_core::pending_restore::PendingRestoreOutcome::FailedSafely {
+                    error,
+                    quarantine_path,
+                    report_path,
+                }) => tracing::error!(
+                    error,
+                    quarantine_path = %quarantine_path.display(),
+                    report_path = ?report_path,
+                    "Pending restore failed safely; continuing with the previous database"
+                ),
+                Err(error) => {
+                    tracing::error!(error = %error, "Pending restore could not be rolled back safely");
+                    panic!(
+                        "FATAL: pending restore failed before database startup and a safe \
+                         rollback could not be confirmed: {error}."
+                    );
+                }
+            }
             tracing::info!(
                 app_dir = %app_dir.display(),
                 version = %app.package_info().version,
@@ -536,6 +739,7 @@ pub fn run() {
             );
 
             // Ensure ~/Documents/aqbot/{images,files,backups}/ exist
+            startup_phase.set("setup.documents");
             aqbot_core::storage_paths::ensure_documents_dirs()
                 .expect("failed to create documents storage dirs");
             tracing::info!("AQBot documents directories ensured");
@@ -547,6 +751,7 @@ pub fn run() {
             // db::create_pool uses SQLite create mode, which would create aqbot.db
             // on first launch — causing the safety guard below to misfire if it ran
             // after the pool is opened.
+            startup_phase.set("setup.master_key");
             let key_path = app_dir.join("master.key");
             let master_key = if key_path.exists() {
                 let mut bytes = std::fs::read(&key_path).expect("failed to read master key");
@@ -598,6 +803,7 @@ pub fn run() {
             // Register sqlite-vec extension before any DB connections
             aqbot_core::vector_store::register_sqlite_vec_extension();
 
+            startup_phase.set("setup.database");
             let rt = tokio::runtime::Runtime::new().unwrap();
             let db_handle = match rt.block_on(db::create_pool(&db_path)) {
                 Ok(h) => h,
@@ -622,7 +828,7 @@ pub fn run() {
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        windows_utils::show_error_dialog("AQBot", &msg);
+                        startup_phase.fail(&e);
                     }
                     std::process::exit(1);
                 }
@@ -634,11 +840,11 @@ pub fn run() {
                 aqbot_core::vector_store::VectorStore::new(db_handle.conn.clone());
 
             // Migrate any hardcoded absolute paths in settings to dynamic variables
+            startup_phase.set("setup.settings");
             rt.block_on(aqbot_core::path_vars::migrate_hardcoded_paths(&db_handle.conn));
 
-            let app_settings = rt
-                .block_on(aqbot_core::repo::settings::get_settings(&db_handle.conn))
-                .unwrap_or_default();
+            let app_settings =
+                rt.block_on(aqbot_core::repo::settings::get_settings(&db_handle.conn))?;
 
             // Apply custom documents root (if configured) before anything
             // that reads documents_root().
@@ -650,17 +856,90 @@ pub fn run() {
             aqbot_core::storage_paths::ensure_documents_dirs()
                 .expect("failed to create documents storage dirs (custom root)");
 
-            let tray_language = app_settings.language.clone();
+            // One-time, idempotent migration of historical assistant images that were
+            // embedded directly in message Markdown/HTML. Never mutate a candidate
+            // unless a pre-migration SQLite backup succeeds.
+            startup_phase.set("setup.inline_media");
+            match rt.block_on(aqbot_core::inline_media::pending_inline_media_message_ids(
+                &db_handle.conn,
+                None,
+            )) {
+                Ok(message_ids) if !message_ids.is_empty() => {
+                    let backup_dir = aqbot_core::path_vars::decode_path_opt(&app_settings.backup_dir)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            aqbot_core::storage_paths::documents_root().join("backups")
+                        });
+                    match rt.block_on(aqbot_core::repo::backup::create_backup(
+                        &db_handle.conn,
+                        "sqlite",
+                        &backup_dir,
+                    )) {
+                        Ok(backup) => {
+                            tracing::info!(
+                                backup_id = %backup.id,
+                                candidate_count = message_ids.len(),
+                                "Created backup before inline media migration"
+                            );
+                            let file_store = aqbot_core::file_store::FileStore::new();
+                            match rt.block_on(
+                                aqbot_core::inline_media::materialize_inline_media_messages(
+                                    &db_handle.conn,
+                                    &file_store,
+                                    &message_ids,
+                                ),
+                            ) {
+                                Ok(report) => {
+                                    tracing::info!(
+                                        migrated = report.migrated,
+                                        failed = report.failures.len(),
+                                        "Historical inline media migration finished"
+                                    );
+                                    for failure in report.failures {
+                                        tracing::error!(
+                                            message_id = %failure.message_id,
+                                            error = %failure.error,
+                                            "Historical inline media message was left unchanged"
+                                        );
+                                    }
+                                }
+                                Err(error) => tracing::error!(
+                                    error = %error,
+                                    "Historical inline media migration could not start"
+                                ),
+                            }
+                        }
+                        Err(error) => tracing::error!(
+                            error = %error,
+                            candidate_count = message_ids.len(),
+                            "Skipped inline media migration because the safety backup failed"
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Failed to inspect historical inline media candidates"
+                ),
+            }
 
+            startup_phase.set("setup.app_state");
             app.manage(AppState {
                 sea_db: db_handle.conn,
                 master_key,
+                mcp_stdio_clients: Arc::new(
+                    aqbot_core::mcp_client::StdioClientManager::new(),
+                ),
                 gateway: Arc::new(Mutex::new(None)),
                 close_to_tray: Arc::new(AtomicBool::new(app_settings.minimize_to_tray)),
                 release_webview_on_tray: Arc::new(AtomicBool::new(app_settings.release_webview_on_tray)),
                 main_window_released_to_tray: Arc::new(AtomicBool::new(false)),
                 main_window_restoring: Arc::new(AtomicBool::new(false)),
                 is_quitting: Arc::new(AtomicBool::new(false)),
+                model_catalog: Arc::new(model_catalog::ModelCatalogService::new(
+                    app_dir.join("model_metadata"),
+                    model_catalog::ModelCatalogConfig::default(),
+                )),
                 app_data_dir: app_dir.clone(),
                 db_path: db_path,
                 auto_backup_handle: Arc::new(Mutex::new(None)),
@@ -675,9 +954,34 @@ pub fn run() {
                 agent_permission_senders: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 agent_ask_senders: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 agent_always_allowed: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                selection_toolbar: Arc::new(selection_toolbar::SelectionToolbarRuntime::new()),
+                pending_tray_action: Arc::new(std::sync::Mutex::new(None)),
+                multi_model_runs: Arc::new(multi_model_run::MultiModelRunManager::new()),
+                conversation_runs: conversation_run::ConversationRunRegistry::new(),
+                tray_enabled: Arc::new(AtomicBool::new(app_settings.tray_enabled)),
+                tray_available: Arc::new(AtomicBool::new(false)),
             });
 
+            {
+                let toolbar = app.state::<AppState>().selection_toolbar.clone();
+                let toolbar_app = app.handle().clone();
+                let toolbar_settings = app_settings.clone();
+                tauri::async_runtime::spawn(async move {
+                    toolbar.reconcile(&toolbar_app, &toolbar_settings).await;
+                });
+            }
+
+            {
+                let drawing_state = app.state::<AppState>().inner().clone();
+                let drawing_app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::drawing::recover_drawing_generations(drawing_app, drawing_state)
+                        .await;
+                });
+            }
+
             // Reset any agent sessions that were running when app crashed/closed
+            startup_phase.set("setup.session_recovery");
             {
                 let sea_db = app.state::<AppState>().sea_db.clone();
                 let _ = rt.block_on(aqbot_core::repo::agent_session::reset_running_sessions(&sea_db));
@@ -696,8 +1000,21 @@ pub fn run() {
                         );
                     }
                 }
+                match rt.block_on(aqbot_core::repo::acp::interrupt_all_streaming_messages(
+                    &sea_db,
+                    "The previous Agent turn was interrupted",
+                )) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(count, "Marked stale ACP turns as interrupted");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to recover stale ACP turns");
+                    }
+                }
             }
 
+            startup_phase.set("setup.main_window");
             if let Err(err) = window_lifecycle::ensure_main_window_for_setup(app.handle()) {
                 tracing::error!(
                     error = %err,
@@ -712,6 +1029,7 @@ pub fn run() {
             }
 
             // Initialize auto-backup scheduler if enabled
+            startup_phase.set("setup.background_services");
             {
                 let state = app.state::<AppState>();
                 let db = state.sea_db.clone();
@@ -852,12 +1170,23 @@ pub fn run() {
                 });
             }
 
-            // Initialize system tray
+            // Reconcile system tray once at startup using the persisted appearance.
+            startup_phase.set("setup.tray");
             let handle = app.handle();
-            if let Err(e) = tray::create_tray(handle, &tray_language) {
-                tracing::warn!("Failed to create system tray: {}", e);
-            }
+            let tray_available = match rt.block_on(tray_icon::reconcile(handle, &app_settings)) {
+                Ok(()) => app_settings.tray_enabled && tray::tray_exists(handle),
+                Err(error) => {
+                    tracing::warn!("Failed to reconcile system tray at startup: {}", error);
+                    window_lifecycle::restore_main_window(handle);
+                    tray::tray_exists(handle)
+                }
+            };
+            handle
+                .state::<AppState>()
+                .tray_available
+                .store(tray_available, Ordering::Relaxed);
 
+            startup_phase.set("frontend.bootstrap");
             Ok(())
         });
     tracing::info!("Attached Tauri setup handler");
@@ -907,7 +1236,12 @@ pub fn run() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     let app = window.app_handle();
                     let state = app.state::<AppState>();
-                    if state.close_to_tray.load(Ordering::Relaxed) {
+                    let close_to_tray = window_lifecycle::effective_close_to_tray(
+                        state.tray_enabled.load(Ordering::Relaxed),
+                        state.tray_available.load(Ordering::Relaxed),
+                        state.close_to_tray.load(Ordering::Relaxed),
+                    );
+                    if close_to_tray {
                         let _ = window_lifecycle::release_main_window_to_tray(window);
                         api.prevent_close();
                     } else {
@@ -926,7 +1260,6 @@ pub fn run() {
     startup_phase.set("inside builder.build(context)");
     let build_result = builder.build(context);
     startup_phase.set("builder.build(context) returned");
-    watchdog.stop();
 
     let app = match build_result {
         Ok(app) => {
@@ -945,27 +1278,7 @@ pub fn run() {
             );
 
             #[cfg(target_os = "windows")]
-            {
-                let lower = error_msg.to_lowercase();
-                if lower.contains("webview2") || lower.contains("webview") || lower.contains("edge")
-                {
-                    let user_ok = windows_utils::show_warning_ok_cancel(
-                        "AQBot",
-                        "未检测到 Microsoft Edge WebView2 Runtime，AQBot 无法启动。\n\n\
-                         点击「确定」打开下载页面进行安装，安装完成后重新启动 AQBot。",
-                    );
-                    if user_ok {
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/c", "start", "https://developer.microsoft.com/en-us/microsoft-edge/webview2/?form=MA13LH#download"])
-                            .spawn();
-                    }
-                } else {
-                    windows_utils::show_error_dialog(
-                        "AQBot",
-                        &format!("应用启动失败：{}", error_msg),
-                    );
-                }
-            }
+            startup_phase.fail(&e);
 
             #[cfg(target_os = "linux")]
             diagnostics::show_linux_startup_error_dialog(&format!(
@@ -978,7 +1291,35 @@ pub fn run() {
     };
 
     tracing::info!("Starting Tauri application event loop");
-    app.run(|app, event| {
+    startup_phase.set("event_loop.webview_creation");
+    app.run(move |app, event| {
+        // Keep the monitor alive through automatic WebView creation and frontend commit.
+        let _startup_watchdog = &watchdog;
+        if matches!(event, tauri::RunEvent::Exit) {
+            let mcp_stdio_clients = app.state::<AppState>().mcp_stdio_clients.clone();
+            match tauri::async_runtime::block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(15),
+                    mcp_stdio_clients.close_all(),
+                )
+                .await
+            }) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Could not close all MCP stdio clients during exit")
+                }
+                Err(_) => tracing::warn!("Timed out closing all MCP stdio clients during exit"),
+            }
+            let toolbar = app.state::<AppState>().selection_toolbar.clone();
+            tauri::async_runtime::block_on(toolbar.shutdown(app));
+            if let Err(error) = app
+                .state::<crash_diagnostics::CrashDiagnosticsState>()
+                .finish_clean()
+            {
+                tracing::error!(%error, "Could not clear AQBot clean-exit session marker");
+            }
+        }
+
         if let tauri::RunEvent::ExitRequested { api, .. } = &event {
             let state = app.state::<AppState>();
             if state.main_window_released_to_tray.load(Ordering::Relaxed)
@@ -994,7 +1335,13 @@ pub fn run() {
             ..
         } = event
         {
-            if !has_visible_windows {
+            // Do not restore the main window when the only visible surface is the
+            // selection toolbar (dock click / accidental app activation).
+            if crate::selection_toolbar::window::only_toolbar_visible(app) {
+                tracing::debug!(
+                    "Suppressing main window restore: only selection toolbar is visible"
+                );
+            } else if !has_visible_windows {
                 window_lifecycle::restore_main_window(app);
             }
         }

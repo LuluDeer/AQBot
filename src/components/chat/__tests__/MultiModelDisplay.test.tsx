@@ -5,12 +5,21 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type React from 'react';
 import type { Message } from '@/types';
-import { clearLiveStreamContent, setLiveStreamContent, useConversationStore } from '@/stores';
-import { MultiModelDisplay } from '../MultiModelDisplay';
+import { ChatChromeContext } from '@/lib/chatChrome';
+import * as stores from '@/stores';
+import { emptyMultiModelColumnLayout } from '@/lib/multiModelColumnLayout';
+import { clearLiveStreamContent, setLiveStreamContent, useConversationStore, useMultiModelColumnLayoutStore, useSettingsStore } from '@/stores';
+import { LayoutSwitcher, MultiModelDisplay } from '../MultiModelDisplay';
+
+const openConversationPopout = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+vi.mock('@/lib/conversationPopout', () => ({
+  openConversationPopout,
+}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key,
+    t: (key: string) => key,
   }),
 }));
 
@@ -24,6 +33,22 @@ vi.mock('overlayscrollbars', () => ({
 
 vi.mock('../ModelSelector', () => ({
   ModelSelector: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
+}));
+
+vi.mock('../SaveToMemoryPopover', () => ({
+  SaveToMemoryPopover: ({
+    children,
+    content,
+    disabled,
+  }: {
+    children: React.ReactNode;
+    content: string;
+    disabled?: boolean;
+  }) => (
+    <span data-memory-content={content} data-memory-disabled={disabled ? 'true' : 'false'}>
+      {children}
+    </span>
+  ),
 }));
 
 function makeMessage(overrides: Partial<Message> & Pick<Message, 'id' | 'model_id' | 'content'>): Message {
@@ -101,15 +126,124 @@ function renderDisplayWithStreamingLabel(versions: Message[], streamingMessageId
 
 describe('MultiModelDisplay', () => {
   beforeEach(() => {
+    openConversationPopout.mockReset();
+    openConversationPopout.mockResolvedValue(undefined);
+    localStorage.clear();
     useConversationStore.setState({
       messages: [],
       activeConversationId: 'conv-1',
       streaming: false,
       streamingConversationId: null,
       streamingMessageId: null,
+      multiModelContinuationMode: 'selected',
     });
     clearLiveStreamContent('assistant-a');
     clearLiveStreamContent('assistant-b');
+    useSettingsStore.setState({
+      settings: {
+        ...useSettingsStore.getState().settings,
+        multi_model_side_by_side_width_mode: 'scroll',
+      },
+    });
+    useMultiModelColumnLayoutStore.setState({
+      layout: emptyMultiModelColumnLayout(),
+      loaded: true,
+      error: null,
+    });
+  });
+
+  it('exposes the layout switcher as keyboard-operable pressed buttons', () => {
+    const onModeChange = vi.fn();
+
+    render(
+      <App>
+        <LayoutSwitcher
+          currentMode="side-by-side"
+          onModeChange={onModeChange}
+        />
+      </App>,
+    );
+
+    const buttons = screen.getAllByRole('button');
+    expect(buttons).toHaveLength(4);
+    expect(screen.queryByText('chat.multiModel.answerAndFutureDisplayMode')).not.toBeInTheDocument();
+    expect(screen.getByRole('group')).toHaveAccessibleName('chat.multiModel.answerAndFutureDisplayMode');
+    expect(buttons[1]).toHaveAccessibleName('chat.multiModel.setAnswerAndFutureDisplayMode');
+    expect(buttons[0]).toHaveAttribute('aria-pressed', 'false');
+    expect(buttons[1]).toHaveAttribute('aria-pressed', 'true');
+    expect(buttons[1].querySelector('.lucide-check')).toBeNull();
+    expect(screen.getByTestId('layout-independent-window')).toHaveAttribute('aria-pressed', 'false');
+
+    fireEvent.click(buttons[2]);
+    expect(onModeChange).toHaveBeenCalledWith('stacked');
+  });
+
+  it('hides the layout switcher in the independent window', () => {
+    render(
+      <App>
+        <ChatChromeContext.Provider value={{ kind: 'popout' }}>
+          <LayoutSwitcher
+            currentMode="tabs"
+            onModeChange={vi.fn()}
+          />
+        </ChatChromeContext.Provider>
+      </App>,
+    );
+
+    expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('layout-independent-window')).not.toBeInTheDocument();
+  });
+
+  it('opens an independent window without changing the in-place layout', async () => {
+    const onModeChange = vi.fn();
+    openConversationPopout.mockClear();
+
+    render(
+      <App>
+        <LayoutSwitcher
+          currentMode="tabs"
+          onModeChange={onModeChange}
+        />
+      </App>,
+    );
+
+    fireEvent.click(screen.getByTestId('layout-independent-window'));
+    expect(onModeChange).not.toHaveBeenCalled();
+    expect(openConversationPopout).toHaveBeenCalledWith('conv-1');
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('layout-independent-window')).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('shows loading on the independent window icon until the window is created', async () => {
+    let resolveOpen: () => void = () => {};
+    openConversationPopout.mockImplementation(() => new Promise<void>((resolve) => {
+      resolveOpen = resolve;
+    }));
+
+    render(
+      <App>
+        <LayoutSwitcher
+          currentMode="tabs"
+          onModeChange={vi.fn()}
+        />
+      </App>,
+    );
+
+    const button = screen.getByTestId('layout-independent-window');
+    fireEvent.click(button);
+
+    expect(button).toHaveAttribute('aria-busy', 'true');
+    expect(button).toHaveAttribute('aria-label', 'chat.multiModel.independentWindowOpening');
+    expect(button).toBeDisabled();
+
+    await act(async () => {
+      resolveOpen();
+    });
+
+    expect(button).toHaveAttribute('aria-busy', 'false');
+    expect(button).not.toBeDisabled();
   });
 
   it('does not fall back to the error boundary when deleting down to one model', () => {
@@ -125,6 +259,27 @@ describe('MultiModelDisplay', () => {
 
     expect(screen.queryByText('Multi-model display error')).not.toBeInTheDocument();
     expect(screen.getByText('alpha')).toBeInTheDocument();
+  });
+
+  it('keeps every authoritative version visible when the live store only contains the active version', () => {
+    const modelA = makeMessage({
+      id: 'assistant-a',
+      model_id: 'model-a',
+      content: 'authoritative alpha',
+    });
+    const modelB = makeMessage({
+      id: 'assistant-b',
+      model_id: 'model-b',
+      content: 'authoritative beta',
+      is_active: false,
+      version_index: 1,
+    });
+    useConversationStore.setState({ messages: [modelA] });
+
+    render(renderDisplay([modelA, modelB]));
+
+    expect(screen.getByText('authoritative alpha')).toBeInTheDocument();
+    expect(screen.getByText('authoritative beta')).toBeInTheDocument();
   });
 
   it('updates an inactive streaming card from the store without rerendering the parent bubble item', () => {
@@ -143,6 +298,36 @@ describe('MultiModelDisplay', () => {
     });
 
     expect(screen.getByText('streamed token')).toBeInTheDocument();
+  });
+
+  it('subscribes once per streaming card in side-by-side and stacked layouts', () => {
+    const modelA = makeMessage({ id: 'assistant-a', model_id: 'model-a', content: 'alpha', status: 'partial' });
+    const modelB = makeMessage({
+      id: 'assistant-b',
+      model_id: 'model-b',
+      content: '',
+      is_active: false,
+      status: 'partial',
+      version_index: 1,
+    });
+    useConversationStore.setState({
+      messages: [modelA, modelB],
+      streaming: true,
+      streamingConversationId: 'conv-1',
+      streamingMessageId: null,
+    });
+
+    for (const mode of ['side-by-side', 'stacked'] as const) {
+      const spy = vi.spyOn(stores, 'subscribeLiveStreamContent');
+      const view = render(renderDisplay([modelA, modelB], modelA.id, mode));
+      const subscribed = spy.mock.calls
+        .map(([messageId]) => messageId)
+        .filter((messageId) => messageId === 'assistant-a' || messageId === 'assistant-b');
+      expect(subscribed.filter((messageId) => messageId === 'assistant-a')).toHaveLength(1);
+      expect(subscribed.filter((messageId) => messageId === 'assistant-b')).toHaveLength(1);
+      spy.mockRestore();
+      view.unmount();
+    }
   });
 
   it('updates an inactive streaming card from live stream content without replacing store messages', () => {
@@ -288,17 +473,107 @@ describe('MultiModelDisplay', () => {
     expect(screen.getByTestId('multi-model-regenerate-assistant-b').closest('.multi-model-card-footer-actions')).not.toBeNull();
   });
 
-  it('uses localized context tooltip keys', () => {
+  it('places save-memory after each branch action and passes that card cleaned content', () => {
+    const modelA = makeMessage({
+      id: 'assistant-a',
+      model_id: 'model-a',
+      content: '<think>private</think>\nalpha **answer**',
+    });
+    const modelB = makeMessage({
+      id: 'assistant-b',
+      model_id: 'model-b',
+      content: 'beta answer',
+      is_active: false,
+      version_index: 1,
+    });
+
+    render(renderDisplay([modelA, modelB], modelA.id, 'side-by-side', {
+      onBranchVersion: vi.fn(),
+    }));
+
+    for (const [message, expected] of [[modelA, 'alpha **answer**'], [modelB, 'beta answer']] as const) {
+      const branch = screen.getByTestId(`multi-model-branch-${message.id}`);
+      const save = screen.getByTestId(`multi-model-save-memory-${message.id}`);
+      const deleteButton = screen.getByTestId(`multi-model-delete-${message.id}`);
+      const wrapper = save.closest('[data-memory-content]');
+
+      expect(branch.compareDocumentPosition(save) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+      expect(save.compareDocumentPosition(deleteButton) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+      expect(wrapper).toHaveAttribute('data-memory-content', expected);
+      expect(wrapper).toHaveAttribute('data-memory-disabled', 'false');
+    }
+  });
+
+  it('disables save-memory while a card is partial', () => {
+    const modelA = makeMessage({ id: 'assistant-a', model_id: 'model-a', content: 'alpha' });
+    const modelB = makeMessage({
+      id: 'assistant-b',
+      model_id: 'model-b',
+      content: 'partial beta',
+      is_active: false,
+      status: 'partial',
+      version_index: 1,
+    });
+
+    render(renderDisplay([modelA, modelB], modelA.id, 'side-by-side', {
+      onBranchVersion: vi.fn(),
+    }));
+
+    const save = screen.getByTestId('multi-model-save-memory-assistant-b');
+    expect(save).toBeDisabled();
+    expect(save.closest('[data-memory-disabled]')).toHaveAttribute('data-memory-disabled', 'true');
+  });
+
+  it('uses localized shared and fallback context tooltip keys', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/components/chat/MultiModelDisplay.tsx'), 'utf8');
     const zh = JSON.parse(readFileSync(resolve(process.cwd(), 'src/i18n/locales/zh-CN.json'), 'utf8'));
     const en = JSON.parse(readFileSync(resolve(process.cwd(), 'src/i18n/locales/en-US.json'), 'utf8'));
 
-    expect(source).toContain("t('chat.multiModelCurrentContext')");
-    expect(source).toContain("t('chat.multiModelUseAsContext')");
-    expect(source).not.toContain('Current context');
-    expect(source).not.toContain('Use as context');
-    expect(zh.chat.multiModelCurrentContext).toBe('当前上下文');
-    expect(en.chat.multiModelCurrentContext).toBe('Current Context');
+    expect(source).toContain('chat.multiModel.currentSharedContext');
+    expect(source).toContain('chat.multiModel.useAsSharedContext');
+    expect(source).toContain('chat.multiModel.currentFallbackContext');
+    expect(source).toContain('chat.multiModel.useAsFallbackContext');
+    expect(zh.chat.multiModel.currentFallbackContext).toBeTruthy();
+    expect(en.chat.multiModel.currentFallbackContext).toBeTruthy();
+  });
+
+  it('describes card selection as fallback context in per-model mode', async () => {
+    useConversationStore.setState({ multiModelContinuationMode: 'per_model' });
+    const modelA = makeMessage({ id: 'assistant-a', model_id: 'model-a', content: 'alpha' });
+    const modelB = makeMessage({
+      id: 'assistant-b',
+      model_id: 'model-b',
+      content: 'beta',
+      is_active: false,
+      version_index: 1,
+    });
+
+    render(renderDisplay([modelA, modelB], modelA.id));
+    fireEvent.mouseEnter(screen.getByTestId('multi-model-set-context-assistant-b'));
+
+    expect(await screen.findByText('chat.multiModel.useAsFallbackContext')).toBeInTheDocument();
+  });
+
+  it('keeps identical model ids from different providers in separate cards', () => {
+    const providerA = makeMessage({
+      id: 'assistant-a',
+      provider_id: 'provider-a',
+      model_id: 'shared-model',
+      content: 'provider A answer',
+    });
+    const providerB = makeMessage({
+      id: 'assistant-b',
+      provider_id: 'provider-b',
+      model_id: 'shared-model',
+      content: 'provider B answer',
+      is_active: false,
+      version_index: 1,
+    });
+
+    render(renderDisplay([providerA, providerB], providerA.id));
+
+    expect(screen.getByText('provider A answer')).toBeInTheDocument();
+    expect(screen.getByText('provider B answer')).toBeInTheDocument();
   });
 
   it('stretches card content so footer actions stay pinned to the bottom', () => {
@@ -329,6 +604,70 @@ describe('MultiModelDisplay', () => {
     expect(shortContent.getAttribute('style')).toContain('flex: 1');
     expect(shortContent).toHaveStyle({ minHeight: '0' });
     expect(screen.getByTestId('multi-model-regenerate-assistant-b').closest('.multi-model-card-footer-actions')).not.toBeNull();
+  });
+
+  it('keeps side-by-side cards at a two-column width instead of 1/n of the window', () => {
+    const versions = ['a', 'b', 'c'].map((id, index) => makeMessage({
+      id: `assistant-${id}`,
+      model_id: `model-${id}`,
+      content: id,
+      is_active: index === 0,
+      version_index: index,
+    }));
+
+    render(renderDisplay(versions));
+
+    const card = screen.getByTestId('multi-model-card-assistant-a');
+    expect(card).toHaveClass('aqbot-multi-model-card');
+    expect(card.style.width).toBe('');
+    expect(card).toHaveStyle({ flex: '0 0 auto', minWidth: '420px' });
+    expect(card.closest('.aqbot-multi-model-track')).not.toBeNull();
+  });
+
+  it('lets fit mode share the workspace instead of keeping a two-column width', () => {
+    useMultiModelColumnLayoutStore.setState({
+      layout: {
+        ...emptyMultiModelColumnLayout(),
+        mainWidthMode: 'fit',
+      },
+      loaded: true,
+      error: null,
+    });
+    const versions = ['a', 'b', 'c'].map((id, index) => makeMessage({
+      id: `assistant-${id}`,
+      model_id: `model-${id}`,
+      content: id,
+      is_active: index === 0,
+      version_index: index,
+    }));
+
+    render(renderDisplay(versions));
+
+    const card = screen.getByTestId('multi-model-card-assistant-a');
+    expect(card).toHaveClass('aqbot-multi-model-card-fit');
+    expect(card).toHaveStyle({ flex: '1 1 0', minWidth: '0px', width: 'auto' });
+    expect(card.closest('.aqbot-multi-model-track')).toBeNull();
+  });
+
+  it('focuses the current answer card without changing the shared context', () => {
+    const onFocusVersion = vi.fn();
+    const onSetContextVersion = vi.fn();
+    const versions = ['a', 'b'].map((id, index) => makeMessage({
+      id: `assistant-${id}`,
+      model_id: `model-${id}`,
+      content: id,
+      is_active: index === 0,
+      version_index: index,
+    }));
+
+    render(renderDisplay(versions, versions[0]!.id, 'side-by-side', {
+      onFocusVersion,
+      onSetContextVersion,
+    }));
+
+    fireEvent.click(screen.getAllByLabelText('chat.multiModel.focusAnswer')[0]!);
+    expect(onFocusVersion).toHaveBeenCalledWith(expect.objectContaining({ id: 'assistant-a' }));
+    expect(onSetContextVersion).not.toHaveBeenCalled();
   });
 
   it('switches the displayed same-model version locally without setting context', () => {

@@ -5,6 +5,14 @@ use tauri::{LogicalPosition, LogicalSize, Manager, Position, Size, WebviewWindow
 const MAIN_WINDOW_LABEL: &str = "main";
 
 pub fn configure_main_window(app: &tauri::AppHandle, main_window: &WebviewWindow) {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = crate::linux_webkit::enable_input_method_preedit(main_window) {
+        tracing::warn!(
+            error = %error,
+            "Failed to enable WebKitGTK input method preedit"
+        );
+    }
+
     // On Windows, hide native decorations so the custom TitleBar is
     // the only title bar. macOS keeps its Overlay style (traffic lights).
     // After removing decorations, re-enable minimize/maximize capabilities
@@ -15,6 +23,8 @@ pub fn configure_main_window(app: &tauri::AppHandle, main_window: &WebviewWindow
         let _ = main_window.set_minimizable(true);
         let _ = main_window.set_maximizable(true);
     }
+
+    crate::app_icon::apply_snapshot_to_window(app, main_window);
 
     let state = app.state::<AppState>();
     if let Some(saved_state) = window_state::load_window_state(&state.app_data_dir) {
@@ -80,10 +90,16 @@ pub fn release_main_window_to_tray(window: &tauri::Window) -> Result<(), String>
             mark_main_window_released(&app, false);
             return Err(err.to_string());
         }
-        Ok(())
+        set_app_dock_visibility(&app, false);
     } else {
-        window.hide().map_err(|err| err.to_string())
+        // Hide from taskbar before hide so Windows doesn't keep a ghost button.
+        set_skip_taskbar(window, true);
+        window.hide().map_err(|err| err.to_string())?;
+        set_app_dock_visibility(&app, false);
     }
+    app.state::<crate::startup_diagnostics::StartupPhase>()
+        .cancel_presentation();
+    Ok(())
 }
 
 pub fn release_webview_window_to_tray(window: &WebviewWindow) -> Result<(), String> {
@@ -94,15 +110,20 @@ pub fn release_webview_window_to_tray(window: &WebviewWindow) -> Result<(), Stri
             mark_main_window_released(&app, false);
             return Err(err.to_string());
         }
-        Ok(())
+        set_app_dock_visibility(&app, false);
     } else {
-        window.hide().map_err(|err| err.to_string())
+        set_skip_taskbar(window, true);
+        window.hide().map_err(|err| err.to_string())?;
+        set_app_dock_visibility(&app, false);
     }
+    app.state::<crate::startup_diagnostics::StartupPhase>()
+        .cancel_presentation();
+    Ok(())
 }
 
 pub fn minimize_main_window(window: tauri::Window) -> Result<(), String> {
     let app = window.app_handle();
-    if should_release_webview(&app) {
+    if window.label() == MAIN_WINDOW_LABEL && should_release_webview(&app) {
         release_main_window_to_tray(&window)
     } else {
         window.minimize().map_err(|err| err.to_string())
@@ -110,11 +131,15 @@ pub fn minimize_main_window(window: tauri::Window) -> Result<(), String> {
 }
 
 pub fn restore_main_window(app: &tauri::AppHandle) {
+    // Restore Dock presence before showing so the window is findable again.
+    set_app_dock_visibility(app, true);
+
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let state = app.state::<AppState>();
         state
             .main_window_released_to_tray
             .store(false, Ordering::Relaxed);
+        set_skip_taskbar(&window, false);
         let _ = window.show();
         let _ = window.set_focus();
         return;
@@ -138,6 +163,75 @@ pub fn restore_main_window(app: &tauri::AppHandle) {
         }
         state.main_window_restoring.store(false, Ordering::Relaxed);
     });
+}
+
+/// Hide or show the app in the macOS Dock when tray-hiding.
+///
+/// On macOS, a hidden window still keeps a Dock icon under the default
+/// `Regular` activation policy. Switching to `Accessory` removes the Dock
+/// icon while the process keeps running via the system tray.
+pub(crate) fn set_app_dock_visibility(app: &tauri::AppHandle, visible: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if visible {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        };
+        if let Err(err) = app.set_activation_policy(policy) {
+            tracing::warn!(
+                visible,
+                error = %err,
+                "Failed to update macOS activation policy for tray lifecycle"
+            );
+        }
+        if visible {
+            crate::app_icon::reconfirm_after_dock_visible(app);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, visible);
+    }
+}
+
+fn set_skip_taskbar(window: &impl SetSkipTaskbar, skip: bool) {
+    window.apply_skip_taskbar(skip);
+}
+
+/// Thin wrapper so both `Window` and `WebviewWindow` can update taskbar visibility.
+trait SetSkipTaskbar {
+    fn apply_skip_taskbar(&self, skip: bool);
+}
+
+impl SetSkipTaskbar for tauri::Window {
+    fn apply_skip_taskbar(&self, skip: bool) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Err(err) = self.set_skip_taskbar(skip) {
+            tracing::warn!(
+                skip,
+                error = %err,
+                "Failed to update taskbar visibility for tray lifecycle"
+            );
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let _ = skip;
+    }
+}
+
+impl SetSkipTaskbar for WebviewWindow {
+    fn apply_skip_taskbar(&self, skip: bool) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Err(err) = self.set_skip_taskbar(skip) {
+            tracing::warn!(
+                skip,
+                error = %err,
+                "Failed to update taskbar visibility for tray lifecycle"
+            );
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let _ = skip;
+    }
 }
 
 fn restore_main_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
@@ -169,14 +263,35 @@ fn create_main_window_from_config(app: &tauri::AppHandle) -> Result<WebviewWindo
     Ok(window)
 }
 
+pub(crate) fn effective_close_to_tray(
+    tray_enabled: bool,
+    tray_available: bool,
+    minimize_to_tray: bool,
+) -> bool {
+    tray_enabled && tray_available && minimize_to_tray
+}
+
+pub(crate) fn effective_release_webview(
+    tray_enabled: bool,
+    tray_available: bool,
+    minimize_to_tray: bool,
+    release_webview_on_tray: bool,
+) -> bool {
+    effective_close_to_tray(tray_enabled, tray_available, minimize_to_tray)
+        && release_webview_on_tray
+}
+
 fn should_release_webview(app: &tauri::AppHandle) -> bool {
     let state = app.state::<AppState>();
-    should_release_webview_for_settings(
+    effective_release_webview(
+        state.tray_enabled.load(Ordering::Relaxed),
+        state.tray_available.load(Ordering::Relaxed),
         state.close_to_tray.load(Ordering::Relaxed),
         state.release_webview_on_tray.load(Ordering::Relaxed),
     )
 }
 
+#[cfg(test)]
 pub(crate) fn should_release_webview_for_settings(
     close_to_tray: bool,
     release_webview_on_tray: bool,
@@ -201,5 +316,16 @@ mod tests {
         assert!(!should_release_webview_for_settings(true, false));
         assert!(!should_release_webview_for_settings(false, true));
         assert!(!should_release_webview_for_settings(false, false));
+    }
+
+    #[test]
+    fn close_to_tray_requires_enabled_and_available_tray() {
+        assert!(super::effective_close_to_tray(true, true, true));
+        assert!(!super::effective_close_to_tray(false, true, true));
+        assert!(!super::effective_close_to_tray(true, false, true));
+        assert!(!super::effective_close_to_tray(true, true, false));
+        assert!(!super::effective_release_webview(true, true, true, false));
+        assert!(super::effective_release_webview(true, true, true, true));
+        assert!(!super::effective_release_webview(false, true, true, true));
     }
 }

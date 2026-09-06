@@ -58,8 +58,8 @@ const REFERENCE_IMAGE_MODE_OPTIONS: Array<DrawingParamOption & { value: DrawingR
 ];
 
 const REFERENCE_IMAGE_FORMAT_OPTIONS: Array<DrawingParamOption & { value: DrawingReferenceImageFormat }> = [
-  { labelKey: 'drawing.referenceImageFormat.object', fallbackLabel: '对象数组', value: 'object' },
-  { labelKey: 'drawing.referenceImageFormat.string', fallbackLabel: '字符串数组', value: 'string' },
+  { labelKey: 'drawing.option.referenceImageFormat.object', fallbackLabel: '对象数组', value: 'object' },
+  { labelKey: 'drawing.option.referenceImageFormat.string', fallbackLabel: '字符串数组', value: 'string' },
 ];
 
 export function isGptImageTransparentBackgroundSupported(modelId?: DrawingModelId): boolean {
@@ -70,12 +70,12 @@ export function isGptImageOutputCompressionSupported(
   modelId: DrawingModelId,
   outputFormat: DrawingOutputFormat,
 ): boolean {
-  return modelId !== 'gpt-image-2' && (outputFormat === 'jpeg' || outputFormat === 'webp');
+  return modelId.startsWith('gpt-image-') && (outputFormat === 'jpeg' || outputFormat === 'webp');
 }
 
-export function getGptImageSizeOptions(t: DrawingTranslate): DrawingParamOption[] {
+export function getGptImageSizeOptions(translate: DrawingTranslate): DrawingParamOption[] {
   return GPT_IMAGE_SIZE_OPTIONS.map((size) => ({
-    fallbackLabel: size === 'auto' ? t('drawing.option.auto', 'Auto') : size,
+    fallbackLabel: size === 'auto' ? translate('drawing.option.auto', 'Auto') : size,
     value: size,
   }));
 }
@@ -132,26 +132,18 @@ function normalizeGptImageSettings(settings: DrawingSettings): DrawingSettings {
 
 const basicFields: DrawingParamField[] = [
   {
-    id: 'model',
-    key: 'modelId',
-    type: 'modelSelect',
-    labelKey: 'drawing.model',
-    fallbackLabel: '模型',
-    normalizeOnChange: (value, context) => {
-      const modelId = value as DrawingModelId;
-      const nextProviders = context.getProvidersForModel(modelId);
-      const providerId = nextProviders.some((provider) => provider.id === context.settings.providerId)
-        ? context.settings.providerId
-        : nextProviders[0]?.id ?? '';
-      return { modelId, providerId };
-    },
-  },
-  {
     id: 'provider',
     key: 'providerId',
     type: 'providerSelect',
     labelKey: 'drawing.provider',
     fallbackLabel: 'Provider',
+  },
+  {
+    id: 'model',
+    key: 'modelId',
+    type: 'modelSelect',
+    labelKey: 'drawing.model',
+    fallbackLabel: '模型',
   },
   {
     id: 'size',
@@ -243,7 +235,7 @@ const advancedFields: DrawingParamField[] = [
     labelKey: 'drawing.referenceImageParamName',
     fallbackLabel: '第三方图片参数名',
     placeholder: 'images',
-    hintKey: 'drawing.referenceImageParamName.hint',
+    hintKey: 'drawing.referenceImageParamNameHint',
     fallbackHint: '仅用于第三方兼容接口；官方 OpenAI 会自动使用 images/image[]',
   },
   {

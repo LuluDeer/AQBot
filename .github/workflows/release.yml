@@ -34,6 +34,11 @@ jobs:
           fi
           echo "✅ Version $TAG is consistent"
 
+      - name: Verify submodule commits exist on remotes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/verify-submodule-commits.mjs
+
   # ── Generate release notes via git-cliff ─────────────
   draft-release-notes:
     name: Generate Release Notes
@@ -82,7 +87,7 @@ jobs:
           # macOS
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           # Windows
           - os: windows-latest
@@ -94,6 +99,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,13 +127,19 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      - name: Install x86_64 OpenSSL (macOS Intel cross-compile)
+      - name: Install x86_64 OpenSSL (macOS Intel)
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
-          arch -x86_64 brew install openssl@3
-          echo "OPENSSL_DIR=$(arch -x86_64 brew --prefix openssl@3)" >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$(arch -x86_64 brew --prefix openssl@3)/include" >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$(arch -x86_64 brew --prefix openssl@3)/lib" >> $GITHUB_ENV
+          ARCH=$(uname -m)
+          if [[ "$ARCH" != "x86_64" ]]; then
+            echo "Expected x86_64 runner, got $ARCH"
+            exit 1
+          fi
+          brew install openssl@3
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -178,6 +190,19 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare Tauri bundler tools
+        if: contains(matrix.target, 'windows') || matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: ./.github/actions/prepare-tauri-bundler-tools
+
+      - name: Import macOS release signing identity
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        timeout-minutes: 10
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: bash scripts/macos/import-ci-signing.sh
+
       - name: Build with Tauri
         uses: tauri-apps/tauri-action@v0
         env:
@@ -185,7 +210,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ matrix.os == 'macos-latest' && '-' || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'AQBot ${{ github.ref_name }}'
@@ -194,7 +218,23 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-rc') }}
           tauriScript: pnpm tauri
           args: --target ${{ matrix.target }}
-          includeUpdaterJson: true
+          includeUpdaterJson: false
+
+      - name: Verify macOS release signature
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          APP_PATH="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign --display --verbose=4 "$APP_PATH" 2>&1 | grep -F 'Authority=AQBot Release'
+
+      - name: Clean up macOS signing identity
+        if: always() && contains(matrix.target, 'apple-darwin')
+        shell: bash
+        timeout-minutes: 5
+        continue-on-error: true
+        run: bash scripts/macos/cleanup-ci-signing.sh
 
       - name: Package Windows portable (zip)
         if: contains(matrix.target, 'windows')
@@ -204,6 +244,22 @@ jobs:
           $arch = if ("${{ matrix.target }}" -match "aarch64") { "arm64" } else { "x64" }
           $zipName = "AQBot_${{ github.ref_name }}_windows-${arch}-portable.zip"
           Compress-Archive -Path $exe -DestinationPath $zipName
+
+      - name: Smoke-test Windows x64 portable ZIP
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          ./scripts/windows/smoke-portable.ps1 -ArchivePath "AQBot_${{ github.ref_name }}_windows-x64-portable.zip" -OutputDirectory "$env:RUNNER_TEMP/aqbot-windows-smoke"
+
+      - name: Upload Windows startup diagnostics
+        if: always() && matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-startup-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/aqbot-windows-smoke/*.log
+            ${{ runner.temp }}/aqbot-windows-smoke/result.json
+          if-no-files-found: warn
 
       - name: Upload Windows portable to release
         if: contains(matrix.target, 'windows')
@@ -220,6 +276,7 @@ jobs:
     needs: [check-version, draft-release-notes]
     if: ${{ !contains(github.ref_name, '-test') }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -322,6 +379,9 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
+          CC_x86_64_unknown_linux_gnu: gcc
+          CXX_x86_64_unknown_linux_gnu: g++
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
@@ -346,6 +406,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate updater manifest
+        run: node scripts/generate-updater-manifest.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish draft release
         uses: softprops/action-gh-release@v2
         with:

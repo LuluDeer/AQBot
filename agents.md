@@ -92,7 +92,40 @@ with mode `0600` on Unix.
   or application version strings
 - All directory names are **lowercase** with no spaces
 
+## Source File Size and Decomposition (Mandatory)
+
+- This rule applies equally to **frontend, backend, and test code**: every
+  hand-written source file MUST be **3000 lines or fewer**. A file that would
+  exceed 3000 lines MUST be split before more code is added; there are no
+  frontend or backend exceptions.
+- Split UI code into focused components and composables/hooks. Extract logic
+  that can be reused into a dedicated module with a small, explicit interface
+  instead of duplicating it across callers.
+- If business logic is intentionally not reusable, split it by cohesive domain
+  responsibility, workflow stage, or feature area, then reference those files
+  through explicit language-native modules, imports, or source includes. Do not
+  split at arbitrary line numbers or hide oversized implementations behind
+  generated indirection.
+- Keep the original entry file as a small facade when callers need a stable
+  interface. Every extracted file is subject to the same 3000-line limit.
+- Before completing a code change, scan the affected repository for source
+  files over 3000 lines and continue decomposing until none remain.
+- Machine-generated dependency locks, generated artifacts, and binary assets
+  are maintained by their generators and MUST NOT be manually split or edited
+  merely to satisfy this source-code limit.
+
 ## UI Conventions
+
+### Internationalization (i18n)
+
+- All user-visible text MUST use i18n, including tooltips, placeholders, empty states, modal content, notifications, context menus, and accessibility labels such as `aria-label` and image `alt` text.
+- Do not add raw Chinese or English UI copy directly in TS/TSX. Technical identifiers, protocol names, brand names, code samples, URLs, file extensions, and units may remain literal when they are intentionally language-neutral.
+- Simplified Chinese (`zh-CN`) and English (`en-US`) are the semantic source locales. Every new key MUST be added to both with equivalent meaning before other locales are updated.
+- Every locale MUST contain the same leaf-key set, non-empty values, and identical interpolation placeholders such as `{{count}}`.
+- A key existing in every locale is not sufficient: non-English locales MUST NOT copy the English value for translatable UI text. Intentional shared values such as `HTTP`, `GitHub`, model IDs, and product names must be explicitly treated as language-neutral.
+- Prefer `t('namespace.key')` after the locale entry exists. Do not use a Chinese or English `defaultValue` to hide a missing locale entry.
+- Dynamic keys MUST be backed by a finite, reviewable key set in every locale; never construct unbounded translation keys from external input.
+- Before completing i18n work, run the locale completeness tests and scan changed UI files for raw visible strings. Verify at least one Chinese locale, English, and one non-Latin locale when sentence fragments are composed around dynamic components.
 
 ### Image Preview & Modal Rules
 

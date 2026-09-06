@@ -1,9 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import {
-  DRAWING_MODELS,
   DRAWING_REFERENCE_IMAGE_MODES,
-  DRAWING_SIZE_OPTIONS,
   normalizeDrawingSettingsByConfig,
 } from '@/lib/drawingModels';
 import type {
@@ -22,8 +20,14 @@ const MAX_BATCH_COUNT = 10;
 const MIN_OUTPUT_COMPRESSION = 0;
 const MAX_OUTPUT_COMPRESSION = 100;
 
-const DRAWING_MODEL_IDS = new Set<DrawingModelId>(DRAWING_MODELS.map((model) => model.id));
-const DRAWING_QUALITIES = new Set<DrawingQuality>(['auto', 'low', 'medium', 'high']);
+const DRAWING_QUALITIES = new Set<DrawingQuality>([
+  'auto',
+  'low',
+  'medium',
+  'high',
+  'standard',
+  'hd',
+]);
 const DRAWING_OUTPUT_FORMATS = new Set<DrawingOutputFormat>(['png', 'jpeg', 'webp']);
 const DRAWING_BACKGROUNDS = new Set<DrawingBackground>(['auto', 'opaque', 'transparent']);
 const DRAWING_REFERENCE_MODES = new Set<DrawingReferenceImageMode>(DRAWING_REFERENCE_IMAGE_MODES);
@@ -43,6 +47,8 @@ export const DEFAULT_DRAWING_SETTINGS: DrawingSettings = {
   n: 1,
   generationApiPath: '/images/generations',
   editApiPath: '/images/edits',
+  parameters: {},
+  parametersByTarget: {},
 };
 
 interface DrawingSettingsState {
@@ -53,7 +59,7 @@ interface DrawingSettingsState {
 }
 
 function isDrawingModelId(value: unknown): value is DrawingModelId {
-  return typeof value === 'string' && DRAWING_MODEL_IDS.has(value as DrawingModelId);
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isDrawingQuality(value: unknown): value is DrawingQuality {
@@ -103,8 +109,8 @@ export function normalizeDrawingSettings(settings: Partial<DrawingSettings> = {}
       ? settings.providerId
       : DEFAULT_DRAWING_SETTINGS.providerId,
     modelId,
-    size: typeof settings.size === 'string' && DRAWING_SIZE_OPTIONS.includes(settings.size)
-      ? settings.size
+    size: typeof settings.size === 'string' && settings.size.trim()
+      ? settings.size.trim()
       : DEFAULT_DRAWING_SETTINGS.size,
     quality: isDrawingQuality(settings.quality)
       ? settings.quality
@@ -130,6 +136,13 @@ export function normalizeDrawingSettings(settings: Partial<DrawingSettings> = {}
     editApiPath: typeof settings.editApiPath === 'string'
       ? settings.editApiPath
       : DEFAULT_DRAWING_SETTINGS.editApiPath,
+    parameters: settings.parameters && typeof settings.parameters === 'object'
+      ? settings.parameters
+      : DEFAULT_DRAWING_SETTINGS.parameters,
+    parametersByTarget: settings.parametersByTarget
+      && typeof settings.parametersByTarget === 'object'
+      ? settings.parametersByTarget
+      : DEFAULT_DRAWING_SETTINGS.parametersByTarget,
   });
 }
 

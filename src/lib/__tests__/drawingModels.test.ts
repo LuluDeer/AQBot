@@ -22,6 +22,7 @@ function providerFixture(overrides: Partial<ProviderConfig>): ProviderConfig {
     provider_type: 'openai',
     api_host: 'https://api.openai.com',
     api_path: null,
+    aws_region: null,
     enabled: true,
     models: [],
     keys: [],
@@ -62,7 +63,6 @@ function renderContext(settings: DrawingSettings): DrawingParamRenderContext {
     modelOptions: [],
     providerOptions: [],
     t: (_key, fallback) => fallback,
-    getProvidersForModel: () => [],
   };
 }
 
@@ -89,7 +89,7 @@ describe('drawing model/provider filtering', () => {
             group_name: 'gpt-image',
             model_type: 'Image',
             capabilities: [],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -106,7 +106,7 @@ describe('drawing model/provider filtering', () => {
             group_name: 'gpt-image',
             model_type: 'Chat',
             capabilities: ['TextChat'],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -124,7 +124,7 @@ describe('drawing model/provider filtering', () => {
             group_name: 'gpt-image',
             model_type: 'Image',
             capabilities: [],
-            max_tokens: null,
+            context_window: null,
             enabled: true,
             param_overrides: null,
           },
@@ -139,6 +139,82 @@ describe('drawing model/provider filtering', () => {
       'gpt-image-1-mini',
     ]);
     expect(getDrawingProvidersForModel(providers, 'gpt-image-2').map((item) => item.id)).toEqual(['openai-1']);
+  });
+
+  it('exposes an enabled custom Image model for issue 125', () => {
+    const providers: ProviderConfig[] = [
+      providerFixture({
+        id: 'custom-xai',
+        name: 'Custom xAI',
+        provider_type: 'custom',
+        models: [
+          {
+            provider_id: 'custom-xai',
+            model_id: 'grok-imagine-image',
+            name: 'grok-imagine-image',
+            group_name: 'grok-imagine',
+            model_type: 'Image',
+            capabilities: [],
+            context_window: null,
+            enabled: true,
+            param_overrides: null,
+          },
+        ],
+      }),
+    ];
+
+    expect(getDrawingModelOptions(providers).map((item) => item.value)).toContain('grok-imagine-image');
+    expect(
+      getDrawingProvidersForModel(providers, 'grok-imagine-image' as never).map((item) => item.id),
+    ).toEqual(['custom-xai']);
+  });
+
+  it('includes openai_responses providers that expose an enabled Image model', () => {
+    const providers: ProviderConfig[] = [
+      providerFixture({
+        id: 'responses-1',
+        name: 'OpenAI Responses',
+        provider_type: 'openai_responses',
+        models: [
+          {
+            provider_id: 'responses-1',
+            model_id: 'gemini-3.1-flash-image',
+            name: 'Gemini 3.1 Flash Image',
+            group_name: 'gemini',
+            model_type: 'Image',
+            capabilities: [],
+            context_window: null,
+            enabled: true,
+            param_overrides: null,
+          },
+        ],
+      }),
+    ];
+
+    expect(getDrawingModelOptions(providers).map((item) => item.value)).toContain(
+      'gemini-3.1-flash-image',
+    );
+    expect(
+      getDrawingProvidersForModel(providers, 'gemini-3.1-flash-image').map((item) => item.id),
+    ).toEqual(['responses-1']);
+  });
+
+  it('does not rewrite the current provider when the model field changes', () => {
+    const config = getDrawingParamConfig('gpt-image-2');
+    const modelField = config.groups
+      .find((group) => group.id === 'basic')
+      ?.fields.find((field) => field.id === 'model');
+    const settings = settingsFixture({
+      providerId: 'responses-1',
+      modelId: 'gemini-3.1-flash-image',
+    });
+    const context = renderContext(settings);
+    const next = modelField?.normalizeOnChange
+      ? modelField.normalizeOnChange('gpt-image-2', context)
+      : { modelId: 'gpt-image-2' };
+
+    expect(next).toEqual({ modelId: 'gpt-image-2' });
+    expect(next.providerId).toBeUndefined();
   });
 
   it('returns localized drawing parameter options', () => {
@@ -191,8 +267,8 @@ describe('drawing model/provider filtering', () => {
 
     expect(config.id).toBe('gpt-image');
     expect(basic?.fields.map((field) => field.id)).toEqual([
-      'model',
       'provider',
+      'model',
       'size',
       'quality',
       'outputFormat',

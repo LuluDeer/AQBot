@@ -1,11 +1,12 @@
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait};
 use sea_orm::*;
 use std::collections::{HashMap, HashSet};
 
 use crate::entity::{conversation_summaries, conversations, messages};
 use crate::error::{AQBotError, Result};
 use crate::types::{
-    Attachment, ConversationStats, Message, MessagePage, MessageRole, MessageSummary, MessageWindow,
+    Attachment, ConversationStats, Message, MessagePage, MessageRole, MessageSummary,
+    MessageWindow, MultiModelContinuationMode,
 };
 use crate::utils::{gen_id, now_ts};
 
@@ -41,7 +42,31 @@ fn stringify_attachment_list(attachments: &[Attachment]) -> Result<String> {
 const STALE_PARTIAL_ASSISTANT_ERROR: &str = "AQBot was closed while this response was running. This stale response has been marked as failed.";
 const COMPRESSION_MARKER: &str = "<!-- context-compressed -->";
 
-fn message_from_entity(m: messages::Model) -> Result<Message> {
+// Message timestamps are second-precision and IDs are random UUIDs. SQLite's
+// insertion rowid preserves the causal order for messages created in one second.
+#[derive(Debug, FromQueryResult)]
+struct MessageOrderCursor {
+    conversation_id: String,
+    is_active: i32,
+    created_at: i64,
+    row_id: i64,
+}
+
+async fn get_message_order_cursor(
+    db: &DatabaseConnection,
+    message_id: &str,
+) -> Result<MessageOrderCursor> {
+    MessageOrderCursor::find_by_statement(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "SELECT conversation_id, is_active, created_at, rowid AS row_id FROM messages WHERE id = ?",
+        vec![message_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| AQBotError::NotFound(format!("Message {message_id}")))
+}
+
+pub(crate) fn message_from_entity(m: messages::Model) -> Result<Message> {
     Ok(Message {
         id: m.id,
         conversation_id: m.conversation_id,
@@ -66,11 +91,20 @@ fn message_from_entity(m: messages::Model) -> Result<Message> {
     })
 }
 
+pub async fn get_message(db: &DatabaseConnection, id: &str) -> Result<Message> {
+    let row = messages::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AQBotError::NotFound(format!("Message {id}")))?;
+    message_from_entity(row)
+}
+
 pub async fn list_messages(db: &DatabaseConnection, conversation_id: &str) -> Result<Vec<Message>> {
     let rows = messages::Entity::find()
         .filter(messages::Column::ConversationId.eq(conversation_id))
         .filter(messages::Column::IsActive.eq(1))
         .order_by_asc(messages::Column::CreatedAt)
+        .order_by(Expr::cust("rowid"), Order::Asc)
         .all(db)
         .await?;
 
@@ -93,11 +127,234 @@ pub async fn list_messages_for_model_context(
                 ),
         )
         .order_by_asc(messages::Column::CreatedAt)
-        .order_by_asc(messages::Column::Id)
+        .order_by(Expr::cust("rowid"), Order::Asc)
         .all(db)
         .await?;
 
     rows.into_iter().map(message_from_entity).collect()
+}
+
+pub async fn list_messages_for_model_context_candidates(
+    db: &DatabaseConnection,
+    conversation_id: &str,
+) -> Result<Vec<Message>> {
+    let rows = messages::Entity::find()
+        .filter(messages::Column::ConversationId.eq(conversation_id))
+        .filter(
+            Condition::any()
+                .add(
+                    Condition::all()
+                        .add(messages::Column::IsActive.eq(1))
+                        .add(messages::Column::Role.is_in(["user", "system"])),
+                )
+                .add(
+                    Condition::all()
+                        .add(messages::Column::Role.eq("assistant"))
+                        .add(messages::Column::VersionIndex.gte(0)),
+                )
+                .add(
+                    Condition::all()
+                        .add(messages::Column::VersionIndex.eq(-1))
+                        .add(messages::Column::Role.is_in(["assistant", "tool"])),
+                ),
+        )
+        .order_by_asc(messages::Column::CreatedAt)
+        .order_by(Expr::cust("rowid"), Order::Asc)
+        .all(db)
+        .await?;
+
+    rows.into_iter().map(message_from_entity).collect()
+}
+
+fn continuation_version_priority(left: &Message, right: &Message) -> std::cmp::Ordering {
+    left.version_index
+        .cmp(&right.version_index)
+        .then_with(|| left.created_at.cmp(&right.created_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn latest_matching_index<F>(messages: &[Message], indices: &[usize], predicate: F) -> Option<usize>
+where
+    F: Fn(&Message) -> bool,
+{
+    indices
+        .iter()
+        .copied()
+        .filter(|index| predicate(&messages[*index]))
+        .max_by(|left, right| continuation_version_priority(&messages[*left], &messages[*right]))
+}
+
+fn select_per_model_version(
+    messages: &[Message],
+    indices: &[usize],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<usize> {
+    let exact_non_error = |message: &Message| {
+        message.provider_id.as_deref() == Some(provider_id)
+            && message.model_id.as_deref() == Some(model_id)
+            && message.status != "error"
+    };
+
+    latest_matching_index(messages, indices, |message| {
+        exact_non_error(message) && message.is_active
+    })
+    .or_else(|| {
+        latest_matching_index(messages, indices, |message| {
+            exact_non_error(message) && message.status == "complete"
+        })
+    })
+    .or_else(|| {
+        latest_matching_index(messages, indices, |message| {
+            exact_non_error(message) && message.status == "partial"
+        })
+    })
+    .or_else(|| {
+        latest_matching_index(messages, indices, |message| {
+            message.is_active && message.status != "error"
+        })
+    })
+}
+
+fn extract_continuation_tool_call_ids(content: &str) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find(":::mcp ") {
+        let after_marker = &remaining[start + ":::mcp ".len()..];
+        let line_end = after_marker.find('\n').unwrap_or(after_marker.len());
+        if let Ok(value) =
+            serde_json::from_str::<serde_json::Value>(after_marker[..line_end].trim())
+        {
+            if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                if !id.trim().is_empty() {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+        remaining = &after_marker[line_end..];
+    }
+
+    ids
+}
+
+fn scaffold_tool_call_ids(message: &Message) -> Option<HashSet<String>> {
+    let calls =
+        serde_json::from_str::<Vec<serde_json::Value>>(message.tool_calls_json.as_deref()?).ok()?;
+    let ids = calls
+        .iter()
+        .filter_map(|call| call.get("id").and_then(serde_json::Value::as_str))
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    (!ids.is_empty() && ids.len() == calls.len()).then_some(ids)
+}
+
+fn allowed_tool_scaffold_ids(
+    messages: &[Message],
+    selected_indices: &HashSet<usize>,
+) -> HashSet<String> {
+    let mut allowed = HashSet::new();
+    for selected_index in selected_indices {
+        let selected = &messages[*selected_index];
+        let (Some(provider_id), Some(model_id), Some(parent_id)) = (
+            selected.provider_id.as_deref(),
+            selected.model_id.as_deref(),
+            selected.parent_message_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let display_ids = extract_continuation_tool_call_ids(&selected.content);
+        if display_ids.is_empty() {
+            continue;
+        }
+
+        for scaffold in messages.iter().filter(|message| {
+            message.role == MessageRole::Assistant
+                && message.version_index == -1
+                && message.parent_message_id.as_deref() == Some(parent_id)
+                && message.provider_id.as_deref() == Some(provider_id)
+                && message.model_id.as_deref() == Some(model_id)
+        }) {
+            if scaffold_tool_call_ids(scaffold).is_some_and(|ids| ids.is_subset(&display_ids)) {
+                allowed.insert(scaffold.id.clone());
+            }
+        }
+    }
+    allowed
+}
+
+pub fn project_messages_for_model_continuation(
+    mut messages: Vec<Message>,
+    provider_id: &str,
+    model_id: &str,
+) -> Vec<Message> {
+    let mut versions_by_parent: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != MessageRole::Assistant || message.version_index < 0 {
+            continue;
+        }
+        if let Some(parent_id) = message.parent_message_id.as_ref() {
+            versions_by_parent
+                .entry(parent_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let selected_indices = versions_by_parent
+        .values()
+        .filter_map(|indices| select_per_model_version(&messages, indices, provider_id, model_id))
+        .collect::<HashSet<_>>();
+    let allowed_scaffold_ids = allowed_tool_scaffold_ids(&messages, &selected_indices);
+
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role == MessageRole::Assistant
+            && message.version_index >= 0
+            && message.parent_message_id.is_some()
+        {
+            message.is_active = selected_indices.contains(&index);
+        }
+    }
+
+    messages.retain(|message| {
+        if message.version_index != -1 {
+            return true;
+        }
+        match message.role {
+            MessageRole::Assistant => allowed_scaffold_ids.contains(&message.id),
+            MessageRole::Tool => message
+                .parent_message_id
+                .as_ref()
+                .is_some_and(|id| allowed_scaffold_ids.contains(id)),
+            _ => true,
+        }
+    });
+
+    messages
+}
+
+pub async fn list_messages_for_continuation(
+    db: &DatabaseConnection,
+    conversation_id: &str,
+    mode: MultiModelContinuationMode,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<Vec<Message>> {
+    match mode {
+        MultiModelContinuationMode::Selected => {
+            list_messages_for_model_context(db, conversation_id).await
+        }
+        MultiModelContinuationMode::PerModel => {
+            let candidates =
+                list_messages_for_model_context_candidates(db, conversation_id).await?;
+            Ok(project_messages_for_model_continuation(
+                candidates,
+                provider_id,
+                model_id,
+            ))
+        }
+    }
 }
 
 pub async fn mark_stale_partial_assistant_messages_failed(db: &DatabaseConnection) -> Result<u64> {
@@ -144,10 +401,7 @@ pub async fn list_messages_page(
         .filter(messages::Column::IsActive.eq(1));
 
     if let Some(cursor_id) = before_message_id {
-        let cursor = messages::Entity::find_by_id(cursor_id)
-            .one(db)
-            .await?
-            .ok_or_else(|| AQBotError::NotFound(format!("Message {}", cursor_id)))?;
+        let cursor = get_message_order_cursor(db, cursor_id).await?;
 
         query = query.filter(
             Condition::any()
@@ -155,14 +409,14 @@ pub async fn list_messages_page(
                 .add(
                     Condition::all()
                         .add(messages::Column::CreatedAt.eq(cursor.created_at))
-                        .add(messages::Column::Id.lt(cursor.id.clone())),
+                        .add(Expr::cust("rowid").lt(cursor.row_id)),
                 ),
         );
     }
 
     let mut rows = query
         .order_by_desc(messages::Column::CreatedAt)
-        .order_by_desc(messages::Column::Id)
+        .order_by(Expr::cust("rowid"), Order::Desc)
         .limit(limit + 1)
         .all(db)
         .await?;
@@ -200,12 +454,12 @@ pub async fn list_messages_window(
         .count(db)
         .await?;
 
-    let anchor = messages::Entity::find_by_id(anchor_message_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AQBotError::NotFound(format!("Message {}", anchor_message_id)))?;
+    let anchor = get_message_order_cursor(db, anchor_message_id).await?;
     if anchor.conversation_id != conversation_id || anchor.is_active != 1 {
-        return Err(AQBotError::NotFound(format!("Message {}", anchor_message_id)));
+        return Err(AQBotError::NotFound(format!(
+            "Message {}",
+            anchor_message_id
+        )));
     }
 
     let mut older_rows = messages::Entity::find()
@@ -217,11 +471,11 @@ pub async fn list_messages_window(
                 .add(
                     Condition::all()
                         .add(messages::Column::CreatedAt.eq(anchor.created_at))
-                        .add(messages::Column::Id.lt(anchor.id.clone())),
+                        .add(Expr::cust("rowid").lt(anchor.row_id)),
                 ),
         )
         .order_by_desc(messages::Column::CreatedAt)
-        .order_by_desc(messages::Column::Id)
+        .order_by(Expr::cust("rowid"), Order::Desc)
         .limit(before_limit + 1)
         .all(db)
         .await?;
@@ -240,11 +494,11 @@ pub async fn list_messages_window(
                 .add(
                     Condition::all()
                         .add(messages::Column::CreatedAt.eq(anchor.created_at))
-                        .add(messages::Column::Id.gte(anchor.id.clone())),
+                        .add(Expr::cust("rowid").gte(anchor.row_id)),
                 ),
         )
         .order_by_asc(messages::Column::CreatedAt)
-        .order_by_asc(messages::Column::Id)
+        .order_by(Expr::cust("rowid"), Order::Asc)
         .limit(after_limit + 2)
         .all(db)
         .await?;
@@ -285,12 +539,12 @@ pub async fn list_messages_after(
         .count(db)
         .await?;
 
-    let cursor = messages::Entity::find_by_id(after_message_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| AQBotError::NotFound(format!("Message {}", after_message_id)))?;
+    let cursor = get_message_order_cursor(db, after_message_id).await?;
     if cursor.conversation_id != conversation_id || cursor.is_active != 1 {
-        return Err(AQBotError::NotFound(format!("Message {}", after_message_id)));
+        return Err(AQBotError::NotFound(format!(
+            "Message {}",
+            after_message_id
+        )));
     }
 
     let mut rows = messages::Entity::find()
@@ -302,11 +556,11 @@ pub async fn list_messages_after(
                 .add(
                     Condition::all()
                         .add(messages::Column::CreatedAt.eq(cursor.created_at))
-                        .add(messages::Column::Id.gt(cursor.id.clone())),
+                        .add(Expr::cust("rowid").gt(cursor.row_id)),
                 ),
         )
         .order_by_asc(messages::Column::CreatedAt)
-        .order_by_asc(messages::Column::Id)
+        .order_by(Expr::cust("rowid"), Order::Asc)
         .limit(limit + 1)
         .all(db)
         .await?;
@@ -359,7 +613,7 @@ pub async fn list_message_summaries(
         WHERE conversation_id = ?
           AND is_active = 1
           AND role IN ('user', 'assistant')
-        ORDER BY created_at ASC, id ASC
+        ORDER BY created_at ASC, rowid ASC
     "#;
 
     let rows = SummaryRow::find_by_statement(Statement::from_sql_and_values(
@@ -397,6 +651,7 @@ pub async fn create_message(
     let now = now_ts();
     let role_s = role_str(&role);
     let attachments_json = stringify_attachment_list(attachments)?;
+    let txn = db.begin().await?;
 
     messages::ActiveModel {
         id: Set(id.clone()),
@@ -410,14 +665,16 @@ pub async fn create_message(
         is_active: Set(1),
         ..Default::default()
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
 
     let row = messages::Entity::find_by_id(&id)
-        .one(db)
+        .one(&txn)
         .await?
         .ok_or_else(|| AQBotError::NotFound(format!("Message {}", id)))?;
-    message_from_entity(row)
+    let message = message_from_entity(row)?;
+    txn.commit().await?;
+    Ok(message)
 }
 
 pub async fn update_message_content(
@@ -439,6 +696,22 @@ pub async fn update_message_content(
         .await?
         .ok_or_else(|| AQBotError::NotFound(format!("Message {}", id)))?;
     message_from_entity(row)
+}
+
+pub async fn update_message_status(
+    db: &DatabaseConnection,
+    id: &str,
+    status: &str,
+) -> Result<Message> {
+    let row = messages::Entity::find_by_id(id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AQBotError::NotFound(format!("Message {}", id)))?;
+
+    let mut am: messages::ActiveModel = row.into();
+    am.status = Set(status.to_string());
+    am.update(db).await?;
+    get_message(db, id).await
 }
 
 /// Update token usage stats on an existing message.
@@ -526,6 +799,9 @@ pub async fn delete_message(db: &DatabaseConnection, id: &str) -> Result<()> {
         }
     }
 
+    // Stored files are conversation-owned, not message-owned. Keep their records
+    // here because another message/version can share the same attachment ID;
+    // conversation deletion performs reference-counted physical cleanup.
     let result = messages::Entity::delete_by_id(id).exec(&txn).await?;
     txn.commit().await?;
 
@@ -541,6 +817,8 @@ pub async fn clear_conversation_messages(
     conversation_id: &str,
 ) -> Result<u64> {
     let txn = db.begin().await?;
+    // Retain conversation-owned stored_files until the conversation itself is
+    // deleted. This avoids removing media still referenced by branches/versions.
     let result = messages::Entity::delete_many()
         .filter(messages::Column::ConversationId.eq(conversation_id))
         .exec(&txn)
@@ -739,6 +1017,8 @@ pub async fn list_message_versions(
         .filter(messages::Column::Role.eq("assistant"))
         .filter(messages::Column::VersionIndex.gte(0))
         .order_by_asc(messages::Column::VersionIndex)
+        .order_by_asc(messages::Column::CreatedAt)
+        .order_by_asc(messages::Column::Id)
         .all(db)
         .await?;
 
@@ -785,6 +1065,8 @@ pub async fn list_message_versions_batch(
         .filter(messages::Column::VersionIndex.gte(0))
         .order_by_asc(messages::Column::ParentMessageId)
         .order_by_asc(messages::Column::VersionIndex)
+        .order_by_asc(messages::Column::CreatedAt)
+        .order_by_asc(messages::Column::Id)
         .all(db)
         .await?;
 
@@ -817,6 +1099,37 @@ pub async fn list_message_versions_batch(
     }
 
     Ok(result)
+}
+
+pub async fn max_assistant_version_index(
+    db: &DatabaseConnection,
+    conversation_id: &str,
+    parent_message_id: &str,
+) -> Result<Option<i32>> {
+    let row = messages::Entity::find()
+        .filter(messages::Column::ConversationId.eq(conversation_id))
+        .filter(messages::Column::ParentMessageId.eq(parent_message_id))
+        .filter(messages::Column::Role.eq("assistant"))
+        .filter(messages::Column::VersionIndex.gte(0))
+        .order_by_desc(messages::Column::VersionIndex)
+        .one(db)
+        .await?;
+    Ok(row.map(|message| message.version_index))
+}
+
+pub async fn mark_message_error(
+    db: &DatabaseConnection,
+    message_id: &str,
+    error: &str,
+) -> Result<()> {
+    let Some(row) = messages::Entity::find_by_id(message_id).one(db).await? else {
+        return Ok(());
+    };
+    let mut active: messages::ActiveModel = row.into();
+    active.status = Set("error".to_string());
+    active.content = Set(error.to_string());
+    active.update(db).await?;
+    Ok(())
 }
 
 pub async fn set_active_version(
@@ -1008,14 +1321,153 @@ pub async fn get_conversation_stats(
 mod tests {
     use super::*;
     use crate::db::create_test_pool;
-    use crate::repo::conversation;
     use crate::entity::conversation_summaries;
+    use crate::repo::conversation;
+
+    fn assistant_version(
+        id: &str,
+        parent_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        status: &str,
+        version_index: i32,
+        is_active: bool,
+    ) -> Message {
+        Message {
+            id: id.to_string(),
+            conversation_id: "conversation".to_string(),
+            role: MessageRole::Assistant,
+            content: id.to_string(),
+            provider_id: Some(provider_id.to_string()),
+            model_id: Some(model_id.to_string()),
+            token_count: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            attachments: Vec::new(),
+            thinking: None,
+            created_at: version_index as i64,
+            parent_message_id: Some(parent_id.to_string()),
+            version_index,
+            is_active,
+            tool_calls_json: None,
+            tool_call_id: None,
+            status: status.to_string(),
+            tokens_per_second: None,
+            first_token_latency_ms: None,
+        }
+    }
 
     async fn set_created_at(db: &DatabaseConnection, id: &str, created_at: i64) {
         let row = messages::Entity::find_by_id(id).one(db).await.unwrap().unwrap();
         let mut am: messages::ActiveModel = row.into();
         am.created_at = Set(created_at);
         am.update(db).await.unwrap();
+    }
+
+    async fn insert_equal_timestamp_test_messages(
+        db: &DatabaseConnection,
+        conversation_id: &str,
+    ) {
+        for (id, role, content, parent_message_id, created_at) in [
+            ("z-user-1", "user", "question 1", None, 100),
+            (
+                "a-assistant-1",
+                "assistant",
+                "answer 1",
+                Some("z-user-1"),
+                100,
+            ),
+            ("y-user-2", "user", "question 2", None, 101),
+            (
+                "b-assistant-2",
+                "assistant",
+                "answer 2",
+                Some("y-user-2"),
+                101,
+            ),
+        ] {
+            messages::ActiveModel {
+                id: Set(id.to_string()),
+                conversation_id: Set(conversation_id.to_string()),
+                role: Set(role.to_string()),
+                content: Set(content.to_string()),
+                attachments: Set("[]".to_string()),
+                created_at: Set(created_at),
+                parent_message_id: Set(parent_message_id.map(str::to_string)),
+                version_index: Set(0),
+                is_active: Set(1),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .unwrap();
+        }
+    }
+
+    fn message_contents(messages: &[Message]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn message_reads_preserve_creation_order_for_equal_timestamps() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let conv =
+            conversation::create_conversation(db, "Equal Timestamps", "model-1", "prov-1", None)
+                .await
+                .unwrap();
+
+        insert_equal_timestamp_test_messages(db, &conv.id).await;
+
+        let all_messages = list_messages(db, &conv.id).await.unwrap();
+        let context_messages = list_messages_for_model_context(db, &conv.id).await.unwrap();
+        let latest_page = list_messages_page(db, &conv.id, 2, None).await.unwrap();
+        let older_page =
+            list_messages_page(db, &conv.id, 2, latest_page.oldest_message_id.as_deref())
+                .await
+                .unwrap();
+        let window = list_messages_window(db, &conv.id, "a-assistant-1", 1, 2)
+            .await
+            .unwrap();
+        let newer = list_messages_after(db, &conv.id, "a-assistant-1", 2)
+            .await
+            .unwrap();
+        let summaries = list_message_summaries(db, &conv.id).await.unwrap();
+
+        assert_eq!(
+            message_contents(&all_messages),
+            vec!["question 1", "answer 1", "question 2", "answer 2"]
+        );
+        assert_eq!(
+            message_contents(&context_messages),
+            message_contents(&all_messages)
+        );
+        assert_eq!(
+            message_contents(&latest_page.messages),
+            vec!["question 2", "answer 2"]
+        );
+        assert_eq!(
+            message_contents(&older_page.messages),
+            vec!["question 1", "answer 1"]
+        );
+        assert_eq!(
+            message_contents(&window.messages),
+            message_contents(&all_messages)
+        );
+        assert_eq!(
+            message_contents(&newer.messages),
+            vec!["question 2", "answer 2"]
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|message| message.content_preview.as_str())
+                .collect::<Vec<_>>(),
+            vec!["question 1", "answer 1", "question 2", "answer 2"]
+        );
     }
 
     #[tokio::test]
@@ -1158,6 +1610,276 @@ mod tests {
                 .count(),
             1
         );
+
+        let candidates = list_messages_for_model_context_candidates(db, &conv.id)
+            .await
+            .unwrap();
+        assert!(candidates
+            .iter()
+            .any(|message| message.id == stale_version.id));
+        assert!(candidates.iter().any(|message| message.id == scaffold_id));
+
+        let selected = list_messages_for_continuation(
+            db,
+            &conv.id,
+            MultiModelContinuationMode::Selected,
+            "ignored-provider",
+            "ignored-model",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|message| (&message.id, message.is_active))
+                .collect::<Vec<_>>(),
+            context_messages
+                .iter()
+                .map(|message| (&message.id, message.is_active))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn per_model_continuation_projects_each_turn_to_the_target_model() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let conv =
+            conversation::create_conversation(db, "Multi Model", "model-a", "provider-a", None)
+                .await
+                .unwrap();
+
+        let user = create_message(db, &conv.id, MessageRole::User, "question", &[], None, 0)
+            .await
+            .unwrap();
+        let answer_a = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "answer-a",
+            &[],
+            Some(&user.id),
+            0,
+        )
+        .await
+        .unwrap();
+        let answer_b = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "answer-b",
+            &[],
+            Some(&user.id),
+            1,
+        )
+        .await
+        .unwrap();
+
+        for (message, provider_id, model_id, is_active) in [
+            (&answer_a, "provider-a", "model-a", 1),
+            (&answer_b, "provider-b", "model-b", 0),
+        ] {
+            let row = messages::Entity::find_by_id(&message.id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut am: messages::ActiveModel = row.into();
+            am.provider_id = Set(Some(provider_id.to_string()));
+            am.model_id = Set(Some(model_id.to_string()));
+            am.is_active = Set(is_active);
+            am.update(db).await.unwrap();
+        }
+
+        let projected = list_messages_for_continuation(
+            db,
+            &conv.id,
+            crate::types::MultiModelContinuationMode::PerModel,
+            "provider-b",
+            "model-b",
+        )
+        .await
+        .unwrap();
+
+        assert!(projected
+            .iter()
+            .any(|message| message.id == user.id && message.is_active));
+        assert!(projected
+            .iter()
+            .any(|message| message.id == answer_b.id && message.is_active));
+        assert!(projected
+            .iter()
+            .any(|message| message.id == answer_a.id && !message.is_active));
+    }
+
+    #[test]
+    fn per_model_selection_honors_status_priority_and_provider_identity() {
+        let messages = vec![
+            // Active exact beats a later complete exact version.
+            assistant_version(
+                "turn-1-active",
+                "turn-1",
+                "provider-a",
+                "model",
+                "partial",
+                0,
+                true,
+            ),
+            assistant_version(
+                "turn-1-complete",
+                "turn-1",
+                "provider-a",
+                "model",
+                "complete",
+                1,
+                false,
+            ),
+            // Same model ID from a different provider is not an exact match.
+            assistant_version(
+                "turn-2-other-provider",
+                "turn-2",
+                "provider-b",
+                "model",
+                "complete",
+                2,
+                true,
+            ),
+            assistant_version(
+                "turn-2-exact",
+                "turn-2",
+                "provider-a",
+                "model",
+                "complete",
+                1,
+                false,
+            ),
+            // An exact error is skipped in favor of an exact partial.
+            assistant_version(
+                "turn-3-error",
+                "turn-3",
+                "provider-a",
+                "model",
+                "error",
+                2,
+                true,
+            ),
+            assistant_version(
+                "turn-3-partial",
+                "turn-3",
+                "provider-a",
+                "model",
+                "partial",
+                1,
+                false,
+            ),
+            // With no usable exact version, use a non-error active fallback.
+            assistant_version(
+                "turn-4-error",
+                "turn-4",
+                "provider-a",
+                "model",
+                "error",
+                1,
+                true,
+            ),
+            assistant_version(
+                "turn-4-fallback",
+                "turn-4",
+                "provider-b",
+                "other",
+                "complete",
+                0,
+                true,
+            ),
+            // No usable exact version and only an errored fallback means none.
+            assistant_version(
+                "turn-5-error",
+                "turn-5",
+                "provider-a",
+                "model",
+                "error",
+                1,
+                true,
+            ),
+            assistant_version(
+                "turn-5-fallback-error",
+                "turn-5",
+                "provider-b",
+                "other",
+                "error",
+                0,
+                true,
+            ),
+        ];
+
+        let projected = project_messages_for_model_continuation(messages, "provider-a", "model");
+        let active_ids = projected
+            .iter()
+            .filter(|message| message.is_active)
+            .map(|message| message.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            active_ids,
+            HashSet::from([
+                "turn-1-active",
+                "turn-2-exact",
+                "turn-3-partial",
+                "turn-4-fallback",
+            ])
+        );
+    }
+
+    #[test]
+    fn per_model_projection_drops_unreferenced_tool_scaffolding() {
+        let answer_a = assistant_version(
+            "answer-a",
+            "turn",
+            "provider-a",
+            "model-a",
+            "complete",
+            0,
+            true,
+        );
+        let answer_b = assistant_version(
+            "answer-b",
+            "turn",
+            "provider-b",
+            "model-b",
+            "complete",
+            1,
+            false,
+        );
+        let mut scaffold_a = assistant_version(
+            "scaffold-a",
+            "turn",
+            "provider-a",
+            "model-a",
+            "complete",
+            -1,
+            false,
+        );
+        scaffold_a.tool_calls_json = Some(
+            r#"[{"id":"call-a","type":"function","function":{"name":"read","arguments":"{}"}}]"#
+                .to_string(),
+        );
+        let mut tool_a = scaffold_a.clone();
+        tool_a.id = "tool-a".to_string();
+        tool_a.role = MessageRole::Tool;
+        tool_a.parent_message_id = Some(scaffold_a.id.clone());
+        tool_a.tool_calls_json = None;
+        tool_a.tool_call_id = Some("call-a".to_string());
+
+        let projected = project_messages_for_model_continuation(
+            vec![answer_a, scaffold_a, tool_a, answer_b],
+            "provider-b",
+            "model-b",
+        );
+
+        assert!(projected
+            .iter()
+            .any(|message| message.id == "answer-b" && message.is_active));
+        assert!(projected.iter().all(|message| message.version_index >= 0));
     }
 
     #[tokio::test]
@@ -1294,6 +2016,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_message_versions_orders_by_slot_then_created_at_then_id() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let conv = conversation::create_conversation(db, "Slot Order", "model-1", "prov-1", None)
+            .await
+            .unwrap();
+        let user = create_message(db, &conv.id, MessageRole::User, "Q", &[], None, 0)
+            .await
+            .unwrap();
+        let late_slot_two = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "C",
+            &[],
+            Some(&user.id),
+            2,
+        )
+        .await
+        .unwrap();
+        let slot_one = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "B",
+            &[],
+            Some(&user.id),
+            1,
+        )
+        .await
+        .unwrap();
+        let slot_zero = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "A",
+            &[],
+            Some(&user.id),
+            0,
+        )
+        .await
+        .unwrap();
+        set_created_at(db, &late_slot_two.id, 1).await;
+        set_created_at(db, &slot_one.id, 3).await;
+        set_created_at(db, &slot_zero.id, 2).await;
+
+        let versions = list_message_versions(db, &conv.id, &user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.iter().map(|message| message.id.as_str()).collect::<Vec<_>>(),
+            vec![slot_zero.id.as_str(), slot_one.id.as_str(), late_slot_two.id.as_str()]
+        );
+        assert_eq!(max_assistant_version_index(db, &conv.id, &user.id).await.unwrap(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn max_assistant_version_index_includes_gaps_and_tool_scaffolds() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let conv = conversation::create_conversation(db, "Max Slot", "model-1", "prov-1", None)
+            .await
+            .unwrap();
+        let user = create_message(db, &conv.id, MessageRole::User, "Q", &[], None, 0)
+            .await
+            .unwrap();
+        create_message(db, &conv.id, MessageRole::Assistant, "A", &[], Some(&user.id), 0)
+            .await
+            .unwrap();
+        let scaffold = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "tool scaffold",
+            &[],
+            Some(&user.id),
+            2,
+        )
+        .await
+        .unwrap();
+        create_message(
+            db,
+            &conv.id,
+            MessageRole::Tool,
+            "tool output",
+            &[],
+            Some(&scaffold.id),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(max_assistant_version_index(db, &conv.id, &user.id).await.unwrap(), Some(2));
+        assert_eq!(
+            list_message_versions(db, &conv.id, &user.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_assistant_version_slots_are_rejected() {
+        let h = create_test_pool().await.unwrap();
+        let db = &h.conn;
+        let conv = conversation::create_conversation(db, "Unique Slot", "model-1", "prov-1", None)
+            .await
+            .unwrap();
+        let user = create_message(db, &conv.id, MessageRole::User, "Q", &[], None, 0)
+            .await
+            .unwrap();
+        create_message(db, &conv.id, MessageRole::Assistant, "A", &[], Some(&user.id), 1)
+            .await
+            .unwrap();
+        let duplicate = create_message(
+            db,
+            &conv.id,
+            MessageRole::Assistant,
+            "B",
+            &[],
+            Some(&user.id),
+            1,
+        )
+        .await;
+        assert!(duplicate.is_err());
+    }
+
+    #[tokio::test]
     async fn clear_conversation_first_rounds_keeps_later_rounds_only() {
         let h = create_test_pool().await.unwrap();
         let db = &h.conn;
@@ -1417,7 +2268,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conversation::upsert_summary(db, &conv.id, "old summary", Some(&active.id), Some(12), Some("model-1"))
+        conversation::upsert_summary(db, &conv.id, "old summary", Some(&active.id), Some(12), Some("model-1"), None)
             .await
             .unwrap();
         let later_user = create_message(db, &conv.id, MessageRole::User, "later", &[], None, 0)
@@ -1503,7 +2354,7 @@ mod tests {
         .await
         .unwrap();
         set_conversation_active_message_count(db, &conv.id, 2).await.unwrap();
-        conversation::upsert_summary(db, &conv.id, "summary", Some(&assistant.id), Some(5), Some("model-1"))
+        conversation::upsert_summary(db, &conv.id, "summary", Some(&assistant.id), Some(5), Some("model-1"), None)
             .await
             .unwrap();
 

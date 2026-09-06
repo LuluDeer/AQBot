@@ -1,5 +1,6 @@
 import { invoke, isTauri } from './invoke';
 import { Image as TauriImage } from '@tauri-apps/api/image';
+import { sanitizeFilenamePart as sanitizeFilenamePartShared } from './filename';
 
 const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
   'image/png': 'png',
@@ -23,6 +24,15 @@ type RemoteImageResponse = {
 
 function isHttpImageSource(src: string) {
   return /^https?:\/\//i.test(src.trim());
+}
+
+function isStoredMediaHttpSource(src: string) {
+  try {
+    const url = new URL(src.trim());
+    return url.protocol === 'http:' && url.hostname === 'aqbot-media.localhost';
+  } catch {
+    return false;
+  }
 }
 
 function base64ToBytes(base64: string) {
@@ -66,13 +76,7 @@ function getExtensionForImage(src: string, mimeType?: string | null) {
 }
 
 function sanitizeFilenamePart(value: string) {
-  const normalized = value
-    .trim()
-    .replace(/[\\/:*?"<>|]+/g, '-')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-  return normalized || 'aqbot-image';
+  return sanitizeFilenamePartShared(value, 'aqbot-image');
 }
 
 function ensureImageExtension(filename: string, src: string, mimeType?: string | null) {
@@ -154,7 +158,7 @@ export async function resolveImageBlob(src: string) {
     throw new Error('Image source is empty.');
   }
 
-  if (isTauri() && isHttpImageSource(src)) {
+  if (isTauri() && isHttpImageSource(src) && !isStoredMediaHttpSource(src)) {
     const response = await invoke<RemoteImageResponse>('fetch_remote_image', { url: src });
     return new Blob([base64ToBytes(response.data)], { type: response.mimeType });
   }

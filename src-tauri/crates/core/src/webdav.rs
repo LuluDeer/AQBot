@@ -1,9 +1,10 @@
 use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use zip::write::SimpleFileOptions;
 
 use crate::error::{AQBotError, Result};
@@ -35,6 +36,20 @@ pub struct BackupZipContents {
     pub has_documents: bool,
     pub has_workspace: bool,
     pub master_key_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupMediaRequirement {
+    pub storage_path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Deserialize)]
+struct BackupMediaManifestEntry {
+    path: String,
+    sha256: String,
+    size: u64,
 }
 
 // === WebDAV Client ===
@@ -279,12 +294,15 @@ impl WebDavClient {
 pub fn create_backup_zip(
     db_path: &Path,
     documents_dir: Option<&Path>,
+    required_documents_root: &Path,
+    required_media: &[BackupMediaRequirement],
     workspace_dir: Option<&Path>,
     master_key_path: Option<&Path>,
     dest_zip: &Path,
     app_version: &str,
     object_counts_json: &str,
 ) -> Result<()> {
+    let required_media = collect_required_media(required_documents_root, required_media)?;
     let file = std::fs::File::create(dest_zip)
         .map_err(|e| AQBotError::Gateway(format!("Failed to create ZIP file: {}", e)))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -301,17 +319,29 @@ pub fn create_backup_zip(
         .map_err(|e| AQBotError::Gateway(format!("ZIP write error: {}", e)))?;
 
     // metadata.json
+    let media_manifest = required_media
+        .iter()
+        .map(|media| {
+            serde_json::json!({
+                "path": media.storage_path,
+                "sha256": media.sha256,
+                "size": media.size,
+            })
+        })
+        .collect::<Vec<_>>();
     let metadata = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "app_version": app_version,
         "created_at": chrono::Utc::now().to_rfc3339(),
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "hostname": get_hostname(),
         "db_checksum": db_checksum,
-        "include_documents": documents_dir.is_some(),
+        "include_documents": documents_dir.is_some() || !required_media.is_empty(),
+        "include_all_documents": documents_dir.is_some(),
         "include_workspace": workspace_dir.is_some(),
         "object_counts": object_counts_json,
+        "media_files": media_manifest,
     });
     let metadata_json = serde_json::to_string_pretty(&metadata)
         .map_err(|e| AQBotError::Gateway(format!("JSON error: {}", e)))?;
@@ -337,6 +367,19 @@ pub fn create_backup_zip(
     if let Some(docs_dir) = documents_dir {
         if docs_dir.exists() {
             add_directory_to_zip(&mut zip, docs_dir, "documents", options)?;
+        }
+    } else {
+        for media in &required_media {
+            zip.start_file(format!("documents/{}", media.storage_path), options)
+                .map_err(|e| AQBotError::Gateway(format!("ZIP error: {e}")))?;
+            let data = std::fs::read(&media.absolute_path).map_err(|e| {
+                AQBotError::Gateway(format!(
+                    "Failed to read required media {}: {e}",
+                    media.storage_path
+                ))
+            })?;
+            zip.write_all(&data)
+                .map_err(|e| AQBotError::Gateway(format!("ZIP write error: {e}")))?;
         }
     }
 
@@ -367,16 +410,35 @@ pub fn extract_backup_zip(zip_path: &Path, dest_dir: &Path) -> Result<BackupZipC
     let mut has_documents = false;
     let mut has_workspace = false;
     let mut master_key_path = None;
+    let mut extracted_paths = HashSet::new();
 
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AQBotError::Gateway(format!("ZIP read error: {}", e)))?;
-        let name = entry.name().to_string();
-
-        if name.contains("..") {
-            continue; // path traversal protection
+        let raw_name = entry.name().to_string();
+        if raw_name.contains('\\') {
+            return Err(AQBotError::Gateway(format!(
+                "Unsafe ZIP entry path: {raw_name}"
+            )));
         }
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| AQBotError::Gateway(format!("Unsafe ZIP entry path: {raw_name}")))?;
+        if enclosed
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(AQBotError::Gateway(format!(
+                "Unsafe ZIP entry path: {raw_name}"
+            )));
+        }
+        if !extracted_paths.insert(enclosed.clone()) {
+            return Err(AQBotError::Gateway(format!(
+                "Duplicate ZIP entry path: {raw_name}"
+            )));
+        }
+        let name = enclosed.to_string_lossy();
 
         if name == "aqbot.db" {
             let path = dest_dir.join("aqbot.db");
@@ -403,9 +465,11 @@ pub fn extract_backup_zip(zip_path: &Path, dest_dir: &Path) -> Result<BackupZipC
             master_key_path = Some(path);
         } else if name.starts_with("documents/") && !entry.is_dir() {
             has_documents = true;
-            let path = dest_dir.join(&name);
+            let path = dest_dir.join(&enclosed);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AQBotError::Gateway(format!("Failed to create extraction directory: {e}"))
+                })?;
             }
             let mut outfile = std::fs::File::create(&path)
                 .map_err(|e| AQBotError::Gateway(format!("Failed to extract file: {}", e)))?;
@@ -413,9 +477,11 @@ pub fn extract_backup_zip(zip_path: &Path, dest_dir: &Path) -> Result<BackupZipC
                 .map_err(|e| AQBotError::Gateway(format!("Failed to extract file: {}", e)))?;
         } else if name.starts_with("workspace/") && !entry.is_dir() {
             has_workspace = true;
-            let path = dest_dir.join(&name);
+            let path = dest_dir.join(&enclosed);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AQBotError::Gateway(format!("Failed to create extraction directory: {e}"))
+                })?;
             }
             let mut outfile = std::fs::File::create(&path)
                 .map_err(|e| AQBotError::Gateway(format!("Failed to extract file: {}", e)))?;
@@ -434,12 +500,149 @@ pub fn extract_backup_zip(zip_path: &Path, dest_dir: &Path) -> Result<BackupZipC
     })
 }
 
+#[derive(Debug)]
+struct RequiredMedia {
+    storage_path: String,
+    absolute_path: PathBuf,
+    sha256: String,
+    size: u64,
+}
+
+fn collect_required_media(
+    documents_root: &Path,
+    requirements: &[BackupMediaRequirement],
+) -> Result<Vec<RequiredMedia>> {
+    let file_store = crate::file_store::FileStore::with_root(documents_root.to_path_buf());
+    let mut unique_requirements = requirements.to_vec();
+    unique_requirements.sort_by(|left, right| left.storage_path.cmp(&right.storage_path));
+    unique_requirements.dedup_by(|left, right| {
+        left.storage_path == right.storage_path
+            && left.sha256 == right.sha256
+            && left.size == right.size
+    });
+    let mut seen_paths = HashSet::new();
+    unique_requirements
+        .into_iter()
+        .map(|requirement| {
+            if !seen_paths.insert(requirement.storage_path.clone()) {
+                return Err(AQBotError::Validation(format!(
+                    "Stored-file metadata disagrees for backup path: {}",
+                    requirement.storage_path
+                )));
+            }
+            let absolute_path = file_store.validated_path(&requirement.storage_path)?;
+            if !absolute_path.is_file() {
+                return Err(AQBotError::NotFound(format!(
+                    "Required backup media is missing: {}",
+                    requirement.storage_path
+                )));
+            }
+            let data = std::fs::read(&absolute_path).map_err(|error| {
+                AQBotError::Gateway(format!(
+                    "Failed to read required backup media {}: {error}",
+                    requirement.storage_path
+                ))
+            })?;
+            let actual_hash = format!("{:x}", Sha256::digest(&data));
+            if data.len() as u64 != requirement.size || actual_hash != requirement.sha256 {
+                return Err(AQBotError::Validation(format!(
+                    "Required backup media does not match stored-file metadata: {}",
+                    requirement.storage_path
+                )));
+            }
+            Ok(RequiredMedia {
+                storage_path: requirement.storage_path,
+                absolute_path,
+                sha256: requirement.sha256,
+                size: requirement.size,
+            })
+        })
+        .collect()
+}
+
 /// Verify the checksum of an extracted database against metadata.
 pub fn verify_db_checksum(db_path: &Path, expected_checksum: &str) -> Result<bool> {
     let data = std::fs::read(db_path)
         .map_err(|e| AQBotError::Gateway(format!("Failed to read db for checksum: {}", e)))?;
     let actual = format!("{:x}", Sha256::digest(&data));
     Ok(actual == expected_checksum)
+}
+
+/// Verify every referenced media payload declared by a v2 backup before any
+/// database, key, or document is replaced. Older bundles without a manifest
+/// remain readable for backward compatibility.
+pub fn verify_backup_media_manifest(
+    contents: &BackupZipContents,
+    extraction_root: &Path,
+) -> Result<()> {
+    let version = contents
+        .metadata
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let Some(manifest) = contents.metadata.get("media_files") else {
+        if version >= 2 {
+            return Err(AQBotError::Validation(
+                "Backup media manifest is missing".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let entries: Vec<BackupMediaManifestEntry> =
+        serde_json::from_value(manifest.clone()).map_err(|error| {
+            AQBotError::Validation(format!("Backup media manifest is invalid: {error}"))
+        })?;
+    let documents_root = extraction_root.join("documents");
+    let file_store = crate::file_store::FileStore::with_root(documents_root);
+    let mut seen_paths = HashSet::new();
+    for entry in entries {
+        if !seen_paths.insert(entry.path.clone()) {
+            return Err(AQBotError::Validation(format!(
+                "Backup media manifest contains duplicate path: {}",
+                entry.path
+            )));
+        }
+        let path = file_store.validated_path(&entry.path)?;
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            AQBotError::Validation(format!(
+                "Backup media is missing or unreadable ({}): {error}",
+                entry.path
+            ))
+        })?;
+        if !metadata.is_file() || metadata.len() != entry.size {
+            return Err(AQBotError::Validation(format!(
+                "Backup media size mismatch: {}",
+                entry.path
+            )));
+        }
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            AQBotError::Gateway(format!(
+                "Failed to read backup media {}: {error}",
+                entry.path
+            ))
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                AQBotError::Gateway(format!(
+                    "Failed to hash backup media {}: {error}",
+                    entry.path
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        if format!("{:x}", hasher.finalize()) != entry.sha256 {
+            return Err(AQBotError::Validation(format!(
+                "Backup media checksum mismatch: {}",
+                entry.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Generate a backup filename with timestamp and hostname.
@@ -525,11 +728,20 @@ fn collect_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> 
     if !dir.is_dir() {
         return Ok(());
     }
+    if dir.file_name().and_then(|name| name.to_str()) == Some(".aqbot-skills-runtime") {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)
         .map_err(|e| AQBotError::Gateway(format!("Failed to read directory: {}", e)))?
     {
         let entry = entry.map_err(|e| AQBotError::Gateway(format!("Dir entry error: {}", e)))?;
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| AQBotError::Gateway(format!("Dir entry error: {}", e)))?;
+        if file_type.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             collect_files(&path, files)?;
         } else {
@@ -545,9 +757,8 @@ fn parse_propfind_response(xml: &str) -> Result<Vec<WebDavFileInfo>> {
     let response_blocks = split_xml_responses(xml);
 
     for block in response_blocks {
-        let lower_block = block.to_lowercase();
-        // Skip collections (directories)
-        if lower_block.contains("<d:collection") || lower_block.contains("<collection") {
+        // Skip collections (directories) — any namespace prefix
+        if is_collection_block(&block) {
             continue;
         }
 
@@ -585,59 +796,57 @@ fn parse_propfind_response(xml: &str) -> Result<Vec<WebDavFileInfo>> {
     Ok(files)
 }
 
+fn is_collection_block(block: &str) -> bool {
+    // Match <collection ...>, <d:collection/>, <lp1:collection>, etc.
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)<(?:[\w.-]+:)?collection(?:\s|/|>)").expect("collection regex")
+    });
+    re.is_match(block)
+}
+
 fn split_xml_responses(xml: &str) -> Vec<String> {
     let mut blocks = Vec::new();
-    let lower = xml.to_lowercase();
+    // Any namespace prefix on <response> (d:, D:, a:, lp1:, bare, …)
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<(?:[\w.-]+:)?response(?:\s[^>]*)?>.*?</(?:[\w.-]+:)?response>")
+            .expect("response regex")
+    });
 
-    let tag_patterns = ["d:response", "response"];
-    for tag in &tag_patterns {
-        let open1 = format!("<{}>", tag);
-        let open2 = format!("<{} ", tag);
-        let close = format!("</{}>", tag);
-
-        let mut pos = 0;
-        while pos < lower.len() {
-            let start = lower[pos..]
-                .find(&open1)
-                .or_else(|| lower[pos..].find(&open2));
-            if let Some(s) = start {
-                let abs_start = pos + s;
-                if let Some(end) = lower[abs_start..].find(&close) {
-                    let abs_end = abs_start + end + close.len();
-                    blocks.push(xml[abs_start..abs_end].to_string());
-                    pos = abs_end;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        if !blocks.is_empty() {
-            break;
-        }
+    for m in re.find_iter(xml) {
+        blocks.push(m.as_str().to_string());
     }
     blocks
 }
 
+/// Extract text content of an XML element by local name, ignoring namespace
+/// prefix and optional attributes on the opening tag.
+///
+/// Real WebDAV servers often return properties as:
+/// - `<d:getcontentlength>123</d:getcontentlength>` (standard)
+/// - `<lp1:getcontentlength>123</lp1:getcontentlength>` (Apache mod_dav)
+/// - `<a:getcontentlength>123</a:getcontentlength>` (IIS-style)
+/// - `<D:getcontentlength xmlns:D="DAV:">123</D:getcontentlength>` (attrs)
+///
+/// Prefer the first **non-empty** match so empty 404 propstats do not hide a
+/// later 200 value.
 fn extract_xml_value(xml: &str, tag_local_name: &str) -> Option<String> {
-    let lower = xml.to_lowercase();
-    let tag = tag_local_name.to_lowercase();
+    let tag = regex::escape(&tag_local_name.to_lowercase());
+    let pattern = format!(r"(?is)<(?:[\w.-]+:)?{tag}(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?{tag}>");
+    let re = regex::Regex::new(&pattern).ok()?;
 
-    let patterns = [
-        (format!("<d:{}>", tag), format!("</d:{}>", tag)),
-        (format!("<{}>", tag), format!("</{}>", tag)),
-    ];
-
-    for (open, close) in &patterns {
-        if let Some(start) = lower.find(open) {
-            let content_start = start + open.len();
-            if let Some(end) = lower[content_start..].find(close) {
-                return Some(xml[content_start..content_start + end].trim().to_string());
-            }
+    let mut first_empty: Option<String> = None;
+    for caps in re.captures_iter(xml) {
+        let raw = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+        if !raw.is_empty() {
+            return Some(raw.to_string());
+        }
+        if first_empty.is_none() {
+            first_empty = Some(String::new());
         }
     }
-    None
+    first_empty
 }
 
 fn url_decode(s: &str) -> String {
@@ -723,6 +932,270 @@ mod tests {
         assert!(
             chrono::DateTime::parse_from_rfc3339(&timestamp).is_ok(),
             "sync status timestamps should be RFC3339 so the frontend can render them directly, got: {timestamp}"
+        );
+    }
+
+    #[test]
+    fn backup_media_manifest_rejects_tampered_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let media_path = temp.path().join("documents/images/media.png");
+        std::fs::create_dir_all(media_path.parent().unwrap()).unwrap();
+        std::fs::write(&media_path, b"expected").unwrap();
+        let contents = BackupZipContents {
+            db_path: temp.path().join("aqbot.db"),
+            metadata: serde_json::json!({
+                "version": 2,
+                "media_files": [{
+                    "path": "images/media.png",
+                    "sha256": format!("{:x}", Sha256::digest(b"expected")),
+                    "size": 8,
+                }],
+            }),
+            has_documents: true,
+            has_workspace: false,
+            master_key_path: None,
+        };
+
+        verify_backup_media_manifest(&contents, temp.path()).unwrap();
+        std::fs::write(&media_path, b"tampered").unwrap();
+
+        let error = verify_backup_media_manifest(&contents, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn version_two_backup_requires_a_media_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let contents = BackupZipContents {
+            db_path: temp.path().join("aqbot.db"),
+            metadata: serde_json::json!({ "version": 2 }),
+            has_documents: false,
+            has_workspace: false,
+            master_key_path: None,
+        };
+
+        let error = verify_backup_media_manifest(&contents, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("manifest is missing"));
+    }
+
+    #[test]
+    fn backup_creation_rejects_media_that_disagrees_with_database_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("images/media.png");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"tampered").unwrap();
+        let requirements = [BackupMediaRequirement {
+            storage_path: "images/media.png".to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"expected")),
+            size: 8,
+        }];
+
+        let error = collect_required_media(temp.path(), &requirements).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match stored-file metadata"));
+    }
+
+    #[test]
+    fn parse_propfind_standard_d_prefix_reports_size() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/aqbot/</d:href>
+    <d:propstat>
+      <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/aqbot/aqbot-backup-20240805-host.zip</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getcontentlength>12345</d:getcontentlength>
+        <d:getlastmodified>Mon, 05 Aug 2024 12:00:00 GMT</d:getlastmodified>
+        <d:resourcetype/>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "aqbot-backup-20240805-host.zip");
+        assert_eq!(files[0].size, 12345);
+        assert!(files[0].last_modified.contains("2024"));
+    }
+
+    #[test]
+    fn parse_propfind_apache_lp1_prefix_reports_size() {
+        // Apache mod_dav / many commercial servers put live props under lp1:
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response xmlns:lp1="DAV:" xmlns:lp2="http://apache.org/dav/props/">
+    <D:href>/aqbot/aqbot-backup-20240805-win.zip</D:href>
+    <D:propstat>
+      <D:prop>
+        <lp1:resourcetype/>
+        <lp1:getcontentlength>987654</lp1:getcontentlength>
+        <lp1:getlastmodified>Tue, 06 Aug 2024 08:00:00 GMT</lp1:getlastmodified>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 987654);
+        assert_eq!(files[0].file_name, "aqbot-backup-20240805-win.zip");
+    }
+
+    #[test]
+    fn parse_propfind_attributed_open_tags_reports_size() {
+        let xml = r#"<?xml version="1.0"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/aqbot/aqbot-backup-20240805-attr.zip</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getcontentlength xmlns:D="DAV:">555</D:getcontentlength>
+        <D:getlastmodified xmlns:D="DAV:">Wed, 07 Aug 2024 01:00:00 GMT</D:getlastmodified>
+        <D:resourcetype xmlns:D="DAV:"/>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 555);
+    }
+
+    #[test]
+    fn parse_propfind_iis_a_prefix_reports_size() {
+        let xml = r#"<?xml version="1.0"?>
+<a:multistatus xmlns:a="DAV:">
+  <a:response>
+    <a:href>/aqbot/aqbot-backup-20240805-iis.zip</a:href>
+    <a:propstat>
+      <a:prop>
+        <a:getcontentlength>4242</a:getcontentlength>
+        <a:getlastmodified>Thu, 08 Aug 2024 10:00:00 GMT</a:getlastmodified>
+        <a:resourcetype/>
+      </a:prop>
+      <a:status>HTTP/1.1 200 OK</a:status>
+    </a:propstat>
+  </a:response>
+</a:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 4242);
+        assert_eq!(files[0].file_name, "aqbot-backup-20240805-iis.zip");
+    }
+
+    #[test]
+    fn parse_propfind_filters_non_backup_and_directories() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/aqbot/notes.txt</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength>10</d:getcontentlength></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/aqbot/other-backup.zip</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength>20</d:getcontentlength></d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/aqbot/subdir/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:getcontentlength>0</d:getcontentlength>
+      </d:prop>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/dav/aqbot/aqbot-backup-20240805-keep.zip</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength>100</d:getcontentlength></d:prop>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "aqbot-backup-20240805-keep.zip");
+        assert_eq!(files[0].size, 100);
+    }
+
+    #[test]
+    fn parse_propfind_prefers_nonempty_getcontentlength_over_empty_propstat() {
+        let xml = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/dav/aqbot/aqbot-backup-20240805-emptyfirst.zip</d:href>
+    <d:propstat>
+      <d:prop><d:getcontentlength></d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 404 Not Found</d:status>
+    </d:propstat>
+    <d:propstat>
+      <d:prop><d:getcontentlength>7777</d:getcontentlength></d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#;
+
+        let files = parse_propfind_response(xml).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size, 7777);
+    }
+
+    #[test]
+    fn collect_files_skips_skill_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("keep.txt"), "ok").unwrap();
+        let runtime = root.path().join(".aqbot-skills-runtime/session");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("skill.md"), "secret").unwrap();
+        let mut files = Vec::new();
+        collect_files(root.path(), &mut files).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert!(names.contains(&"keep.txt"));
+        assert!(!names.contains(&"skill.md"));
+    }
+
+    #[test]
+    fn extract_xml_value_accepts_arbitrary_prefix_and_attributes() {
+        assert_eq!(
+            extract_xml_value(
+                r#"<lp1:getcontentlength>42</lp1:getcontentlength>"#,
+                "getcontentlength"
+            )
+            .as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            extract_xml_value(
+                r#"<D:getcontentlength xmlns:D="DAV:">99</D:getcontentlength>"#,
+                "getcontentlength"
+            )
+            .as_deref(),
+            Some("99")
+        );
+        assert_eq!(
+            extract_xml_value(r#"<a:href>/path/file.zip</a:href>"#, "href").as_deref(),
+            Some("/path/file.zip")
         );
     }
 }

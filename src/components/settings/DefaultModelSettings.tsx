@@ -12,7 +12,7 @@ const { TextArea } = Input;
 
 const DEFAULT_TITLE_SUMMARY_PROMPT = '请根据以下对话内容，生成一个简短精炼的标题（不超过20个字），直接返回标题文本，不要包含引号或任何额外说明。';
 
-const DEFAULT_COMPRESSION_PROMPT = '你是一个对话摘要助手。请将以下对话历史压缩为简洁摘要。\n\n要求：\n1. 保留所有用户明确表达的需求、偏好和决策\n2. 保留关键技术细节（代码片段、配置、错误信息等）\n3. 保留待办事项和未解决的问题\n4. 用简洁的要点形式组织\n5. 保持摘要简洁，不超过 500 字';
+const DEFAULT_COMPRESSION_PROMPT = '你是一个对话摘要助手。请将以下对话历史压缩为简洁摘要。\n\n要求：\n1. 保留所有用户明确表达的需求、偏好和决策\n2. 保留关键技术细节（代码片段、配置、错误信息等）\n3. 保留待办事项和未解决的问题\n4. 用简洁的要点形式组织\n5. 在输出上限内尽可能完整保留关键事实与原文细节';
 
 // ── Context count slider ───────────────────────────────────
 
@@ -29,8 +29,15 @@ function ContextCountParam({
 }) {
   const { token } = theme.useToken();
   const { t } = useTranslation();
-  const effectiveValue = value ?? 5;
-  const contextMarks: Record<number, string> = { 0: '0', 5: '5', 10: '10', 15: '15', 50: t('common.unlimited') };
+  // null means unlimited (matches backend). Display 50 so the slider sits on "unlimited".
+  const effectiveValue = value ?? 50;
+  const contextMarks: Record<number, string> = {
+    0: '0',
+    5: '5',
+    10: '10',
+    15: '15',
+    50: t('common.unlimited'),
+  };
 
   return (
     <>
@@ -50,13 +57,16 @@ function ContextCountParam({
           min={0} max={50} step={1}
           marks={contextMarks}
           value={effectiveValue}
-          onChange={(v) => onChange(v)}
+          onChange={(v) => onChange(v >= 50 ? null : v)}
         />
         <InputNumber
           style={{ width: 72 }}
           min={0} max={50}
           value={effectiveValue}
-          onChange={(v) => onChange(v ?? 5)}
+          onChange={(v) => {
+            if (v == null || v >= 50) onChange(null);
+            else onChange(v);
+          }}
           size="small"
         />
       </div>
@@ -297,11 +307,11 @@ function ModelCard({
 
 export function DefaultModelSettings() {
   const { t } = useTranslation();
-  const fetchProviders = useProviderStore((s) => s.fetchProviders);
+  const ensureProvidersLoaded = useProviderStore((s) => s.ensureProvidersLoaded);
 
   useEffect(() => {
-    fetchProviders();
-  }, [fetchProviders]);
+    void ensureProvidersLoaded();
+  }, [ensureProvidersLoaded]);
 
   const placeholderText = t('settings.useActiveModel');
 

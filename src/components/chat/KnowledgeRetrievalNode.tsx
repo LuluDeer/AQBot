@@ -3,7 +3,7 @@ import { theme } from 'antd';
 import { BookOpen, ChevronDown, ChevronRight, AlertCircle } from 'lucide-react';
 import type { NodeComponentProps } from 'markstream-react';
 import { useTranslation } from 'react-i18next';
-import type { MemorySourceResult, MemoryRetrievedItem } from '@/lib/memoryUtils';
+import { translateDiagnosticError, type MemorySourceResult, type MemoryRetrievedItem } from '@/lib/memoryUtils';
 
 type KnowledgeRetrievalNodeData = {
   type: 'knowledge-retrieval';
@@ -102,7 +102,7 @@ export function KnowledgeRetrievalNode(props: NodeComponentProps<KnowledgeRetrie
         }}
       >
         <AlertCircle size={16} />
-        <span>{node.content || t('chat.knowledgeRetrieval.error')}</span>
+        <span>{translateDiagnosticError(node.content, t, 'chat.knowledgeRetrieval.error')}</span>
       </div>
     );
   }
@@ -112,9 +112,6 @@ export function KnowledgeRetrievalNode(props: NodeComponentProps<KnowledgeRetrie
     const messageKey = reason === 'threshold_filtered'
       ? 'chat.knowledgeRetrieval.emptyThreshold'
       : 'chat.knowledgeRetrieval.empty';
-    const defaultValue = reason === 'threshold_filtered'
-      ? '未找到符合检索阈值的知识库内容，可适当降低检索阈值。'
-      : '未找到相关知识库内容。';
     return (
       <div
         style={{
@@ -130,7 +127,7 @@ export function KnowledgeRetrievalNode(props: NodeComponentProps<KnowledgeRetrie
         }}
       >
         <BookOpen size={16} />
-        <span>{t(messageKey, { defaultValue })}</span>
+        <span>{t(messageKey)}</span>
       </div>
     );
   }
@@ -164,7 +161,6 @@ export function KnowledgeRetrievalNode(props: NodeComponentProps<KnowledgeRetrie
         <span style={{ fontSize: 13, fontWeight: 500 }}>
           {t('chat.knowledgeRetrieval.resultsCount', {
             count: totalItems,
-            defaultValue: '检索到 {{count}} 条知识',
           })}
         </span>
         <span style={{ marginLeft: 'auto', color: token.colorTextTertiary }}>

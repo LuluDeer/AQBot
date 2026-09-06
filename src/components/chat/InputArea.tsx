@@ -1,11 +1,12 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import { Button, Tooltip, App, theme, Dropdown, Tag, Popover, Checkbox, Badge, InputNumber } from 'antd';
 import type { MenuProps } from 'antd';
-import { Paperclip, Trash2, Mic, Eraser, Scissors, Globe, Brain, Atom, Plug, SlidersHorizontal, ArrowUp, Square, Check, Zap, ZapOff, Shrink, Upload, GitCompareArrows, X, BookOpen, GripHorizontal, CircleOff, SignalLow, SignalMedium, SignalHigh, Signal, Bot, MessageSquare, Shield, ShieldCheck, ShieldAlert, FolderOpen, ExternalLink } from 'lucide-react';
+import { Paperclip, Mic, Eraser, Scissors, Globe, Brain, Plug, SlidersHorizontal, ArrowUp, Square, Check, Zap, Shrink, Upload, GitCompareArrows, BookOpen, GripHorizontal, Bot, MessageSquare, Shield, ShieldCheck, ShieldAlert, FolderOpen, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useConversationStore, useProviderStore, useSettingsStore, useSearchStore, useMcpStore, useMemoryStore, useKnowledgeStore } from '@/stores';
+import { selectUiRunPhase, selectUiStreaming } from '@/stores/conversationStore';
 import { useUIStore } from '@/stores/uiStore';
-import { findModelByIds, supportsReasoning, modelHasCapability } from '@/lib/modelCapabilities';
+import { findModelByIds, supportsReasoning, supportsFunctionCalling, modelHasCapability } from '@/lib/modelCapabilities';
 import {
   coerceReasoningOptionKey,
   legacyThinkingBudgetToOptionKey,
@@ -17,67 +18,63 @@ import { NamespaceIcon } from '@/components/shared/NamespaceIcon';
 import { KnowledgeBaseIcon } from '@/components/shared/KnowledgeBaseIcon';
 import { getShortcutBinding, formatShortcutForDisplay, matchesShortcutEvent } from '@/lib/shortcuts';
 import { normalizeAutoConversationTitle } from '@/lib/conversationTitle';
+import {
+  resolveEffectiveContextStrategy,
+  shouldNotifyContextExclusion,
+} from '@/lib/contextStrategy';
 import { perfNow, perfTraceDuration } from '@/lib/perfTrace';
+import { normalizeMultiModelContinuationMode } from '@/lib/multiModelContinuation';
+import { mergeMultiModelTargetSelection } from '@/lib/resolveTargetReasoning';
 import type { ShortcutAction } from '@/lib/shortcuts';
 import { VoiceCall } from './VoiceCall';
 import { ConversationSettingsModal } from './ConversationSettingsModal';
+import { CompanionModelTags } from './CompanionModelTags';
+import { MessageQueueTray } from './MessageQueueTray';
 import { ModelSelector } from './ModelSelector';
+import { thinkingOptionIcon } from './thinkingOptionIcon';
 import { SearchProviderTypeIcon, PROVIDER_TYPE_LABELS } from '@/components/shared/SearchProviderIcon';
-import { ModelIcon } from '@lobehub/icons';
-import type { AttachmentInput, ProviderType, RealtimeConfig } from '@/types';
+import {
+  DEFAULT_CHAT_INPUT_ACTIONS_SCALE,
+  normalizeChatInputActionsScale,
+  type AttachmentInput,
+  type ContextStrategy,
+  type ProviderType,
+  type RealtimeConfig,
+} from '@/types';
 import { invoke } from '@/lib/invoke';
-
-const DOCUMENT_ATTACHMENT_ACCEPT = [
-  '.pdf',
-  '.doc',
-  '.docx',
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-].join(',');
-
-const DOCUMENT_ATTACHMENT_MIME_BY_EXTENSION: Record<string, string> = {
-  pdf: 'application/pdf',
-  doc: 'application/msword',
-  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-};
-
-function getAttachmentMimeType(fileName: string, mimeType?: string): string {
-  if (mimeType) return mimeType;
-  const extension = fileName.split('.').pop()?.toLowerCase() || '';
-  return DOCUMENT_ATTACHMENT_MIME_BY_EXTENSION[extension] || 'application/octet-stream';
-}
-
-function isAllowedAttachmentFile(
-  fileName: string,
-  mimeType: string | undefined,
-  hasVision: boolean,
-  documentAttachmentReadingEnabled: boolean,
-): boolean {
-  const effectiveMimeType = getAttachmentMimeType(fileName, mimeType);
-  if (hasVision && effectiveMimeType.startsWith('image/')) return true;
-  if (!documentAttachmentReadingEnabled) return false;
-  return Object.values(DOCUMENT_ATTACHMENT_MIME_BY_EXTENSION).includes(effectiveMimeType);
-}
-
-async function fileToAttachmentInput(file: File): Promise<AttachmentInput> {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const base64 = (reader.result as string).split(',')[1] || '';
-      resolve({
-        file_name: file.name,
-        file_type: getAttachmentMimeType(file.name, file.type),
-        file_size: file.size,
-        data: base64,
-      });
-    };
-    reader.readAsDataURL(file);
-  });
-}
+import { ConversationRoleStorageError, resolveChatModeForConversation } from '@/lib/applyRole';
+import { usePageSuspendCleanup } from '@/components/layout/PageLifecycle';
+import { RoleSwitcherPopover } from './toolbar/RoleSwitcherPopover';
+import { SkillPickerPopover } from './toolbar/SkillPickerPopover';
+import {
+  AttachmentChips,
+  revokeComposerAttachments,
+  type ComposerAttachment,
+} from './AttachmentChips';
+import {
+  DOCUMENT_ATTACHMENT_ACCEPT,
+  fileToAttachmentInput,
+  isAllowedChatAttachmentFile,
+  useComposerAttachments,
+} from './composerAttachments';
+import { isImageAttachmentFile } from './attachmentFileTypes';
+import {
+  createPastedSnippet,
+  insertPasteTokenAtSelection,
+  isLongPastedText,
+  mergePastedSnippetsIntoContent,
+  removePasteTokens,
+  type PastedSnippet,
+} from '@/lib/pastedText';
 
 // In-memory draft cache: persists input text per-conversation across component unmounts
 const _draftCache = new Map<string, string>();
+
+type AcceptedDraftCleanup = {
+  attachmentIds: ReadonlySet<string>;
+  draftValue: string;
+  snippetIds: ReadonlySet<string>;
+};
 
 export function InputArea() {
   const { t } = useTranslation();
@@ -86,18 +83,56 @@ export function InputArea() {
     const convId = useConversationStore.getState().activeConversationId;
     return convId ? _draftCache.get(convId) || '' : '';
   });
-  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const draftRevisionRef = useRef(0);
+  const submitInFlightByConversationRef = useRef(new Set<string>());
+  const updateDraftValue = useCallback((next: React.SetStateAction<string>) => {
+    draftRevisionRef.current += 1;
+    setValue(next);
+  }, []);
+  const [pastedSnippets, setPastedSnippets] = useState<PastedSnippet[]>([]);
+  const pastedSnippetsRef = useRef(pastedSnippets);
+  pastedSnippetsRef.current = pastedSnippets;
+  const pastedSnippetSeqRef = useRef(0);
+  const attachmentDraftCacheRef = useRef(new Map<string, ComposerAttachment[]>());
+  const snippetDraftCacheRef = useRef(new Map<string, {
+    snippets: PastedSnippet[];
+    sequence: number;
+  }>());
+  const acceptedDraftCleanupRef = useRef(new Map<string, AcceptedDraftCleanup>());
+  const cleanupAcceptedCachedDraft = useCallback((
+    conversationId: string,
+    cleanup: AcceptedDraftCleanup,
+  ) => {
+    const cachedAttachments = attachmentDraftCacheRef.current.get(conversationId) ?? [];
+    const acceptedAttachments = cachedAttachments.filter((attachment) => (
+      cleanup.attachmentIds.has(attachment.id)
+    ));
+    const remainingAttachments = cachedAttachments.filter((attachment) => (
+      !cleanup.attachmentIds.has(attachment.id)
+    ));
+    revokeComposerAttachments(acceptedAttachments);
+    if (remainingAttachments.length > 0) {
+      attachmentDraftCacheRef.current.set(conversationId, remainingAttachments);
+    } else {
+      attachmentDraftCacheRef.current.delete(conversationId);
+    }
+    if (_draftCache.get(conversationId) === cleanup.draftValue) {
+      _draftCache.delete(conversationId);
+      snippetDraftCacheRef.current.delete(conversationId);
+    }
+  }, []);
   const [voiceCallVisible, setVoiceCallVisible] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [mcpPopoverOpen, setMcpPopoverOpen] = useState(false);
   const [searchDropdownOpen, setSearchDropdownOpen] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputConfigurationPromptOpenRef = useRef(false);
   const valueRef = useRef(value);
   valueRef.current = value;
   const prevConvIdRef = useRef<string | null>(
     useConversationStore.getState().activeConversationId ?? null
   );
+  const creatingConversationTransferRef = useRef(false);
 
   // Drag-to-resize state: userMinHeight controls the minimum visible height of the textarea
   const INITIAL_MIN_HEIGHT = 44;
@@ -106,45 +141,88 @@ export function InputArea() {
   const userMinHeightRef = useRef(userMinHeight);
   userMinHeightRef.current = userMinHeight;
   const dragStateRef = useRef<{ startY: number; startH: number } | null>(null);
+  const resizeCleanupRef = useRef<() => void>(() => {});
   const hasUserResizedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Multi-model companion state
-  const [companionModels, setCompanionModels] = useState<Array<{ providerId: string; modelId: string }>>([]);
   const [multiModelOpen, setMultiModelOpen] = useState(false);
   const sendMultiModelMessage = useConversationStore((s) => s.sendMultiModelMessage);
+  const skipCurrentMultiModelTarget = useConversationStore((s) => s.skipCurrentMultiModelTarget);
+  const multiModelRun = useConversationStore((s) => s.multiModelRun);
+  const companionModels = useConversationStore((s) => s.multiModelTargets);
+  const setMultiModelTargets = useConversationStore((s) => s.setMultiModelTargets);
+  const multiModelHistoryMode = useConversationStore((s) => s.multiModelContinuationMode);
+  const setMultiModelContinuationMode = useConversationStore((s) => s.setMultiModelContinuationMode);
 
   const { message: messageApi, modal } = App.useApp();
-  const streaming = useConversationStore((s) => s.streaming);
+  const streaming = useConversationStore(selectUiStreaming);
+  const runPhase = useConversationStore(selectUiRunPhase);
+  const stopping = runPhase === 'stopping';
   const loading = useConversationStore((s) => s.loading);
   const compressingConversationId = useConversationStore((s) => s.compressingConversationId);
   const cancelCurrentStream = useConversationStore((s) => s.cancelCurrentStream);
   const activeConversationId = useConversationStore((s) => s.activeConversationId);
-  const compressing = compressingConversationId === activeConversationId;
-  const sendMessage = useConversationStore((s) => s.sendMessage);
+  const setMultiModelHistoryMode = useCallback((mode: typeof multiModelHistoryMode) => {
+    setMultiModelContinuationMode(normalizeMultiModelContinuationMode(mode));
+  }, [setMultiModelContinuationMode]);
+  const compressing = activeConversationId !== null
+    && compressingConversationId === activeConversationId;
+  const submitChatMessage = useConversationStore((s) => s.submitChatMessage);
+  const updateQueuedChatMessage = useConversationStore((s) => s.updateQueuedChatMessage);
+  const removeQueuedChatMessage = useConversationStore((s) => s.removeQueuedChatMessage);
+  const sendQueuedChatMessageNow = useConversationStore((s) => s.sendQueuedChatMessageNow);
   const sendAgentMessage = useConversationStore((s) => s.sendAgentMessage);
   const createConversation = useConversationStore((s) => s.createConversation);
   const messages = useConversationStore((s) => s.messages);
   const totalActiveCount = useConversationStore((s) => s.totalActiveCount);
   const hasOlderMessages = useConversationStore((s) => s.hasOlderMessages);
+  const conversations = useConversationStore((s) => s.conversations);
+  const archivedConversations = useConversationStore((s) => s.archivedConversations);
+  const providers = useProviderStore((s) => s.providers);
+  const settings = useSettingsStore((s) => s.settings);
+  const activeConversationForContext = conversations.find((c) => c.id === activeConversationId);
+  const effectiveContextStrategy = resolveEffectiveContextStrategy(
+    activeConversationForContext,
+    settings.default_context_strategy,
+  );
   const contextCount = useMemo(() => {
     const activeMessages = messages.filter((m) => m.is_active !== false && !m.content.startsWith('%%ERROR%%'));
     const lastMarkerIdx = activeMessages.reduce((maxIdx, m, i) => {
-      if (m.content === '<!-- context-clear -->' || m.content === '<!-- context-compressed -->') return i;
+      if (
+        m.content === '<!-- context-clear -->'
+        || (effectiveContextStrategy === 'smart_summary' && m.content === '<!-- context-compressed -->')
+      ) return i;
       return maxIdx;
     }, -1);
+    let count: number;
     if (lastMarkerIdx !== -1) {
-      return activeMessages.slice(lastMarkerIdx + 1).length;
+      count = activeMessages.slice(lastMarkerIdx + 1).length;
+    } else if (hasOlderMessages && totalActiveCount > 0) {
+      count = totalActiveCount;
+    } else {
+      count = activeMessages.length;
     }
-    if (hasOlderMessages && totalActiveCount > 0) {
-      return totalActiveCount;
+    // Reflect the effective message-count cap in the badge (matches backend).
+    const rawLimit =
+      activeConversationForContext?.context_message_limit ??
+      settings.default_context_count ??
+      null;
+    if (rawLimit != null && rawLimit < 50) {
+      // 0 means current-only → display at most 1 when messages exist.
+      count = Math.min(count, rawLimit === 0 ? 1 : rawLimit);
     }
-    return activeMessages.length;
-  }, [messages, hasOlderMessages, totalActiveCount]);
-
-  const conversations = useConversationStore((s) => s.conversations);
-  const providers = useProviderStore((s) => s.providers);
-  const settings = useSettingsStore((s) => s.settings);
+    return count;
+  }, [
+    messages,
+    hasOlderMessages,
+    totalActiveCount,
+    activeConversationForContext?.context_message_limit,
+    effectiveContextStrategy,
+    settings.default_context_count,
+  ]);
+  const inputActionsScale = normalizeChatInputActionsScale(
+    settings.chat_input_actions_scale ?? DEFAULT_CHAT_INPUT_ACTIONS_SCALE,
+  ) / 100;
 
   const shortcutHint = useCallback((label: string, action: ShortcutAction) => {
     if (!settings) return label;
@@ -185,11 +263,11 @@ export function InputArea() {
   const setSearchEnabled = useConversationStore((s) => s.setSearchEnabled);
   const setSearchProviderId = useConversationStore((s) => s.setSearchProviderId);
   const searchProviders = useSearchStore((s) => s.providers);
-  const loadSearchProviders = useSearchStore((s) => s.loadProviders);
+  const ensureSearchProvidersLoaded = useSearchStore((s) => s.ensureProvidersLoaded);
 
   // MCP state
   const mcpServers = useMcpStore((s) => s.servers);
-  const loadMcpServers = useMcpStore((s) => s.loadServers);
+  const ensureMcpServersLoaded = useMcpStore((s) => s.ensureServersLoaded);
   const enabledMcpServerIds = useConversationStore((s) => s.enabledMcpServerIds);
   const toggleMcpServer = useConversationStore((s) => s.toggleMcpServer);
 
@@ -208,14 +286,14 @@ export function InputArea() {
 
   // Knowledge base state
   const knowledgeBases = useKnowledgeStore((s) => s.bases);
-  const loadKnowledgeBases = useKnowledgeStore((s) => s.loadBases);
+  const ensureKnowledgeBasesLoaded = useKnowledgeStore((s) => s.ensureBasesLoaded);
   const enabledKnowledgeBaseIds = useConversationStore((s) => s.enabledKnowledgeBaseIds);
   const toggleKnowledgeBase = useConversationStore((s) => s.toggleKnowledgeBase);
   const [kbPopoverOpen, setKbPopoverOpen] = useState(false);
 
   // Memory state
   const memoryNamespaces = useMemoryStore((s) => s.namespaces);
-  const loadMemoryNamespaces = useMemoryStore((s) => s.loadNamespaces);
+  const ensureMemoryNamespacesLoaded = useMemoryStore((s) => s.ensureNamespacesLoaded);
   const enabledMemoryNamespaceIds = useConversationStore((s) => s.enabledMemoryNamespaceIds);
   const toggleMemoryNamespace = useConversationStore((s) => s.toggleMemoryNamespace);
   const [memoryPopoverOpen, setMemoryPopoverOpen] = useState(false);
@@ -229,29 +307,50 @@ export function InputArea() {
 
   const activeConversation = conversations.find((c) => c.id === activeConversationId);
   const currentMode = activeConversation?.mode === 'agent' ? 'agent' : 'chat';
+  const activeChatQueue = useConversationStore((s) => (
+    activeConversationId ? s.chatQueueByConversation?.[activeConversationId] : undefined
+  ));
+  const effectiveContextStrategyLabel = useMemo(() => {
+    switch (effectiveContextStrategy) {
+      case 'smart_summary': return t('settings.contextStrategySmartSummary');
+      case 'raw_strict': return t('settings.contextStrategyRawStrict');
+      case 'raw_truncate': return t('settings.contextStrategyRawTruncate');
+    }
+  }, [effectiveContextStrategy, t]);
+  const handleContextStrategyChange = useCallback(async (strategy: ContextStrategy) => {
+    if (!activeConversationId) return;
+    try {
+      await updateConversation(activeConversationId, {
+        context_strategy_override: strategy,
+        context_compression: strategy === 'smart_summary',
+      });
+    } catch (error) {
+      console.error('Failed to update context strategy:', error);
+      messageApi.error(t('chat.contextStrategyUpdateFailed'));
+    }
+  }, [activeConversationId, messageApi, t, updateConversation]);
 
   const setActivePage = useUIStore((s) => s.setActivePage);
+  const enterSettings = useUIStore((s) => s.enterSettings);
   const setSettingsSection = useUIStore((s) => s.setSettingsSection);
+  const setSelectedProviderId = useUIStore((s) => s.setSelectedProviderId);
 
-  // Load search providers on mount
+  // Empty arrays are valid loaded resources; Activity resumes must not refetch.
   useEffect(() => {
-    if (searchProviders.length === 0) loadSearchProviders();
-  }, [searchProviders.length, loadSearchProviders]);
+    void ensureSearchProvidersLoaded();
+  }, [ensureSearchProvidersLoaded]);
 
-  // Load MCP servers on mount
   useEffect(() => {
-    if (mcpServers.length === 0) loadMcpServers();
-  }, [mcpServers.length, loadMcpServers]);
+    void ensureMcpServersLoaded();
+  }, [ensureMcpServersLoaded]);
 
-  // Load knowledge bases on mount
   useEffect(() => {
-    if (knowledgeBases.length === 0) loadKnowledgeBases();
-  }, [knowledgeBases.length, loadKnowledgeBases]);
+    void ensureKnowledgeBasesLoaded();
+  }, [ensureKnowledgeBasesLoaded]);
 
-  // Load memory namespaces on mount
   useEffect(() => {
-    if (memoryNamespaces.length === 0) loadMemoryNamespaces();
-  }, [memoryNamespaces.length, loadMemoryNamespaces]);
+    void ensureMemoryNamespacesLoaded();
+  }, [ensureMemoryNamespacesLoaded]);
 
   // Fetch agent permission mode on mount/conversation switch
   useEffect(() => {
@@ -267,54 +366,53 @@ export function InputArea() {
     }
   }, [currentMode, activeConversationId]);
 
-  // Draft persistence: save old draft & restore new when conversation changes
-  useEffect(() => {
-    const prev = prevConvIdRef.current;
-    if (prev && prev !== activeConversationId) {
-      const draft = valueRef.current;
-      if (draft) _draftCache.set(prev, draft);
-      else _draftCache.delete(prev);
-    }
-    setValue(activeConversationId ? _draftCache.get(activeConversationId) || '' : '');
-    prevConvIdRef.current = activeConversationId ?? null;
-  }, [activeConversationId]);
-
-  // Save draft on unmount (navigating away from chat page)
-  useEffect(() => {
-    return () => {
-      const convId = prevConvIdRef.current;
-      if (convId && valueRef.current) {
-        _draftCache.set(convId, valueRef.current);
-      }
-    };
-  }, []);
-
-  // Persist companion models per conversation in localStorage
-  const companionStorageKey = activeConversationId ? `aqbot:companion-models:${activeConversationId}` : null;
-
-  // Load companion models when conversation changes
-  useEffect(() => {
-    if (!companionStorageKey) { setCompanionModels([]); return; }
-    try {
-      const saved = localStorage.getItem(companionStorageKey);
-      setCompanionModels(saved ? JSON.parse(saved) : []);
-    } catch { setCompanionModels([]); }
-  }, [companionStorageKey]);
-
-  // Pick up pending prompt text from welcome cards and send through the proper pipeline
+  // Pick up pending prompt text from welcome cards and send through the same composer pipeline.
   const pendingPromptText = useConversationStore((s) => s.pendingPromptText);
   useEffect(() => {
     if (!pendingPromptText) return;
     useConversationStore.getState().setPendingPromptText(null);
     const text = pendingPromptText;
+    const restorePendingPrompt = () => {
+      updateDraftValue((current) => current ? `${current}\n${text}` : text);
+    };
     (async () => {
       try {
-        if (companionModels.length > 0) {
-          await sendMultiModelMessage(text, companionModels, undefined, searchEnabled ? searchProviderId : null);
+        const latestTargets = useConversationStore.getState().multiModelTargets;
+        const latestHistoryMode = useConversationStore.getState().multiModelContinuationMode;
+        if (streaming && (currentMode === 'agent' || latestTargets.length > 0)) {
+          restorePendingPrompt();
+          messageApi.warning(t('chat.inputQueue.unsupported'));
+        } else if (currentMode === 'agent') {
+          await sendAgentMessage(text);
+        } else if (latestTargets.length > 0) {
+          await sendMultiModelMessage({
+            content: text,
+            targetModels: latestTargets,
+            historyMode: latestHistoryMode,
+            searchProviderId: searchEnabled ? searchProviderId : null,
+          });
         } else {
-          await sendMessage(text, undefined, searchEnabled ? searchProviderId : null);
+          const result = await submitChatMessage(
+            text,
+            undefined,
+            searchEnabled ? searchProviderId : null,
+          );
+          if (result.kind === 'rejected') {
+            restorePendingPrompt();
+            let warning = t('common.failed');
+            if (result.reason === 'unsupported-mode') {
+              warning = t('chat.inputQueue.unsupported');
+            } else if (
+              result.reason === 'conversation-loading'
+              || result.reason === 'other-conversation-busy'
+            ) {
+              warning = t('chat.inputQueue.otherConversationBusy');
+            }
+            messageApi.warning(warning);
+          }
         }
       } catch (e) {
+        restorePendingPrompt();
         console.error('[InputArea] pendingPromptText send error:', e);
         messageApi.error(String(e));
       }
@@ -464,13 +562,13 @@ export function InputArea() {
       const isFullAccess = mode === 'full_access';
       modal.confirm({
         title: isFullAccess
-          ? t('agent.permissionFullAccessWarningTitle', '⚠️ 完全访问模式')
-          : t('agent.permissionAcceptEditsWarningTitle', '⚠️ 允许编辑模式'),
+          ? t('agent.permissionFullAccessWarningTitle')
+          : t('agent.permissionAcceptEditsWarningTitle'),
         content: isFullAccess
-          ? t('agent.permissionFullAccessWarning', 'Agent 将拥有完全访问权限，可以执行任何文件操作且不受路径限制。请确保你信任当前使用的模型和 System Prompt。')
-          : t('agent.permissionAcceptEditsWarning', 'Agent 将自动批准文件编辑操作，无需逐一确认。请确保你了解潜在的安全风险。'),
-        okText: t('common.confirm', '确认'),
-        cancelText: t('common.cancel', '取消'),
+          ? t('agent.permissionFullAccessChatWarning')
+          : t('agent.permissionAcceptEditsWarning'),
+        okText: t('common.confirm'),
+        cancelText: t('common.cancel'),
         okButtonProps: isFullAccess ? { danger: true } : undefined,
         onOk: applyChange,
       });
@@ -487,7 +585,7 @@ export function InputArea() {
     }
   }, [agentPermissionMode]);
 
-  const clearConversationDisabled = !activeConversationId || streaming || messages.length === 0;
+  const clearConversationDisabled = !activeConversationId || loading || streaming || messages.length === 0;
 
   const confirmClearAllMessages = useCallback(() => {
     if (clearConversationDisabled) return;
@@ -677,7 +775,12 @@ export function InputArea() {
     }
 
     if (settings.default_provider_id && settings.default_model_id) {
-      const defaultModel = findModelByIds(providers, settings.default_provider_id, settings.default_model_id);
+      const defaultProvider = providers.find((provider) => (
+        provider.id === settings.default_provider_id && provider.enabled
+      ));
+      const defaultModel = defaultProvider?.models.find((model) => (
+        model.model_id === settings.default_model_id
+      ));
       if (defaultModel?.enabled) return defaultModel;
     }
 
@@ -694,6 +797,10 @@ export function InputArea() {
     const providerId = currentModel?.provider_id ?? activeConversation?.provider_id;
     return providers.find((provider) => provider.id === providerId)?.provider_type;
   }, [activeConversation?.provider_id, currentModel?.provider_id, providers]);
+  const currentProviderId = currentModel?.provider_id
+    ?? activeConversation?.provider_id
+    ?? settings.default_provider_id
+    ?? null;
 
   const reasoningProfile = useMemo(
     () => resolveReasoningProfile(currentProviderType, currentModel),
@@ -703,7 +810,7 @@ export function InputArea() {
   const thinkingOptions = useMemo(
     () => reasoningProfile.options.map((option) => ({
       ...option,
-      label: t(option.labelKey, option.fallbackLabel),
+      label: t(option.labelKey),
     })),
     [reasoningProfile, t],
   );
@@ -720,34 +827,16 @@ export function InputArea() {
     [selectedThinkingKey, thinkingOptions],
   );
 
-  const thinkingIcon = useMemo(() => {
-    switch (selectedThinkingOption.icon) {
-      case 'off': return <CircleOff size={14} />;
-      case 'low': return <SignalLow size={14} />;
-      case 'medium': return <SignalMedium size={14} />;
-      case 'high': return <SignalHigh size={14} />;
-      case 'xhigh': return <Signal size={14} />;
-      case 'max': return <Signal size={14} />;
-      default: return <Atom size={14} />;
-    }
-  }, [selectedThinkingOption.icon]);
+  const thinkingIcon = useMemo(
+    () => thinkingOptionIcon(selectedThinkingOption.icon),
+    [selectedThinkingOption.icon],
+  );
 
   const thinkingMenuItems = useMemo<MenuProps['items']>(
     () => thinkingOptions.map((opt) => ({
       key: opt.key,
       label: opt.label,
-      icon: (() => {
-        switch (opt.icon) {
-          case 'off': return <CircleOff size={14} />;
-          case 'default': return <Atom size={14} />;
-          case 'low': return <SignalLow size={14} />;
-          case 'medium': return <SignalMedium size={14} />;
-          case 'high': return <SignalHigh size={14} />;
-          case 'xhigh': return <Signal size={14} />;
-          case 'max': return <Signal size={14} />;
-          default: return <Atom size={14} />;
-        }
-      })(),
+      icon: thinkingOptionIcon(opt.icon),
     })),
     [thinkingOptions],
   );
@@ -765,15 +854,26 @@ export function InputArea() {
 
   // Context token usage calculation
   const getContextUsage = useConversationStore((s) => s.getContextUsage);
+  const requestOpenCompressionSummary = useConversationStore((s) => s.requestOpenCompressionSummary);
   const [serverContextUsage, setServerContextUsage] = useState<{
     usedTokens: number;
-    maxTokens: number;
-    percent: number;
+    maxTokens: number | null;
+    percent: number | null;
+    hasSummary: boolean;
+    messagesAfterBoundary: number;
+    effectiveStrategy: ContextStrategy;
+    rawTokens: number;
+    sentTokens: number;
+    excludedMessageCount: number;
+    exclusionReason: string | null;
+    overflow: boolean;
   } | null>(null);
+  const lastExclusionNoticeRef = useRef<string | null>(null);
   const contextUsageRevision = `${messages.length}:${messages[messages.length - 1]?.id ?? ''}:${messages[messages.length - 1]?.status ?? ''}`;
 
   useEffect(() => {
     setServerContextUsage(null);
+    lastExclusionNoticeRef.current = null;
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -795,14 +895,31 @@ export function InputArea() {
         getContextUsage(activeConversationId).then((usage) => {
           perfTraceDuration('chat.contextUsage', startedAt, { conversationId: activeConversationId });
           if (cancelled) return;
-          if (!usage?.max_tokens) {
+          if (!usage) {
             setServerContextUsage(null);
             return;
           }
+          const sentTokens = usage.sent_tokens ?? usage.used_tokens;
+          const inputBudget = usage.threshold_tokens ?? usage.context_window;
+          const maxTokens = inputBudget !== null && inputBudget !== undefined && inputBudget >= 0
+            ? inputBudget
+            : null;
           setServerContextUsage({
-            usedTokens: usage.used_tokens,
-            maxTokens: usage.max_tokens,
-            percent: Math.min(Math.round((usage.used_tokens / usage.max_tokens) * 100), 100),
+            usedTokens: sentTokens,
+            maxTokens,
+            percent: maxTokens !== null
+              ? maxTokens === 0
+                ? sentTokens > 0 ? 100 : 0
+                : Math.min(Math.round((sentTokens / maxTokens) * 100), 100)
+              : null,
+            hasSummary: usage.has_summary,
+            messagesAfterBoundary: usage.messages_after_boundary,
+            effectiveStrategy: usage.effective_strategy ?? effectiveContextStrategy,
+            rawTokens: usage.raw_tokens ?? usage.used_tokens,
+            sentTokens: usage.sent_tokens ?? usage.used_tokens,
+            excludedMessageCount: usage.excluded_message_count ?? 0,
+            exclusionReason: usage.exclusion_reason ?? null,
+            overflow: usage.overflow ?? false,
           });
         });
       };
@@ -821,20 +938,56 @@ export function InputArea() {
         win.cancelIdleCallback(idleId);
       }
     };
-  }, [activeConversationId, contextUsageRevision, getContextUsage, loading, streaming]);
+  }, [
+    activeConversationId,
+    contextUsageRevision,
+    effectiveContextStrategy,
+    getContextUsage,
+    loading,
+    streaming,
+  ]);
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+    if (
+      !serverContextUsage?.excludedMessageCount
+      || !shouldNotifyContextExclusion(serverContextUsage.exclusionReason)
+    ) {
+      lastExclusionNoticeRef.current = null;
+      return;
+    }
+    const noticeKey = [
+      activeConversationId,
+      serverContextUsage.exclusionReason ?? '',
+    ].join(':');
+    if (lastExclusionNoticeRef.current === noticeKey) return;
+    lastExclusionNoticeRef.current = noticeKey;
+    messageApi.warning(t('chat.contextMessagesExcludedWarning', {
+      count: serverContextUsage.excludedMessageCount,
+    }));
+  }, [
+    activeConversationId,
+    messageApi,
+    serverContextUsage?.excludedMessageCount,
+    serverContextUsage?.exclusionReason,
+    t,
+  ]);
 
   // Fallback only: local estimation sees loaded messages, so it can undercount
   // paginated conversations when the backend usage query is unavailable.
   const contextTokenUsage = useMemo(() => {
     if (serverContextUsage) return serverContextUsage;
 
-    const maxTokens = currentModel?.max_tokens;
+    const maxTokens = currentModel?.context_window;
     if (!maxTokens) return null;
 
     // Count message tokens (only after last marker)
     const activeMessages = messages.filter((m) => m.is_active !== false && !m.content.startsWith('%%ERROR%%'));
     const lastMarkerIdx = activeMessages.reduce((maxIdx, m, i) => {
-      if (m.content === '<!-- context-clear -->' || m.content === '<!-- context-compressed -->') return i;
+      if (
+        m.content === '<!-- context-clear -->'
+        || (effectiveContextStrategy === 'smart_summary' && m.content === '<!-- context-compressed -->')
+      ) return i;
       return maxIdx;
     }, -1);
     const effectiveMessages = lastMarkerIdx === -1 ? activeMessages : activeMessages.slice(lastMarkerIdx + 1);
@@ -848,66 +1001,215 @@ export function InputArea() {
     }
 
     const percent = Math.min(Math.round((usedTokens / maxTokens) * 100), 100);
-    return { usedTokens, maxTokens, percent };
-  }, [messages, currentModel?.max_tokens, activeConversation?.system_prompt, serverContextUsage]);
+    return {
+      usedTokens,
+      maxTokens,
+      percent,
+      hasSummary: lastMarkerIdx !== -1 && activeMessages[lastMarkerIdx]?.content === '<!-- context-compressed -->',
+      messagesAfterBoundary: effectiveMessages.length,
+      effectiveStrategy: effectiveContextStrategy,
+      rawTokens: usedTokens,
+      sentTokens: usedTokens,
+      excludedMessageCount: 0,
+      exclusionReason: null,
+      overflow: false,
+    };
+  }, [
+    messages,
+    currentModel?.context_window,
+    activeConversation?.system_prompt,
+    effectiveContextStrategy,
+    serverContextUsage,
+  ]);
 
-  const { hasRealtimeVoice, hasReasoning, hasVision } = React.useMemo(() => ({
+  const { hasRealtimeVoice, hasReasoning, hasVision, hasFunctionCalling } = React.useMemo(() => ({
     hasRealtimeVoice: activeConversation
       ? !!findModelByIds(providers, activeConversation.provider_id, activeConversation.model_id)?.capabilities.includes('RealtimeVoice')
       : false,
     hasReasoning: supportsReasoning(currentModel),
     hasVision: modelHasCapability(currentModel, 'Vision'),
+    hasFunctionCalling: supportsFunctionCalling(currentModel),
   }), [activeConversation, currentModel, providers]);
   const documentAttachmentReadingEnabled = settings.document_attachment_reading_enabled ?? false;
-  const canAttachFiles = hasVision || documentAttachmentReadingEnabled;
+  const acceptChatAttachment = useCallback(
+    (file: File) => isAllowedChatAttachmentFile(
+      file,
+      hasVision,
+      documentAttachmentReadingEnabled,
+    ),
+    [documentAttachmentReadingEnabled, hasVision],
+  );
+  const showImageInputConfigurationPrompt = useCallback(() => {
+    if (imageInputConfigurationPromptOpenRef.current) return;
+    if (!currentProviderId) {
+      messageApi.warning(t('chat.noModelsAvailable'));
+      return;
+    }
+    imageInputConfigurationPromptOpenRef.current = true;
+    modal.confirm({
+      title: t('chat.imageInputNotConfiguredTitle'),
+      content: t('chat.imageInputNotConfiguredContent'),
+      okText: t('chat.imageInputOpenProviderSettings'),
+      cancelText: t('common.cancel'),
+      afterClose: () => {
+        imageInputConfigurationPromptOpenRef.current = false;
+      },
+      onOk: () => {
+        enterSettings();
+        setSettingsSection('providers');
+        setSelectedProviderId(currentProviderId);
+      },
+    });
+  }, [
+    currentProviderId,
+    enterSettings,
+    messageApi,
+    modal,
+    setSelectedProviderId,
+    setSettingsSection,
+    t,
+  ]);
+
+  const handleRejectedAttachments = useCallback((files: File[]) => {
+    const hasRejectedImage = !hasVision && files.some(isImageAttachmentFile);
+    if (hasRejectedImage) {
+      showImageInputConfigurationPrompt();
+    }
+    if (files.some((file) => !isImageAttachmentFile(file))) {
+      messageApi.warning(t('chat.attachmentTypeUnsupported'));
+    }
+  }, [hasVision, messageApi, showImageInputConfigurationPrompt, t]);
+  const handleAttachmentReadError = useCallback((filePath: string, error: unknown) => {
+    console.error('[drag-drop] Failed to read file:', filePath, error);
+    const name = filePath.split(/[\\/]/).pop() || filePath || t('common.unknown');
+    messageApi.error(t('chat.attachmentReadFailed', { name }));
+  }, [messageApi, t]);
+  const {
+    attachments: attachedFiles,
+    attachmentsRef: attachedFilesRef,
+    fileInputRef,
+    isDragging,
+    removeAttachment,
+    detachAttachments,
+    detachAttachmentsById,
+    restoreAttachments,
+    openFilePicker: handleFileSelect,
+    handleFileChange,
+    handleClipboardFiles,
+    dragHandlers,
+  } = useComposerAttachments({
+    acceptFile: acceptChatAttachment,
+    onRejected: handleRejectedAttachments,
+    onReadError: handleAttachmentReadError,
+  });
+
+  // Composer drafts follow the conversation within this WebView.
+  useEffect(() => {
+    const previousId = prevConvIdRef.current;
+    const nextId = activeConversationId ?? null;
+    if (previousId === nextId) return;
+    if (!previousId && nextId && creatingConversationTransferRef.current) {
+      creatingConversationTransferRef.current = false;
+      prevConvIdRef.current = nextId;
+      return;
+    }
+    creatingConversationTransferRef.current = false;
+    if (previousId) {
+      const draft = valueRef.current;
+      const acceptedCleanup = acceptedDraftCleanupRef.current.get(previousId);
+      const dropAcceptedDraft = acceptedCleanup?.draftValue === draft;
+      if (draft && !dropAcceptedDraft) _draftCache.set(previousId, draft);
+      else _draftCache.delete(previousId);
+      const detached = detachAttachments();
+      const acceptedAttachments = acceptedCleanup
+        ? detached.filter((attachment) => acceptedCleanup.attachmentIds.has(attachment.id))
+        : [];
+      const remainingAttachments = acceptedCleanup
+        ? detached.filter((attachment) => !acceptedCleanup.attachmentIds.has(attachment.id))
+        : detached;
+      revokeComposerAttachments(acceptedAttachments);
+      if (remainingAttachments.length > 0) {
+        attachmentDraftCacheRef.current.set(previousId, remainingAttachments);
+      }
+      else attachmentDraftCacheRef.current.delete(previousId);
+      const snippets = pastedSnippetsRef.current;
+      const remainingSnippets = dropAcceptedDraft && acceptedCleanup
+        ? snippets.filter((snippet) => !acceptedCleanup.snippetIds.has(snippet.id))
+        : snippets;
+      if (remainingSnippets.length > 0) {
+        snippetDraftCacheRef.current.set(previousId, {
+          snippets: remainingSnippets,
+          sequence: pastedSnippetSeqRef.current,
+        });
+      } else {
+        snippetDraftCacheRef.current.delete(previousId);
+      }
+      acceptedDraftCleanupRef.current.delete(previousId);
+    }
+    updateDraftValue(nextId ? _draftCache.get(nextId) || '' : '');
+    const nextAttachments = nextId
+      ? attachmentDraftCacheRef.current.get(nextId) ?? []
+      : [];
+    if (nextId) attachmentDraftCacheRef.current.delete(nextId);
+    restoreAttachments(nextAttachments);
+    const nextSnippetDraft = nextId ? snippetDraftCacheRef.current.get(nextId) : undefined;
+    if (nextId) snippetDraftCacheRef.current.delete(nextId);
+    setPastedSnippets(nextSnippetDraft?.snippets ?? []);
+    pastedSnippetSeqRef.current = nextSnippetDraft?.sequence ?? 0;
+    prevConvIdRef.current = nextId;
+  }, [activeConversationId, detachAttachments, restoreAttachments, updateDraftValue]);
+
+  useEffect(() => () => {
+    const conversationId = prevConvIdRef.current;
+    if (conversationId) {
+      if (valueRef.current) _draftCache.set(conversationId, valueRef.current);
+      else _draftCache.delete(conversationId);
+    }
+    for (const attachments of attachmentDraftCacheRef.current.values()) {
+      revokeComposerAttachments(attachments);
+    }
+    attachmentDraftCacheRef.current.clear();
+    snippetDraftCacheRef.current.clear();
+    acceptedDraftCleanupRef.current.clear();
+    revokeComposerAttachments(attachedFilesRef.current);
+  }, [attachedFilesRef]);
+
+  useEffect(() => {
+    const knownConversationIds = new Set([
+      ...conversations.map((conversation) => conversation.id),
+      ...archivedConversations.map((conversation) => conversation.id),
+    ]);
+    const cachedConversationIds = new Set([
+      ..._draftCache.keys(),
+      ...attachmentDraftCacheRef.current.keys(),
+      ...snippetDraftCacheRef.current.keys(),
+      ...acceptedDraftCleanupRef.current.keys(),
+    ]);
+    for (const conversationId of cachedConversationIds) {
+      if (knownConversationIds.has(conversationId)) continue;
+      const attachments = attachmentDraftCacheRef.current.get(conversationId) ?? [];
+      revokeComposerAttachments(attachments);
+      attachmentDraftCacheRef.current.delete(conversationId);
+      snippetDraftCacheRef.current.delete(conversationId);
+      acceptedDraftCleanupRef.current.delete(conversationId);
+      _draftCache.delete(conversationId);
+    }
+  }, [archivedConversations, conversations]);
+
   const fileInputAccept = [
-    hasVision ? 'image/*' : null,
+    'image/*',
     documentAttachmentReadingEnabled ? DOCUMENT_ATTACHMENT_ACCEPT : null,
   ].filter(Boolean).join(',');
 
   // Current model key for excluding from multi-select (no longer used - users can select any model)
 
-  const companionDisplayInfos = useMemo(() => {
-    return companionModels.map((cm) => {
-      const provider = providers.find((p) => p.id === cm.providerId);
-      const model = provider?.models.find((m) => m.model_id === cm.modelId);
-      return {
-        ...cm,
-        modelName: model?.name ?? cm.modelId,
-        providerName: provider?.name ?? '',
-      };
-    });
-  }, [companionModels, providers]);
-
   const handleMultiModelSelect = useCallback((models: Array<{ providerId: string; modelId: string }>) => {
-    setCompanionModels(models);
-    if (companionStorageKey) {
-      if (models.length > 0) {
-        localStorage.setItem(companionStorageKey, JSON.stringify(models));
-      } else {
-        localStorage.removeItem(companionStorageKey);
-      }
-    }
-  }, [companionStorageKey]);
-
-  const removeCompanionModel = useCallback((index: number) => {
-    setCompanionModels((prev) => {
-      const next = prev.filter((_, i) => i !== index);
-      if (companionStorageKey) {
-        if (next.length > 0) {
-          localStorage.setItem(companionStorageKey, JSON.stringify(next));
-        } else {
-          localStorage.removeItem(companionStorageKey);
-        }
-      }
-      return next;
-    });
-  }, [companionStorageKey]);
+    setMultiModelTargets(mergeMultiModelTargetSelection(companionModels, models));
+  }, [companionModels, setMultiModelTargets]);
 
   const clearAllCompanionModels = useCallback(() => {
-    setCompanionModels([]);
-    if (companionStorageKey) localStorage.removeItem(companionStorageKey);
-  }, [companionStorageKey]);
+    setMultiModelTargets([]);
+  }, [setMultiModelTargets]);
 
   const voiceConfig: RealtimeConfig = React.useMemo(
     () => ({
@@ -921,13 +1223,25 @@ export function InputArea() {
   const handleModeSwitch = useCallback(async (mode: 'chat' | 'agent') => {
     if (!activeConversation) return;
 
-    await updateConversation(activeConversation.id, { mode });
+    let nextMode: 'chat' | 'role' | 'agent';
+    try {
+      nextMode = mode === 'agent'
+        ? 'agent'
+        : resolveChatModeForConversation(activeConversation.id);
+    } catch (e) {
+      messageApi.error(
+        e instanceof ConversationRoleStorageError
+          ? t('chat.role.bindingReadFailed')
+          : String(e),
+      );
+      return;
+    }
+    await updateConversation(activeConversation.id, { mode: nextMode });
 
     if (mode === 'agent') {
       // Clear multi-model companion models — not applicable in agent mode
       if (companionModels.length > 0) {
-        setCompanionModels([]);
-        if (companionStorageKey) localStorage.removeItem(companionStorageKey);
+        setMultiModelTargets([]);
       }
       try {
         const session = await invoke<{ cwd: string | null }>('agent_update_session', {
@@ -949,16 +1263,51 @@ export function InputArea() {
         console.warn('Failed to init agent session:', e);
       }
     }
-  }, [activeConversation, updateConversation, companionModels, companionStorageKey]);
+  }, [activeConversation, updateConversation, companionModels, setMultiModelTargets, messageApi, t]);
 
   const handleSend = useCallback(async () => {
-    const trimmed = value.trim();
-    if (!trimmed) return;
+    const submitLockKey = activeConversationId ?? '__creating__';
+    if (loading || submitInFlightByConversationRef.current.has(submitLockKey)) return;
 
-    const submittedFiles = attachedFiles;
+    const submittedAttachments = attachedFiles;
+    const submittedSnippets = pastedSnippets;
+    const submittedDraftRevision = draftRevisionRef.current;
+    const mergedContent = mergePastedSnippetsIntoContent(value, submittedSnippets);
+    if (!mergedContent && submittedAttachments.length === 0) return;
 
+    const latestTargets = useConversationStore.getState().multiModelTargets;
+    const latestHistoryMode = useConversationStore.getState().multiModelContinuationMode;
+    if (streaming && (currentMode === 'agent' || latestTargets.length > 0)) {
+      messageApi.warning(t('chat.inputQueue.unsupported'));
+      return;
+    }
+
+    if (latestTargets.length > 0) {
+      const hasUnavailableTarget = latestTargets.some((target) => {
+        const provider = providers.find((item) => item.id === target.providerId);
+        const model = provider?.models.find((item) => (
+          item.model_id === target.modelId && item.enabled
+        ));
+        return !provider?.enabled || !model;
+      });
+      if (hasUnavailableTarget) {
+        messageApi.warning(t('chat.multiModel.unavailableModel'));
+        return;
+      }
+    }
+
+    // Attachment-only messages need a minimal content marker so downstream pipelines stay valid.
+    const finalContent = mergedContent || t('chat.attachmentOnlyMessage');
+    // Prefer human text for auto titles; fall back to snippet/file when the box is token-only.
+    const titleSeed = value.replace(/\[\[paste:#\d+\]\]/g, '').trim()
+      || submittedSnippets[0]?.content.slice(0, 80)
+      || submittedAttachments[0]?.file.name
+      || 'New chat';
+
+    submitInFlightByConversationRef.current.add(submitLockKey);
+    let targetConversationId = activeConversationId;
     try {
-      if (!activeConversationId) {
+      if (!targetConversationId) {
         let provider = settings.default_provider_id
           ? providers.find((p) => p.id === settings.default_provider_id && p.enabled)
           : undefined;
@@ -973,58 +1322,136 @@ export function InputArea() {
           messageApi.warning(t('chat.noModelsAvailable'));
           return;
         }
-        await createConversation(normalizeAutoConversationTitle(trimmed), model.model_id, provider.id);
+        creatingConversationTransferRef.current = true;
+        try {
+          const createdConversation = await createConversation(
+            normalizeAutoConversationTitle(titleSeed),
+            model.model_id,
+            provider.id,
+          );
+          targetConversationId = createdConversation.id;
+          prevConvIdRef.current = createdConversation.id;
+          creatingConversationTransferRef.current = false;
+        } catch (error) {
+          creatingConversationTransferRef.current = false;
+          throw error;
+        }
       }
 
       let attachments: AttachmentInput[] | undefined;
-      if (submittedFiles.length > 0) {
-        attachments = await Promise.all(submittedFiles.map(fileToAttachmentInput));
+      if (submittedAttachments.length > 0) {
+        attachments = await Promise.all(
+          submittedAttachments.map((item) => fileToAttachmentInput(item.file)),
+        );
       }
 
-      setValue('');
-      setAttachedFiles([]);
-      // Reset textarea height and drag state after clearing content
-      hasUserResizedRef.current = false;
-      setUserMinHeight(INITIAL_MIN_HEIGHT);
-      userMinHeightRef.current = INITIAL_MIN_HEIGHT;
-      requestAnimationFrame(() => {
-        if (textareaRef.current) {
-          textareaRef.current.style.height = 'auto';
+      const submittedAttachmentIds = new Set(
+        submittedAttachments.map((attachment) => attachment.id),
+      );
+      const submittedSnippetIds = new Set(submittedSnippets.map((snippet) => snippet.id));
+      let draftAccepted = false;
+      const acceptSubmittedDraft = () => {
+        if (draftAccepted) return;
+        draftAccepted = true;
+
+        const latestActiveConversationId = useConversationStore.getState().activeConversationId;
+        const composerOwnsTarget = prevConvIdRef.current === targetConversationId;
+        if (latestActiveConversationId === targetConversationId && composerOwnsTarget) {
+          const detached = detachAttachmentsById(submittedAttachmentIds);
+          revokeComposerAttachments(detached);
+        } else if (targetConversationId) {
+          const cleanup: AcceptedDraftCleanup = {
+            attachmentIds: submittedAttachmentIds,
+            draftValue: value,
+            snippetIds: submittedSnippetIds,
+          };
+          acceptedDraftCleanupRef.current.set(targetConversationId, cleanup);
+          if (!composerOwnsTarget) {
+            cleanupAcceptedCachedDraft(targetConversationId, cleanup);
+            acceptedDraftCleanupRef.current.delete(targetConversationId);
+          }
         }
-      });
+
+        const currentSnippetIds = new Set(pastedSnippetsRef.current.map((snippet) => snippet.id));
+        const currentDraftStillMatchesSubmission = valueRef.current === value
+          && currentSnippetIds.size === submittedSnippetIds.size
+          && [...submittedSnippetIds].every((snippetId) => currentSnippetIds.has(snippetId));
+        if (
+          latestActiveConversationId === targetConversationId
+          && composerOwnsTarget
+          && (
+            draftRevisionRef.current === submittedDraftRevision
+            || currentDraftStillMatchesSubmission
+          )
+        ) {
+          updateDraftValue('');
+          setPastedSnippets((current) => (
+            current.filter((snippet) => !submittedSnippetIds.has(snippet.id))
+          ));
+          pastedSnippetSeqRef.current = 0;
+          hasUserResizedRef.current = false;
+          setUserMinHeight(INITIAL_MIN_HEIGHT);
+          userMinHeightRef.current = INITIAL_MIN_HEIGHT;
+          requestAnimationFrame(() => {
+            if (textareaRef.current) {
+              textareaRef.current.style.height = 'auto';
+            }
+          });
+        }
+      };
+
       if (currentMode === 'agent') {
-        await sendAgentMessage(trimmed, attachments);
-      } else if (companionModels.length > 0) {
-        await sendMultiModelMessage(trimmed, companionModels, attachments, searchEnabled ? searchProviderId : null);
+        await sendAgentMessage(finalContent, attachments, { conversationId: targetConversationId });
+        acceptSubmittedDraft();
+      } else if (latestTargets.length > 0) {
+        await sendMultiModelMessage({
+          content: finalContent,
+          targetModels: latestTargets,
+          historyMode: latestHistoryMode,
+          attachments,
+          searchProviderId: searchEnabled ? searchProviderId : null,
+          conversationId: targetConversationId ?? undefined,
+          onAccepted: acceptSubmittedDraft,
+        });
       } else {
-        await sendMessage(trimmed, attachments, searchEnabled ? searchProviderId : null);
+        const result = await submitChatMessage(
+          finalContent,
+          attachments,
+          searchEnabled ? searchProviderId : null,
+          { conversationId: targetConversationId ?? undefined },
+        );
+        if (result.kind === 'rejected') {
+          let errorMessage = useConversationStore.getState().error || t('common.failed');
+          if (result.reason === 'unsupported-mode') {
+            errorMessage = t('chat.inputQueue.unsupported');
+          } else if (
+            result.reason === 'conversation-loading'
+            || result.reason === 'other-conversation-busy'
+          ) {
+            errorMessage = t('chat.inputQueue.otherConversationBusy');
+          }
+          throw errorMessage;
+        }
+        acceptSubmittedDraft();
       }
     } catch (e) {
-      setValue((current) => current || trimmed);
-      setAttachedFiles((current) => (current.length > 0 ? current : submittedFiles));
       console.error('[handleSend] error:', e);
       messageApi.error(String(e));
-      // Re-expand textarea after restoring content
-      requestAnimationFrame(() => {
-        const textarea = textareaRef.current;
-        if (textarea) {
-          textarea.style.height = 'auto';
-          const desired = hasUserResizedRef.current
-            ? userMinHeightRef.current
-            : Math.max(textarea.scrollHeight, userMinHeightRef.current);
-          textarea.style.height = Math.min(desired, ABSOLUTE_MAX_HEIGHT) + 'px';
-        }
-      });
+    } finally {
+      submitInFlightByConversationRef.current.delete(submitLockKey);
+      if (targetConversationId) {
+        submitInFlightByConversationRef.current.delete(targetConversationId);
+      }
     }
-  }, [value, attachedFiles, sendMessage, sendAgentMessage, sendMultiModelMessage, companionModels, activeConversationId, providers, settings, createConversation, messageApi, t, searchEnabled, searchProviderId, currentMode]);
+  }, [value, attachedFiles, pastedSnippets, submitChatMessage, sendAgentMessage, sendMultiModelMessage, companionModels, multiModelHistoryMode, activeConversationId, providers, settings, createConversation, loading, messageApi, t, searchEnabled, searchProviderId, cleanupAcceptedCachedDraft, currentMode, detachAttachmentsById, streaming, updateDraftValue]);
 
   const handleFillLastMessage = useCallback(() => {
-    if (streaming) return;
+    if (loading || streaming) return;
     const lastUserMessage = [...messages]
       .reverse()
       .find((message) => message.role === 'user' && message.status !== 'error');
     if (!lastUserMessage?.content) return;
-    setValue(lastUserMessage.content);
+    updateDraftValue(lastUserMessage.content);
     hasUserResizedRef.current = false;
     requestAnimationFrame(() => {
       const textarea = textareaRef.current;
@@ -1034,132 +1461,78 @@ export function InputArea() {
       const desired = Math.max(textarea.scrollHeight, userMinHeightRef.current);
       textarea.style.height = Math.min(desired, ABSOLUTE_MAX_HEIGHT) + 'px';
     });
-  }, [messages, streaming]);
+  }, [loading, messages, streaming, updateDraftValue]);
 
   const handleCancel = useCallback(() => {
-    cancelCurrentStream();
+    void cancelCurrentStream();
   }, [cancelCurrentStream]);
 
-  const handleFileSelect = useCallback(() => {
-    fileInputRef.current?.click();
+  const resizeTextareaToContent = useCallback(() => {
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      textarea.style.height = 'auto';
+      const desired = hasUserResizedRef.current
+        ? userMinHeightRef.current
+        : Math.max(textarea.scrollHeight, userMinHeightRef.current);
+      textarea.style.height = Math.min(desired, ABSOLUTE_MAX_HEIGHT) + 'px';
+    });
   }, []);
 
-  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files) {
-      const allowedFiles = Array.from(files).filter((file) =>
-        isAllowedAttachmentFile(
-          file.name,
-          file.type,
-          hasVision,
-          documentAttachmentReadingEnabled,
-        ),
-      );
-      setAttachedFiles((prev) => [...prev, ...allowedFiles]);
-    }
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-    }
-  }, [documentAttachmentReadingEnabled, hasVision]);
-
-  const removeFile = useCallback((index: number) => {
-    setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
-  }, []);
+  const removeSnippet = useCallback((id: string) => {
+    setPastedSnippets((prev) => {
+      const target = prev.find((s) => s.id === id);
+      if (!target) return prev;
+      updateDraftValue((current) => removePasteTokens(current, target.index));
+      resizeTextareaToContent();
+      return prev.filter((s) => s.id !== id);
+    });
+  }, [resizeTextareaToContent, updateDraftValue]);
 
   const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    if (!canAttachFiles) return;
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const files: File[] = [];
-    for (const item of items) {
-      if (item.kind === 'file') {
-        const file = item.getAsFile();
-        if (
-          file &&
-          isAllowedAttachmentFile(
-            file.name,
-            file.type,
-            hasVision,
-            documentAttachmentReadingEnabled,
-          )
-        ) {
-          files.push(file);
-        }
-      }
-    }
-    if (files.length > 0) {
+    if (handleClipboardFiles(e)) return;
+
+    // Long plain-text paste → compact snippet + inline reference token at caret.
+    const text = e.clipboardData?.getData('text/plain');
+    if (text && isLongPastedText(text)) {
       e.preventDefault();
-      setAttachedFiles((prev) => [...prev, ...files]);
-    }
-  }, [canAttachFiles, documentAttachmentReadingEnabled, hasVision]);
+      pastedSnippetSeqRef.current += 1;
+      const index = pastedSnippetSeqRef.current;
+      const snippet = createPastedSnippet(text, index);
+      setPastedSnippets((prev) => [...prev, snippet]);
 
-  // Drag-and-drop overlay (Tauri native)
-  const [isDragging, setIsDragging] = useState(false);
-
-  useEffect(() => {
-    if (!canAttachFiles) return;
-
-    let unlisten: (() => void) | undefined;
-
-    (async () => {
-      const { getCurrentWebview } = await import('@tauri-apps/api/webview');
-      const { readFile } = await import('@tauri-apps/plugin-fs');
-
-      unlisten = await getCurrentWebview().onDragDropEvent(async (event) => {
-        const { type } = event.payload;
-        if (type === 'enter') {
-          setIsDragging(true);
-        } else if (type === 'leave') {
-          setIsDragging(false);
-        } else if (type === 'drop') {
-          setIsDragging(false);
-          const { paths } = event.payload;
-          const files: File[] = [];
-          for (const filePath of paths) {
-            try {
-              const fileName = filePath.split(/[\\/]/).pop() || 'file';
-              const ext = fileName.split('.').pop()?.toLowerCase() || '';
-              const mimeMap: Record<string, string> = {
-                png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-                gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-                bmp: 'image/bmp', ico: 'image/x-icon',
-                pdf: 'application/pdf',
-                doc: 'application/msword',
-                docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                txt: 'text/plain',
-                json: 'application/json', csv: 'text/csv',
-                md: 'text/markdown', html: 'text/html',
-                js: 'text/javascript', ts: 'text/typescript',
-                zip: 'application/zip',
-              };
-              const mimeType = mimeMap[ext] || 'application/octet-stream';
-              if (
-                !isAllowedAttachmentFile(
-                  fileName,
-                  mimeType,
-                  hasVision,
-                  documentAttachmentReadingEnabled,
-                )
-              ) {
-                continue;
-              }
-              const bytes = await readFile(filePath);
-              files.push(new File([bytes], fileName, { type: mimeType }));
-            } catch (err) {
-              console.error('[drag-drop] Failed to read file:', filePath, err);
-            }
-          }
-          if (files.length > 0) {
-            setAttachedFiles((prev) => [...prev, ...files]);
-          }
-        }
+      const textarea = e.currentTarget;
+      const currentValue = textarea.value;
+      const start = textarea.selectionStart ?? currentValue.length;
+      const end = textarea.selectionEnd ?? start;
+      const { value: nextValue, caret } = insertPasteTokenAtSelection(currentValue, start, end, index);
+      updateDraftValue(nextValue);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(caret, caret);
+        el.style.height = 'auto';
+        const desired = hasUserResizedRef.current
+          ? userMinHeightRef.current
+          : Math.max(el.scrollHeight, userMinHeightRef.current);
+        el.style.height = Math.min(desired, ABSOLUTE_MAX_HEIGHT) + 'px';
       });
-    })();
+    }
+  }, [handleClipboardFiles, updateDraftValue]);
 
-    return () => {
-      unlisten?.();
-    };
-  }, [canAttachFiles, documentAttachmentReadingEnabled, hasVision]);
+  usePageSuspendCleanup(() => {
+    setVoiceCallVisible(false);
+    setSettingsOpen(false);
+    setMcpPopoverOpen(false);
+    setSearchDropdownOpen(false);
+    setMultiModelOpen(false);
+    setThinkingDropdownOpen(false);
+    setKbPopoverOpen(false);
+    setMemoryPopoverOpen(false);
+    resizeCleanupRef.current();
+  });
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1187,13 +1560,14 @@ export function InputArea() {
   }, []);
 
   const handleInput = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setValue(e.target.value);
+    updateDraftValue(e.target.value);
     autoResizeTextarea(e.target);
-  }, [autoResizeTextarea]);
+  }, [autoResizeTextarea, updateDraftValue]);
 
   // Drag-to-resize: changes userMinHeight so the textarea grows even with short content
   const handleResizeMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
+    resizeCleanupRef.current();
     const textarea = textareaRef.current;
     const startHeight = textarea ? textarea.offsetHeight : userMinHeightRef.current;
     dragStateRef.current = { startY: e.clientY, startH: startHeight };
@@ -1208,15 +1582,17 @@ export function InputArea() {
         textarea.style.height = newH + 'px';
       }
     };
-    const onMouseUp = () => {
+    const cleanupResize = () => {
       dragStateRef.current = null;
       document.removeEventListener('mousemove', onMouseMove);
-      document.removeEventListener('mouseup', onMouseUp);
+      document.removeEventListener('mouseup', cleanupResize);
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
+      resizeCleanupRef.current = () => {};
     };
+    resizeCleanupRef.current = cleanupResize;
     document.addEventListener('mousemove', onMouseMove);
-    document.addEventListener('mouseup', onMouseUp);
+    document.addEventListener('mouseup', cleanupResize);
     document.body.style.cursor = 'ns-resize';
     document.body.style.userSelect = 'none';
   }, []);
@@ -1231,12 +1607,12 @@ export function InputArea() {
   React.useEffect(() => {
     const onFillLast = () => handleFillLastMessage();
     const onClearContext = () => {
-      if (activeConversationId && !streaming) {
+      if (activeConversationId && !loading && !streaming) {
         void insertContextClear();
       }
     };
     const onClearConversation = () => {
-      if (!activeConversationId || streaming || messages.length === 0) return;
+      if (!activeConversationId || loading || streaming || messages.length === 0) return;
       confirmClearAllMessages();
     };
 
@@ -1253,6 +1629,7 @@ export function InputArea() {
     confirmClearAllMessages,
     handleFillLastMessage,
     insertContextClear,
+    loading,
     messages.length,
     streaming,
   ]);
@@ -1262,7 +1639,7 @@ export function InputArea() {
     const onFillInput = (e: Event) => {
       const text = (e as CustomEvent).detail;
       if (typeof text !== 'string' || !text) return;
-      setValue((prev) => (prev ? prev + '\n' + text : text));
+      updateDraftValue((prev) => (prev ? prev + '\n' + text : text));
       requestAnimationFrame(() => {
         const textarea = textareaRef.current;
         if (!textarea) return;
@@ -1276,20 +1653,28 @@ export function InputArea() {
     };
     window.addEventListener('aqbot:fill-input', onFillInput);
     return () => window.removeEventListener('aqbot:fill-input', onFillInput);
-  }, []);
+  }, [updateDraftValue]);
 
   // Listen for mode toggle shortcut
   React.useEffect(() => {
     const onToggleMode = () => {
-      const nextMode = currentMode === 'chat' ? 'agent' : 'chat';
+      const nextMode = currentMode === 'agent' ? 'chat' : 'agent';
       handleModeSwitch(nextMode);
     };
     window.addEventListener('aqbot:toggle-mode', onToggleMode);
     return () => window.removeEventListener('aqbot:toggle-mode', onToggleMode);
   }, [currentMode, handleModeSwitch]);
 
+  const canSend =
+    !loading &&
+    (value.trim().length > 0 || attachedFiles.length > 0 || pastedSnippets.length > 0);
+  const canQueueDuringStream = currentMode === 'chat' && companionModels.length === 0;
+
   return (
-    <div className="px-4 pb-3 pt-1">
+    <div
+      className="px-4 pb-3 pt-1"
+      {...dragHandlers}
+    >
       <input
         ref={fileInputRef}
         type="file"
@@ -1299,29 +1684,12 @@ export function InputArea() {
         onChange={handleFileChange}
       />
 
-      {/* Attachment preview */}
-      {attachedFiles.length > 0 && (
-        <div className="flex flex-wrap gap-2 mb-2">
-          {attachedFiles.map((file, idx) => (
-            <span
-              key={`${file.name}-${idx}`}
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs"
-              style={{
-                backgroundColor: token.colorFillTertiary,
-                borderRadius: token.borderRadius,
-              }}
-            >
-              {file.name}
-              <Trash2
-                size={14}
-                className="cursor-pointer"
-                style={{ color: token.colorTextSecondary }}
-                onClick={() => removeFile(idx)}
-              />
-            </span>
-          ))}
-        </div>
-      )}
+      <AttachmentChips
+        attachments={attachedFiles}
+        snippets={pastedSnippets}
+        onRemoveAttachment={removeAttachment}
+        onRemoveSnippet={removeSnippet}
+      />
 
       {/* Main input container */}
       <div
@@ -1347,55 +1715,42 @@ export function InputArea() {
         >
           <GripHorizontal size={14} style={{ color: token.colorTextQuaternary, opacity: 0.5 }} />
         </div>
-        {/* Companion model tags */}
         {currentMode !== 'agent' && companionModels.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-3 pt-3 pb-1">
-            <span
-              className="inline-flex items-center px-2 py-0.5 text-xs"
-              style={{ color: token.colorTextTertiary }}
-            >
-              {t('chat.multiModel.selectTitle')}:
-            </span>
-            {companionDisplayInfos.map((cm, idx) => (
-              <span
-                key={`${cm.providerId}-${cm.modelId}`}
-                className="inline-flex items-center gap-1.5 pl-1.5 pr-1 py-0.5 text-xs"
-                style={{
-                  backgroundColor: token.colorFillSecondary,
-                  borderRadius: token.borderRadiusSM,
-                  color: token.colorText,
-                }}
-              >
-                <ModelIcon model={cm.modelId} size={14} type="avatar" />
-                <span style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {cm.modelName}
-                </span>
-                {cm.providerName && (
-                  <span style={{ color: token.colorTextQuaternary, fontSize: 11 }}>
-                    {cm.providerName}
-                  </span>
-                )}
-                <X
-                  size={12}
-                  className="cursor-pointer flex-shrink-0"
-                  style={{ color: token.colorTextTertiary }}
-                  onClick={() => removeCompanionModel(idx)}
-                />
-              </span>
-            ))}
-            {/* Clear all companion models */}
-            <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs cursor-pointer"
-              style={{
-                borderRadius: token.borderRadiusSM,
-                color: token.colorTextTertiary,
-              }}
-              onClick={clearAllCompanionModels}
-            >
-              <Trash2 size={11} />
-              {t('chat.clearAll')}
-            </span>
-          </div>
+          <CompanionModelTags
+            targets={companionModels}
+            providers={providers}
+            unifiedThinkingLevel={thinkingLevel}
+            unifiedThinkingBudget={thinkingBudget}
+            executionMode={settings.multi_model_execution_mode}
+            sequentialIntervalSeconds={settings.multi_model_sequential_interval_seconds}
+            historyMode={multiModelHistoryMode}
+            multiModelRun={multiModelRun}
+            onTargetsChange={setMultiModelTargets}
+            onHistoryModeChange={setMultiModelHistoryMode}
+            onClearAll={clearAllCompanionModels}
+          />
+        )}
+
+        {currentMode === 'chat'
+          && companionModels.length === 0
+          && activeConversationId
+          && activeChatQueue
+          && activeChatQueue.messages.length > 0 && (
+          <MessageQueueTray
+            messages={activeChatQueue.messages}
+            paused={activeChatQueue.phase === 'paused'}
+            error={activeChatQueue.error}
+            sendingNowId={activeChatQueue.sendNowMessageId}
+            onEdit={(messageId, patch) => {
+              updateQueuedChatMessage(activeConversationId, messageId, patch);
+            }}
+            onSendNow={async (messageId) => {
+              await sendQueuedChatMessageNow(activeConversationId, messageId);
+            }}
+            onDelete={(messageId) => {
+              removeQueuedChatMessage(activeConversationId, messageId);
+            }}
+          />
         )}
 
         {/* Textarea */}
@@ -1426,8 +1781,12 @@ export function InputArea() {
         />
 
         {/* Bottom action bar */}
-        <div className="flex items-center justify-between px-2 pb-2">
-          <div className="flex items-center gap-0.5">
+        <div className="flex flex-wrap items-center justify-between gap-1 px-2 pb-2">
+          <div
+            data-testid="input-actions-primary"
+            className="flex flex-wrap items-center gap-0.5"
+            style={{ zoom: inputActionsScale }}
+          >
             {searchEnabled ? (
               <Tooltip title={t('chat.search.title')}>
                 <Button
@@ -1491,32 +1850,88 @@ export function InputArea() {
                 </Tooltip>
               </Dropdown>
             )}
-            {canAttachFiles && (
-              <Tooltip title={t('chat.attachFile')}>
-                <Button
-                  aria-label={t('chat.attachFile')}
-                  type="text"
-                  size="small"
-                  icon={<Paperclip size={14} />}
-                  onClick={handleFileSelect}
-                />
-              </Tooltip>
-            )}
+            <Tooltip title={t('chat.attachFile')}>
+              <Button
+                aria-label={t('chat.attachFile')}
+                type="text"
+                size="small"
+                icon={<Paperclip size={14} />}
+                onClick={handleFileSelect}
+              />
+            </Tooltip>
+            <RoleSwitcherPopover />
+            {currentMode === 'agent' && <SkillPickerPopover />}
             <Popover
               trigger="click"
               placement="topLeft"
-              content={mcpPopoverContent}
+              content={(
+                <div>
+                  {mcpPopoverContent}
+                  {currentMode !== 'agent' && (
+                    <div
+                      data-testid="mcp-terminal-hint"
+                      style={{
+                        borderTop: `1px solid ${token.colorBorderSecondary}`,
+                        marginTop: 8,
+                        paddingTop: 8,
+                      }}
+                    >
+                      <div style={{ fontSize: 12, color: token.colorTextSecondary, marginBottom: 4 }}>
+                        {t('chat.mcp.terminalHint')}
+                      </div>
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0, fontSize: 12 }}
+                        aria-label={t('chat.mcp.switchToAgent')}
+                        onClick={() => {
+                          setMcpPopoverOpen(false);
+                          void handleModeSwitch('agent');
+                        }}
+                      >
+                        {t('chat.mcp.switchToAgent')}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              )}
               arrow={false}
-              open={mcpPopoverOpen}
-              onOpenChange={setMcpPopoverOpen}
+              open={hasFunctionCalling ? mcpPopoverOpen : false}
+              onOpenChange={(open) => {
+                if (!hasFunctionCalling) return;
+                setMcpPopoverOpen(open);
+              }}
             >
-              <Tooltip title={t('chat.mcp.title')} open={mcpPopoverOpen ? false : undefined}>
-                <Badge count={enabledMcpServerIds.filter((id) => mcpServers.some((s) => s.id === id && s.enabled)).length} size="small" offset={[-4, 4]} color={token.colorPrimary}>
+              <Tooltip
+                title={
+                  hasFunctionCalling
+                    ? t('chat.mcp.title')
+                    : t('chat.mcp.unsupported')
+                }
+                open={mcpPopoverOpen ? false : undefined}
+              >
+                <Badge
+                  count={
+                    hasFunctionCalling
+                      ? enabledMcpServerIds.filter((id) => mcpServers.some((s) => s.id === id && s.enabled)).length
+                      : 0
+                  }
+                  size="small"
+                  offset={[-4, 4]}
+                  color={token.colorPrimary}
+                >
                 <Button
                   type="text"
                   size="small"
                   icon={<Plug size={14} />}
-                  style={enabledMcpServerIds.some((id) => mcpServers.some((s) => s.id === id && s.enabled)) ? { color: token.colorPrimary } : undefined}
+                  aria-label={t('chat.mcp.title')}
+                  disabled={!hasFunctionCalling}
+                  style={
+                    hasFunctionCalling
+                    && enabledMcpServerIds.some((id) => mcpServers.some((s) => s.id === id && s.enabled))
+                      ? { color: token.colorPrimary }
+                      : undefined
+                  }
                 />
                 </Badge>
               </Tooltip>
@@ -1574,23 +1989,39 @@ export function InputArea() {
               menu={{
                 items: [
                   {
-                    key: 'auto',
-                    icon: activeConversation?.context_compression
-                      ? <ZapOff size={14} />
+                    key: 'smart_summary',
+                    icon: effectiveContextStrategy === 'smart_summary'
+                      ? <Check size={14} />
                       : <Zap size={14} />,
-                    label: activeConversation?.context_compression
-                      ? t('chat.disableAutoCompression')
-                      : t('chat.enableAutoCompression'),
-                    onClick: () => {
-                      if (!activeConversationId || !activeConversation) return;
-                      updateConversation(activeConversationId, { context_compression: !activeConversation.context_compression });
-                    },
+                    label: t('settings.contextStrategySmartSummary'),
+                    onClick: () => handleContextStrategyChange('smart_summary'),
+                  },
+                  {
+                    key: 'raw_truncate',
+                    icon: effectiveContextStrategy === 'raw_truncate'
+                      ? <Check size={14} />
+                      : <Shrink size={14} />,
+                    label: t('settings.contextStrategyRawTruncate'),
+                    onClick: () => handleContextStrategyChange('raw_truncate'),
+                  },
+                  {
+                    key: 'raw_strict',
+                    icon: effectiveContextStrategy === 'raw_strict'
+                      ? <Check size={14} />
+                      : <ShieldAlert size={14} />,
+                    label: t('settings.contextStrategyRawStrict'),
+                    onClick: () => handleContextStrategyChange('raw_strict'),
                   },
                   {
                     key: 'manual',
                     icon: <Shrink size={14} />,
                     label: t('chat.manualCompress'),
-                    disabled: !activeConversationId || streaming || compressing || messages.length === 0,
+                    disabled: effectiveContextStrategy !== 'smart_summary'
+                      || !activeConversationId
+                      || loading
+                      || streaming
+                      || compressing
+                      || messages.length === 0,
                     onClick: async () => {
                       if (!activeConversationId) return;
                       try {
@@ -1606,14 +2037,23 @@ export function InputArea() {
               trigger={['click']}
               placement="topLeft"
             >
-              <Tooltip title={t('chat.contextCompression')}>
+              <Tooltip title={t('chat.contextStrategyActive', { strategy: effectiveContextStrategyLabel })}>
                 <Button
+                  aria-label={t('chat.contextStrategyActive', { strategy: effectiveContextStrategyLabel })}
                   type="text"
                   size="small"
-                  icon={<Zap size={14} />}
+                  icon={effectiveContextStrategy === 'smart_summary'
+                    ? <Zap size={14} />
+                    : effectiveContextStrategy === 'raw_strict'
+                      ? <ShieldAlert size={14} />
+                      : <Shrink size={14} />}
                   loading={compressing}
-                  disabled={!activeConversationId}
-                  style={activeConversation?.context_compression ? { color: token.colorPrimary } : undefined}
+                  disabled={!activeConversationId || loading}
+                  style={effectiveContextStrategy === 'smart_summary'
+                    ? { color: token.colorPrimary }
+                    : effectiveContextStrategy === 'raw_strict'
+                      ? { color: token.colorWarning }
+                      : undefined}
                 />
               </Tooltip>
             </Dropdown>
@@ -1623,7 +2063,7 @@ export function InputArea() {
                 size="small"
                 icon={<Scissors size={14} />}
                 onClick={insertContextClear}
-                disabled={!activeConversationId || streaming || messages.length === 0 || messages[messages.length - 1]?.content === '<!-- context-clear -->'}
+                disabled={!activeConversationId || loading || streaming || messages.length === 0 || messages[messages.length - 1]?.content === '<!-- context-clear -->'}
               />
             </Tooltip>
             <Dropdown
@@ -1646,7 +2086,7 @@ export function InputArea() {
               <Button type="text" size="small" icon={<SlidersHorizontal size={14} />} onClick={() => setSettingsOpen(true)} />
             </Tooltip>
             {hasRealtimeVoice && (
-              <Tooltip title={t('voice.startCall') + '（暂未实现）'}>
+              <Tooltip title={`${t('voice.startCall')} (${t('common.comingSoon')})`}>
                 <Button
                   type="text"
                   size="small"
@@ -1656,23 +2096,61 @@ export function InputArea() {
               </Tooltip>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div
+            data-testid="input-actions-send"
+            className="flex items-center gap-2 ml-auto"
+            style={{ zoom: inputActionsScale }}
+          >
             {streaming ? (
-              <Button
-                shape="circle"
-                size="small"
-                danger
-                icon={<Square size={14} />}
-                onClick={handleCancel}
-              />
+              <>
+                {multiModelRun?.mode === 'sequential'
+                  && (multiModelRun.phase === 'running' || multiModelRun.phase === 'starting') && (
+                  <Tooltip title={t('chat.multiModel.skipCurrent')}>
+                    <Button
+                      shape="round"
+                      size="small"
+                      aria-label={t('chat.multiModel.skipCurrent')}
+                      onClick={() => { void skipCurrentMultiModelTarget(); }}
+                    >
+                      {t('chat.multiModel.skipCurrent')}
+                    </Button>
+                  </Tooltip>
+                )}
+                <Tooltip title={stopping ? t('chat.stopping') : (multiModelRun ? t('chat.multiModel.stopRun') : t('common.stop'))}>
+                  <Button
+                    shape="circle"
+                    size="small"
+                    danger
+                    loading={stopping}
+                    disabled={stopping}
+                    aria-label={stopping ? t('chat.stopping') : (multiModelRun ? t('chat.multiModel.stopRun') : t('common.stop'))}
+                    icon={<Square size={14} />}
+                    onClick={handleCancel}
+                  />
+                </Tooltip>
+                {canQueueDuringStream && (
+                <Tooltip title={t('chat.inputQueue.enqueue')}>
+                  <Button
+                    type="primary"
+                    shape="circle"
+                    size="small"
+                    icon={<ArrowUp size={14} />}
+                    aria-label={t('chat.inputQueue.enqueue')}
+                    onClick={handleSend}
+                    disabled={!canSend}
+                  />
+                </Tooltip>
+                )}
+              </>
             ) : (
               <Button
                 type="primary"
                 shape="circle"
                 size="small"
                 icon={<ArrowUp size={14} />}
+                aria-label={t('chat.sendMessage')}
                 onClick={handleSend}
-                disabled={!value.trim()}
+                disabled={!canSend}
               />
             )}
           </div>
@@ -1680,8 +2158,12 @@ export function InputArea() {
       </div>
 
       {/* Mode controls bar — below input container */}
-      <div className="flex items-center justify-between px-1 pt-1">
-        <div className="flex items-center gap-1">
+      <div className="flex flex-wrap items-center justify-between gap-y-1 px-1 pt-1">
+        <div
+          data-testid="input-actions-mode"
+          className="flex flex-wrap items-center gap-1"
+          style={{ zoom: inputActionsScale }}
+        >
           <Dropdown
             menu={{
               items: [
@@ -1693,7 +2175,17 @@ export function InputArea() {
                 {
                   key: 'agent',
                   icon: <Bot size={14} />,
-                  label: <>{t('common.agentMode')} <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', marginLeft: 2 }}>Beta</Tag></>,
+                  label: (
+                    <div>
+                      <div>
+                        {t('common.agentMode')}{' '}
+                        <Tag color="blue" style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', marginLeft: 2 }}>Beta</Tag>
+                      </div>
+                      <div style={{ fontSize: 11, color: token.colorTextSecondary }}>
+                        {t('common.agentModeCapabilities')}
+                      </div>
+                    </div>
+                  ),
                 },
               ],
               selectedKeys: [currentMode],
@@ -1726,7 +2218,7 @@ export function InputArea() {
             </Tooltip>
           )}
           {currentMode === 'agent' && agentCwd && (
-            <Tooltip title={t('common.openDirectory', '打开目录')}>
+            <Tooltip title={t('common.openDirectory')}>
               <Button
                 type="text"
                 size="small"
@@ -1744,7 +2236,11 @@ export function InputArea() {
             </Tooltip>
           )}
         </div>
-        <div className="flex items-center gap-2 ml-auto">
+        <div
+          data-testid="input-actions-status"
+          className="flex items-center gap-2 ml-auto"
+          style={{ zoom: inputActionsScale }}
+        >
           {currentMode === 'agent' && (
             <Dropdown
               menu={{
@@ -1774,24 +2270,142 @@ export function InputArea() {
             </span>
           )}
           {contextTokenUsage && (() => {
+            const usageStrategyLabel = contextTokenUsage.effectiveStrategy === 'smart_summary'
+              ? t('settings.contextStrategySmartSummary')
+              : contextTokenUsage.effectiveStrategy === 'raw_strict'
+                ? t('settings.contextStrategyRawStrict')
+                : t('settings.contextStrategyRawTruncate');
             const r = 8, stroke = 2.5, size = (r + stroke) * 2;
             const circ = 2 * Math.PI * r;
-            const offset = circ * (1 - contextTokenUsage.percent / 100);
-            const color = contextTokenUsage.percent > 80
+            const strictBudgetUnknown = contextTokenUsage.exclusionReason === 'context_budget_unknown'
+              && contextTokenUsage.effectiveStrategy === 'raw_strict';
+            const strictWindowUnknown = contextTokenUsage.effectiveStrategy === 'raw_strict'
+              && (
+                contextTokenUsage.exclusionReason === 'context_window_unknown'
+                || (
+                  contextTokenUsage.exclusionReason === null
+                  && contextTokenUsage.maxTokens === null
+                )
+              );
+            const visualPercent = contextTokenUsage.percent ?? 100;
+            const offset = circ * (1 - visualPercent / 100);
+            const color = strictWindowUnknown || contextTokenUsage.overflow
               ? token.colorError
-              : contextTokenUsage.percent > 60
+              : visualPercent > 60
                 ? token.colorWarning
                 : token.colorPrimary;
+            const exclusionReasonLabel = (() => {
+              switch (contextTokenUsage.exclusionReason) {
+                case 'smart_summary': return t('chat.contextExclusionReasonSmartSummary');
+                case 'input_budget': return t('chat.contextExclusionReasonInputBudget');
+                case 'input_budget_exceeded': return t('chat.contextExclusionReasonInputBudgetExceeded');
+                case 'message_limit': return t('chat.contextExclusionReasonMessageLimit');
+                case 'context_window_unknown': return t('chat.contextExclusionReasonContextWindowUnknown');
+                case 'context_budget_unknown': return t('chat.contextExclusionReasonContextBudgetUnknown');
+                case null: return null;
+                default: return t('chat.contextExclusionReasonOther');
+              }
+            })();
+            const canCompress = contextTokenUsage.effectiveStrategy === 'smart_summary'
+              && !!activeConversationId
+              && !loading
+              && !streaming
+              && !compressing
+              && messages.length > 0;
             return (
               <Popover
+                trigger="click"
                 content={
-                  <span style={{ fontSize: 12 }}>
-                    {contextTokenUsage.usedTokens.toLocaleString()} / {contextTokenUsage.maxTokens.toLocaleString()} tokens ({contextTokenUsage.percent}%)
-                  </span>
+                  <div style={{ minWidth: 240, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div style={{ fontSize: 12, color: token.colorTextSecondary }}>
+                      {contextTokenUsage.maxTokens !== null && contextTokenUsage.percent !== null
+                        ? `${contextTokenUsage.usedTokens.toLocaleString()} / ${contextTokenUsage.maxTokens.toLocaleString()} tokens (${contextTokenUsage.percent}%)`
+                        : strictBudgetUnknown
+                          ? t('chat.contextBudgetUnknownStrict')
+                          : strictWindowUnknown
+                            ? t('chat.contextWindowUnknownStrict')
+                            : t('chat.contextWindowUnknown')}
+                    </div>
+                    <div style={{ fontSize: 11, color: token.colorTextTertiary }}>
+                      {t('chat.contextStrategyLabel')}: {usageStrategyLabel}
+                    </div>
+                    {(contextTokenUsage.rawTokens !== contextTokenUsage.sentTokens
+                      || contextTokenUsage.excludedMessageCount > 0) && (
+                      <div style={{ fontSize: 11, color: token.colorTextTertiary }}>
+                        {t('chat.contextRawTokens')}: {contextTokenUsage.rawTokens.toLocaleString()}
+                        {' · '}
+                        {t('chat.contextSentTokens')}: {contextTokenUsage.sentTokens.toLocaleString()}
+                      </div>
+                    )}
+                    {contextTokenUsage.excludedMessageCount > 0 && (
+                      <div style={{ fontSize: 11, color: token.colorWarning }}>
+                        {t('chat.contextExcludedMessages', {
+                          count: contextTokenUsage.excludedMessageCount,
+                        })}
+                        {exclusionReasonLabel
+                          ? ` · ${t('chat.contextExclusionReason')}: ${exclusionReasonLabel}`
+                          : ''}
+                      </div>
+                    )}
+                    {strictBudgetUnknown ? (
+                      contextTokenUsage.maxTokens !== null && (
+                        <div style={{ fontSize: 11, color: token.colorError }}>
+                          {t('chat.contextBudgetUnknownStrict')}
+                        </div>
+                      )
+                    ) : contextTokenUsage.overflow && !strictWindowUnknown && (
+                      <div style={{ fontSize: 11, color: token.colorError }}>
+                        {t('chat.contextOverflow')}
+                      </div>
+                    )}
+                    {contextTokenUsage.hasSummary && (
+                      <div style={{ fontSize: 11, color: token.colorTextTertiary }}>
+                        {t('chat.hasSummary')}
+                        {' · '}
+                        {t('chat.messagesAfterBoundary', { count: contextTokenUsage.messagesAfterBoundary })}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <Button
+                        size="small"
+                        type="primary"
+                        loading={compressing}
+                        disabled={!canCompress}
+                        onClick={async () => {
+                          if (!activeConversationId) return;
+                          try {
+                            await compressContext();
+                            messageApi.success(t('chat.compressSuccess'));
+                          } catch {
+                            messageApi.error(t('chat.compressFailed'));
+                          }
+                        }}
+                      >
+                        {t('chat.compressNow')}
+                      </Button>
+                      <Button
+                        size="small"
+                        disabled={!contextTokenUsage.hasSummary}
+                        onClick={() => requestOpenCompressionSummary()}
+                      >
+                        {t('chat.viewCompressionSummary')}
+                      </Button>
+                      {(contextTokenUsage.overflow || strictWindowUnknown)
+                        && contextTokenUsage.effectiveStrategy === 'raw_strict' && (
+                          <Button
+                            size="small"
+                            danger
+                            onClick={() => insertContextClear()}
+                          >
+                            {t('chat.clearContextToContinue')}
+                          </Button>
+                        )}
+                    </div>
+                  </div>
                 }
               >
                 <svg
-                  aria-label={t('chat.contextTokenUsage', '上下文 tokens')}
+                  aria-label={t('chat.contextTokenUsage')}
                   width={size}
                   height={size}
                   style={{ display: 'block', cursor: 'pointer' }}
@@ -1833,6 +2447,7 @@ export function InputArea() {
             justifyContent: 'center',
             backgroundColor: 'rgba(0, 0, 0, 0.45)',
             backdropFilter: 'blur(4px)',
+            pointerEvents: 'none',
           }}
         >
           <div

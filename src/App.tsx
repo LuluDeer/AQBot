@@ -1,68 +1,103 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { lazy, Suspense, useEffect, useRef, useCallback, useDeferredValue, useState } from 'react';
 import { ConfigProvider, App as AntdApp, Layout, theme } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import { useTranslation } from 'react-i18next';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { TitleBar } from '@/components/layout/TitleBar';
 import { ContentArea } from '@/components/layout/ContentArea';
+import { ChatChromeContext } from '@/lib/chatChrome';
+import {
+  conversationIdFromPopoutLabel,
+  frontendKindForWindow,
+  getCurrentWindowLabel,
+} from '@/lib/windowKind';
 import CommandPalette from '@/components/layout/CommandPalette';
 import { GlobalCopyMenu } from '@/components/layout/GlobalCopyMenu';
+import { CrashRecoveryModal } from '@/components/layout/CrashRecoveryModal';
 import { useCommandPalette } from '@/hooks/useCommandPalette';
 import { useUIStore, useSettingsStore, useConversationStore } from '@/stores';
+import { useAppStartup } from '@/hooks/useAppStartup';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { useConversationTabsCoordinator } from '@/hooks/useConversationTabsCoordinator';
 import { useGlobalShortcutManager } from '@/hooks/useGlobalShortcutManager';
 import { useResolvedDarkMode } from '@/hooks/useResolvedDarkMode';
 import { useGlobalOverlayScrollbars } from '@/hooks/useGlobalOverlayScrollbars';
 import { useUpdateChecker } from '@/hooks/useUpdateChecker';
-import { useProviderDeepLink } from '@/hooks/useProviderDeepLink';
+import { useTrayMenuActions } from '@/hooks/useTrayMenuActions';
+import { ProviderDeepLinkDialog } from '@/hooks/useProviderDeepLink';
 import { useShadcnTheme } from '@/theme/shadcnTheme';
 import { isTauri, invoke, listen } from '@/lib/invoke';
+import { applyAppFonts } from '@/lib/applyAppFonts';
+import { cssFontStack, DEFAULT_CODE_FONT_FALLBACK, DEFAULT_UI_FONT_FALLBACK } from '@/lib/cssFontFamily';
 import { preloadChatRenderers } from '@/lib/preloadChatRenderers';
-import { enableD2, setDefaultI18nMap } from 'markstream-react';
+import { useSystemFontFaces } from '@/hooks/useSystemFontFaces';
+import { setupAgentEventListeners } from '@/stores/agentStore';
+import { enableD2 } from 'markstream-react';
+import { applyMarkstreamI18nMap } from '@/lib/markstreamI18n';
+import { closeStartupWindow, formatStartupError, presentStartupWindow, writeStartupDiagnostic } from '@/lib/startupDiagnostics';
 import './i18n';
 
 const { Sider, Content } = Layout;
 const { useToken } = theme;
-const DEFAULT_CHAT_FONT_FAMILY = 'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+const ConversationPopoutInner = lazy(async () => {
+  const module = await import('@/components/chat/ConversationPopoutInner');
+  return { default: module.ConversationPopoutInner };
+});
 
-/** Show the main window (it starts hidden to avoid white flash). */
-async function showWindow() {
-  try {
-    const { getCurrentWebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-    const window = getCurrentWebviewWindow();
-    await window.show();
-    await window.setFocus();
-  } catch (e) {
-    console.warn('Failed to show window:', e);
-  }
+export function runQuitFlow(
+  confirmOnQuit: boolean,
+  showConfirmation: () => void,
+  quit: () => void,
+) {
+  if (confirmOnQuit) showConfirmation();
+  else quit();
 }
 
 function AppInner() {
   const { token } = useToken();
   const { t } = useTranslation();
-  const { modal, message } = AntdApp.useApp();
+  const { modal } = AntdApp.useApp();
+  const appRootRef = useRef<HTMLDivElement>(null);
   const activePage = useUIStore((s) => s.activePage);
+  const settingsSection = useUIStore((s) => s.settingsSection);
+  const renderedActivePage = useDeferredValue(activePage);
   const { open: cmdOpen, setOpen: setCmdOpen } = useCommandPalette();
-  const isInSettings = activePage === 'settings';
-  useProviderDeepLink({ modal, message });
+  const isInSettings = renderedActivePage === 'settings';
+  const providersSettingsVisible = isInSettings && settingsSection === 'providers';
+  const confirmOnQuit = useSettingsStore((s) => s.settings.confirm_on_quit ?? true);
+  const windowLabel = getCurrentWindowLabel();
+  const frontendKind = frontendKindForWindow(windowLabel);
+  const popoutConversationId = conversationIdFromPopoutLabel(windowLabel);
+  const isConversationPopout = frontendKind === 'conversation-popout';
+  useKeyboardShortcuts();
+  useConversationTabsCoordinator(!isConversationPopout);
+  useTrayMenuActions();
+  useGlobalOverlayScrollbars(appRootRef);
+  useEffect(() => { void presentStartupWindow('app'); }, []);
 
   // Handle app close confirmation from backend
   const handleCloseRequested = useCallback(() => {
-    modal.confirm({
-      title: t('desktop.closeConfirmTitle'),
-      content: t('desktop.closeConfirmContent'),
-      okText: t('desktop.closeConfirmOk'),
-      cancelText: t('desktop.closeConfirmCancel'),
-      okButtonProps: { danger: true },
-      onOk: () => invoke('force_quit'),
-    });
-  }, [modal, t]);
+    runQuitFlow(
+      confirmOnQuit,
+      () => {
+        modal.confirm({
+          title: t('desktop.closeConfirmTitle'),
+          content: t('desktop.closeConfirmContent'),
+          okText: t('desktop.closeConfirmOk'),
+          cancelText: t('desktop.closeConfirmCancel'),
+          okButtonProps: { danger: true },
+          onOk: () => invoke('force_quit'),
+        });
+      },
+      () => { void invoke('force_quit'); },
+    );
+  }, [confirmOnQuit, modal, t]);
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || windowLabel !== 'main') return;
     const unlisten = listen('app-close-requested', handleCloseRequested);
     return () => { unlisten.then((fn) => fn()); };
-  }, [handleCloseRequested]);
+  }, [handleCloseRequested, windowLabel]);
 
   // Sync Ant Design tokens to CSS custom properties for global usage
   useEffect(() => {
@@ -88,34 +123,59 @@ function AppInner() {
     return () => stopStreamListening();
   }, [startStreamListening, stopStreamListening]);
 
-  // Auto-check for updates on startup and periodically
+  useEffect(() => setupAgentEventListeners(), []);
+
+  // Auto-check for updates on startup and periodically (gated by auto_check_update)
   const { checkForUpdate } = useUpdateChecker();
+  const autoCheckUpdate = useSettingsStore((s) => s.settings.auto_check_update ?? true);
   const updateCheckInterval = useSettingsStore((s) => s.settings.update_check_interval ?? 60);
   const updateIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || !autoCheckUpdate) return;
     // Initial check after 3s delay
     const timer = setTimeout(() => checkForUpdate({ silent: true }), 3000);
     return () => clearTimeout(timer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [autoCheckUpdate, checkForUpdate]);
 
   useEffect(() => {
-    if (!isTauri() || !updateCheckInterval) return;
+    if (!isTauri() || !autoCheckUpdate || !updateCheckInterval) return;
     if (updateIntervalRef.current) clearInterval(updateIntervalRef.current);
     const intervalMs = Math.max(updateCheckInterval, 1) * 60 * 1000;
     updateIntervalRef.current = setInterval(() => checkForUpdate({ silent: true }), intervalMs);
     return () => {
       if (updateIntervalRef.current) clearInterval(updateIntervalRef.current);
     };
-  }, [updateCheckInterval, checkForUpdate]);
+  }, [autoCheckUpdate, updateCheckInterval, checkForUpdate]);
 
   return (
-    <div className="flex flex-col h-screen" style={{ backgroundColor: token.colorBgContainer }}>
-      <TitleBar />
-      <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
+    <div
+      ref={appRootRef}
+      className="flex flex-col h-screen"
+      style={{ backgroundColor: token.colorBgContainer }}
+    >
+      <TitleBar variant={isConversationPopout ? 'popout' : 'main'} />
+      <ProviderDeepLinkDialog providersSettingsVisible={providersSettingsVisible} />
+      {!isConversationPopout && (
+        <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
+      )}
       <GlobalCopyMenu />
+      {!isConversationPopout && <CrashRecoveryModal />}
+      {isConversationPopout ? (
+        <ChatChromeContext.Provider value={{ kind: 'popout' }}>
+          <div className="flex-1 overflow-hidden min-h-0">
+            {popoutConversationId ? (
+              <Suspense fallback={null}>
+                <ConversationPopoutInner conversationId={popoutConversationId} />
+              </Suspense>
+            ) : (
+              <div className="flex h-full items-center justify-center">
+                {t('chat.multiModel.popoutMissingConversation')}
+              </div>
+            )}
+          </div>
+        </ChatChromeContext.Provider>
+      ) : (
       <Layout className="flex-1 overflow-hidden" style={{ backgroundColor: 'transparent' }}>
         {!isInSettings && (
           <Sider
@@ -129,146 +189,147 @@ function AppInner() {
           </Sider>
         )}
         <Content className="overflow-hidden">
-          <ContentArea activePage={activePage} />
+          <ContentArea activePage={renderedActivePage} />
         </Content>
       </Layout>
+      )}
+    </div>
+  );
+}
+
+function StartupScreen({ failed, error }: { failed: boolean; error: string | null }) {
+  const { t } = useTranslation();
+  const { token } = useToken();
+  useEffect(() => {
+    if (failed) void presentStartupWindow('error');
+  }, [failed]);
+  return (
+    <div className="flex h-screen flex-col" style={{ background: token.colorBgContainer, color: token.colorText }}>
+      <div data-tauri-drag-region className="flex h-9 shrink-0 items-center justify-end px-3">
+        <button type="button" onClick={() => { void closeStartupWindow(); }}>{t('common.close')}</button>
+      </div>
+      <div className="flex flex-1 flex-col items-center justify-center gap-4 p-8" role={failed ? 'alert' : 'status'}>
+        <p>{t(failed ? 'startup.settingsFailed' : 'startup.loading')}</p>
+        {failed && <>
+          <p>{t('startup.logInstructions')}</p>
+          <pre className="max-w-full whitespace-pre-wrap break-words">{error}</pre>
+        </>}
+      </div>
     </div>
   );
 }
 
 function AppRoot() {
   const { i18n } = useTranslation();
+  const settingsStatus = useSettingsStore((s) => s.settingsMeta.status);
+  const settingsError = useSettingsStore((s) => s.error);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  useEffect(() => {
+    if (settingsStatus === 'ready') setSettingsLoaded(true);
+  }, [settingsStatus]);
+  useEffect(() => {
+    if (!isTauri() || getCurrentWindowLabel() !== 'main' || settingsLoaded || settingsStatus === 'ready') return;
+    const unlisten = listen('app-close-requested', () => {
+      void invoke('force_quit').catch((error) => {
+        void writeStartupDiagnostic('error', `frontend startup close failed: ${formatStartupError(error)}`);
+      });
+    });
+    return () => { void unlisten.then((dispose) => dispose()); };
+  }, [settingsLoaded, settingsStatus]);
   const themeMode = useSettingsStore((s) => s.settings.theme_mode);
   const primaryColor = useSettingsStore((s) => s.settings.primary_color);
   const fontSize = useSettingsStore((s) => s.settings.font_size);
   const fontWeight = useSettingsStore((s) => s.settings.font_weight);
   const fontFamily = useSettingsStore((s) => s.settings.font_family);
+  const fontStyle = useSettingsStore((s) => s.settings.font_style);
   const codeFontFamily = useSettingsStore((s) => s.settings.code_font_family);
   const chatFontSize = useSettingsStore((s) => s.settings.chat_font_size);
   const chatLineHeight = useSettingsStore((s) => s.settings.chat_line_height);
   const chatFontFamily = useSettingsStore((s) => s.settings.chat_font_family);
   const chatFontWeight = useSettingsStore((s) => s.settings.chat_font_weight);
+  const chatFontStyle = useSettingsStore((s) => s.settings.chat_font_style);
+  const interfaceFontFaces = useSystemFontFaces(fontFamily);
+  const chatFontFaces = useSystemFontFaces(chatFontFamily);
   const borderRadius = useSettingsStore((s) => s.settings.border_radius);
   const language = useSettingsStore((s) => s.settings.language);
   const isDark = useResolvedDarkMode(themeMode);
+  const direction = i18n.dir(i18n.language);
 
   useEffect(() => {
     document.documentElement.dataset.theme = isDark ? 'dark' : 'light';
   }, [isDark]);
 
   useEffect(() => {
+    document.documentElement.dir = direction;
+  }, [direction]);
+
+  useEffect(() => {
     enableD2(() => import('@terrastruct/d2'));
     void preloadChatRenderers();
   }, []);
 
-  useKeyboardShortcuts();
+  useAppStartup();
   useGlobalShortcutManager();
-  useGlobalOverlayScrollbars();
-
-  // Load persisted settings from backend on startup, then apply native settings
-  useEffect(() => {
-    const init = async () => {
-      try {
-        await useSettingsStore.getState().fetchSettings();
-      } catch (e) {
-        console.warn('Failed to fetch settings:', e);
-      }
-
-      if (!isTauri()) return;
-      const settings = useSettingsStore.getState().settings;
-
-      // Apply native window settings
-      try {
-        await invoke('apply_startup_settings', {
-          alwaysOnTop: settings.always_on_top ?? false,
-          closeToTray: settings.minimize_to_tray ?? false,
-          releaseWebviewOnTray: settings.release_webview_on_tray ?? false,
-        });
-      } catch (e) {
-        console.warn('Failed to apply native settings:', e);
-      }
-
-      // Autostart
-      try {
-        const { enable, disable } = await import('@tauri-apps/plugin-autostart');
-        if (settings.auto_start) {
-          await enable();
-        } else {
-          await disable();
-        }
-      } catch (e) {
-        console.warn('Failed to set autostart:', e);
-      }
-
-      // Show window after initialization (window starts hidden to avoid white flash)
-      await showWindow();
-    };
-    init();
-  }, []);
 
   // Sync i18n language with settings store
   useEffect(() => {
-    if (i18n.language !== language) {
+    if (settingsStatus === 'ready' && i18n.language !== language) {
       i18n.changeLanguage(language);
     }
-  }, [i18n, language]);
+  }, [i18n, language, settingsStatus]);
 
   useEffect(() => {
-    const t = i18n.getFixedT(i18n.language);
-    setDefaultI18nMap({
-      'common.close': t('common.close'),
-      'common.collapse': t('common.collapse'),
-      'common.copied': t('common.copied'),
-      'common.copy': t('common.copy'),
-      'common.decrease': t('common.decrease'),
-      'common.expand': t('common.expand'),
-      'common.export': t('common.export'),
-      'common.increase': t('common.increase'),
-      'common.minimize': t('common.minimize'),
-      'common.open': t('common.open'),
-      'common.preview': t('common.preview'),
-      'common.reset': t('common.reset'),
-      'common.resetZoom': t('common.resetZoom'),
-      'common.source': t('common.source'),
-      'common.zoomIn': t('common.zoomIn'),
-      'common.zoomOut': t('common.zoomOut'),
-      'image.loadError': t('image.loadError'),
-      'image.loading': t('image.loading'),
-    });
+    applyMarkstreamI18nMap(i18n.getFixedT(i18n.language));
   }, [i18n, i18n.language]);
 
   // Sync font settings to CSS custom properties
   useEffect(() => {
-    const root = document.documentElement;
-    root.style.setProperty('--font-weight', String(fontWeight));
-    if (fontFamily) {
-      root.style.setProperty('--font-family', fontFamily);
-      document.body.style.fontFamily = fontFamily;
-    } else {
-      root.style.removeProperty('--font-family');
-      document.body.style.removeProperty('font-family');
-    }
-    if (codeFontFamily) {
-      root.style.setProperty('--code-font-family', codeFontFamily);
-    } else {
-      root.style.removeProperty('--code-font-family');
-    }
-    root.style.setProperty('--chat-font-size', `${chatFontSize ?? 15}px`);
-    root.style.setProperty('--chat-line-height', String(chatLineHeight ?? 1.7));
-    root.style.setProperty('--chat-font-family', chatFontFamily || DEFAULT_CHAT_FONT_FAMILY);
-    root.style.setProperty('--chat-font-weight', String(chatFontWeight ?? 400));
-  }, [fontWeight, fontFamily, codeFontFamily, chatFontSize, chatLineHeight, chatFontFamily, chatFontWeight]);
+    applyAppFonts({
+      fontFamily,
+      fontWeight,
+      fontStyle,
+      fontFaces: interfaceFontFaces,
+      codeFontFamily,
+      chatFontFamily,
+      chatFontWeight,
+      chatFontStyle,
+      chatFontFaces,
+      chatFontSize: chatFontSize ?? 15,
+      chatLineHeight: chatLineHeight ?? 1.7,
+    });
+  }, [
+    fontWeight,
+    fontFamily,
+    fontStyle,
+    interfaceFontFaces,
+    codeFontFamily,
+    chatFontSize,
+    chatLineHeight,
+    chatFontFamily,
+    chatFontWeight,
+    chatFontStyle,
+    chatFontFaces,
+  ]);
 
-  const themeConfig = useShadcnTheme(isDark, primaryColor, fontSize, borderRadius, fontFamily || undefined, codeFontFamily || undefined);
+  const themeConfig = useShadcnTheme(
+    isDark,
+    primaryColor,
+    fontSize,
+    borderRadius,
+    fontFamily ? cssFontStack(fontFamily, DEFAULT_UI_FONT_FALLBACK) : undefined,
+    codeFontFamily ? cssFontStack(codeFontFamily, DEFAULT_CODE_FONT_FALLBACK) : undefined,
+  );
 
   return (
     <ConfigProvider
       locale={i18n.language === 'zh-CN' ? zhCN : undefined}
+      direction={direction}
       theme={themeConfig}
       modal={{ centered: true, styles: { mask: { backdropFilter: 'blur(4px)' } } }}
     >
       <AntdApp>
-        <AppInner />
+        {settingsLoaded || settingsStatus === 'ready' ? <AppInner />
+          : <StartupScreen failed={settingsStatus === 'error'} error={settingsError} />}
       </AntdApp>
     </ConfigProvider>
   );

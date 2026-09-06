@@ -11,8 +11,8 @@ use crate::crypto::{decrypt_key, encrypt_key};
 use crate::error::{AQBotError, Result};
 use crate::repo::provider;
 use crate::types::{
-    CreateProviderInput, Model, ModelCapability, ModelParamOverrides, ModelType, ProviderConfig,
-    ProviderType,
+    infer_model_type_and_capabilities, CreateProviderInput, Model, ModelParamOverrides,
+    ProviderConfig, ProviderType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +164,7 @@ async fn import_candidate(
                     provider_type: candidate.provider_type.clone(),
                     api_host: candidate.api_host.clone(),
                     api_path: candidate.api_path.clone(),
+                    aws_region: None,
                     enabled: true,
                     builtin_id: None,
                 },
@@ -211,28 +212,25 @@ async fn merge_candidate_models(
         if existing_ids.contains(model_id) {
             continue;
         }
-        let model_type = ModelType::detect(model_id);
+        let (model_type, capabilities) = infer_model_type_and_capabilities(model_id, model_id);
         models.push(Model {
             provider_id: provider_config.id.clone(),
             model_id: model_id.clone(),
             name: model_id.clone(),
             group_name: None,
-            capabilities: default_capabilities(&model_type),
+            capabilities,
             model_type,
-            max_tokens: None,
+            context_window: None,
+            max_output_tokens: None,
             enabled: true,
             param_overrides: empty_param_overrides_for_import(&provider_config.provider_type),
+            image_config: None,
+            metadata_state: None,
+            aliases: Vec::new(),
         });
     }
 
     provider::save_models(db, &provider_config.id, &models).await
-}
-
-fn default_capabilities(model_type: &ModelType) -> Vec<ModelCapability> {
-    match model_type {
-        ModelType::Chat => vec![ModelCapability::TextChat],
-        _ => Vec::new(),
-    }
 }
 
 fn empty_param_overrides_for_import(provider_type: &ProviderType) -> Option<ModelParamOverrides> {
@@ -251,6 +249,7 @@ fn empty_param_overrides_for_import(provider_type: &ProviderType) -> Option<Mode
         frequency_penalty: None,
         use_max_completion_tokens: None,
         no_system_role: None,
+        omit_sampling_params: None,
         force_max_tokens: None,
         thinking_param_style: None,
         reasoning_profile: Some(profile),
@@ -287,7 +286,8 @@ async fn scan_raw_candidates_from_path(
         let raw = row_to_candidate(&row, endpoint_map.get(&row.id));
         let mut public = raw.public;
         if !raw.unsupported {
-            public.status = classify_candidate(aqbot_db, master_key, &public, raw.raw_key.as_deref()).await?;
+            public.status =
+                classify_candidate(aqbot_db, master_key, &public, raw.raw_key.as_deref()).await?;
         }
         if seen.insert(public.id.clone()) {
             candidates.push(RawProviderImportCandidate {
@@ -305,7 +305,9 @@ async fn connect_readonly_sqlite(path: &Path) -> Result<DatabaseConnection> {
     let url = format!("sqlite:{}?mode=ro", path.display());
     let mut options = ConnectOptions::new(url);
     options.max_connections(1).sqlx_logging(false);
-    Database::connect(options).await.map_err(AQBotError::Database)
+    Database::connect(options)
+        .await
+        .map_err(AQBotError::Database)
 }
 
 async fn table_exists(db: &DatabaseConnection, table: &str) -> Result<bool> {
@@ -363,8 +365,8 @@ async fn load_endpoint_map(db: &DatabaseConnection) -> Result<HashMap<String, St
         .await?;
     let mut map = HashMap::new();
     for row in rows {
-        let Some(provider_id) = get_string(&row, "provider_id")
-            .or_else(|| get_string(&row, "providerId"))
+        let Some(provider_id) =
+            get_string(&row, "provider_id").or_else(|| get_string(&row, "providerId"))
         else {
             continue;
         };
@@ -418,7 +420,10 @@ fn row_to_candidate(
     let models = find_models(&row.settings_config);
     let mut reason = None;
     let unsupported = if is_oauth_like(&row.settings_config, api_format) {
-        reason = Some("OAuth providers cannot be imported because no reusable API key is available".to_string());
+        reason = Some(
+            "OAuth providers cannot be imported because no reusable API key is available"
+                .to_string(),
+        );
         true
     } else if raw_key.as_deref().map(is_masked_key).unwrap_or(true) {
         reason = Some("No readable API key was found in this CC Switch provider".to_string());
@@ -517,7 +522,11 @@ async fn find_matching_provider(
 }
 
 fn normalize_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').trim_end_matches('!').to_string()
+    value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches('!')
+        .to_string()
 }
 
 fn normalize_api_path(value: Option<&str>) -> String {
@@ -529,7 +538,11 @@ fn normalize_api_path(value: Option<&str>) -> String {
         .to_string()
 }
 
-fn api_paths_match(provider_type: &ProviderType, existing: Option<&str>, candidate: Option<&str>) -> bool {
+fn api_paths_match(
+    provider_type: &ProviderType,
+    existing: Option<&str>,
+    candidate: Option<&str>,
+) -> bool {
     let existing = normalize_api_path(existing);
     let candidate = normalize_api_path(candidate);
     if existing == candidate {
@@ -821,6 +834,7 @@ fn provider_type_str(provider_type: &ProviderType) -> &'static str {
         ProviderType::Jina => "jina",
         ProviderType::Cohere => "cohere",
         ProviderType::Voyage => "voyage",
+        ProviderType::Bedrock => "bedrock",
         ProviderType::Custom => "custom",
     }
 }
@@ -858,9 +872,12 @@ mod tests {
             .await
             .unwrap();
         for statement in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            db.execute(Statement::from_string(DbBackend::Sqlite, statement.to_string()))
-                .await
-                .unwrap();
+            db.execute(Statement::from_string(
+                DbBackend::Sqlite,
+                statement.to_string(),
+            ))
+            .await
+            .unwrap();
         }
         (dir, path)
     }
@@ -1000,6 +1017,7 @@ mod tests {
                 provider_type: ProviderType::Custom,
                 api_host: "https://api.existing.example.com".into(),
                 api_path: Some("/v1/chat/completions".into()),
+                aws_region: None,
                 enabled: true,
                 builtin_id: None,
             },
@@ -1014,6 +1032,7 @@ mod tests {
                 provider_type: ProviderType::Custom,
                 api_host: "https://api.duplicate.example.com".into(),
                 api_path: Some("/v1/chat/completions".into()),
+                aws_region: None,
                 enabled: true,
                 builtin_id: None,
             },
@@ -1021,14 +1040,9 @@ mod tests {
         .await
         .unwrap();
         let encrypted_duplicate = encrypt_key("sk-duplicate", &master_key).unwrap();
-        add_provider_key(
-            db,
-            &duplicate.id,
-            &encrypted_duplicate,
-            "sk-dupli...",
-        )
-        .await
-        .unwrap();
+        add_provider_key(db, &duplicate.id, &encrypted_duplicate, "sk-dupli...")
+            .await
+            .unwrap();
 
         let candidates = scan_cc_switch_provider_imports_from_path(db, &master_key, &path)
             .await
@@ -1039,14 +1053,10 @@ mod tests {
             .map(|candidate| candidate.id.clone())
             .collect();
 
-        let result = import_cc_switch_provider_configs_from_path(
-            db,
-            &master_key,
-            &path,
-            selected_ids,
-        )
-        .await
-        .unwrap();
+        let result =
+            import_cc_switch_provider_configs_from_path(db, &master_key, &path, selected_ids)
+                .await
+                .unwrap();
 
         assert_eq!(result.created_count, 1);
         assert_eq!(result.added_key_count, 1);
@@ -1067,7 +1077,10 @@ mod tests {
             decrypt_key(&imported.keys[0].key_encrypted, &master_key).unwrap(),
             "sk-first"
         );
-        assert!(imported.models.iter().any(|model| model.model_id == "model-a"));
+        assert!(imported
+            .models
+            .iter()
+            .any(|model| model.model_id == "model-a"));
 
         let duplicate_after = get_provider(db, &duplicate.id).await.unwrap();
         assert_eq!(duplicate_after.keys.len(), 1);

@@ -9,11 +9,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{decrypt_key, encrypt_key};
-use crate::entity::{conversations, import_jobs, messages, models, provider_keys, providers, stored_files};
+use crate::entity::{
+    conversations, import_jobs, messages, models, provider_keys, providers, stored_files,
+};
 use crate::error::{AQBotError, Result};
 use crate::file_store::FileStore;
 use crate::repo::settings::get_settings;
-use crate::types::{Attachment, ModelCapability, ModelParamOverrides, ModelType, ProviderType};
+use crate::types::{
+    infer_model_type_and_capabilities, Attachment, ContextStrategy, ModelParamOverrides,
+    ProviderType,
+};
 use crate::utils::{gen_id, now_ts};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -136,11 +141,12 @@ struct KelivoProviderConfig {
     provider_type: Option<String>,
     #[serde(default)]
     use_response_api: Option<bool>,
-    #[serde(default)]
+    /// Real Kelivo backups may emit `null` for list/map fields; treat as empty.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     models: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     model_overrides: HashMap<String, Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     api_keys: Vec<KelivoApiKeyConfig>,
 }
 
@@ -151,6 +157,15 @@ struct KelivoApiKeyConfig {
     key: String,
     #[serde(default)]
     is_enabled: Option<bool>,
+}
+
+/// `#[serde(default)]` only covers missing fields; Kelivo often writes explicit `null`.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone)]
@@ -170,8 +185,22 @@ struct KelivoAttachmentRef {
 struct ParsedKelivoBackup {
     chats: KelivoChats,
     settings: Option<Value>,
-    zip_entries: HashSet<String>,
+    /// Relative file paths available in the backup (zip entry names or dir-relative paths).
+    file_entries: HashSet<String>,
     warnings: Vec<ThirdPartyImportWarning>,
+    source_kind: KelivoBackupKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KelivoBackupKind {
+    Zip,
+    Directory,
+}
+
+/// Abstraction over zip archives and extracted directory backups.
+enum KelivoFileSource {
+    Zip(zip::ZipArchive<File>),
+    Directory(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -239,216 +268,246 @@ pub async fn import_kelivo_backup_from_path_with_root(
         .unwrap_or_else(|| "unknown-model".to_string());
     let mut provider_map = HashMap::new();
     let file_store = FileStore::with_root(documents_root.to_path_buf());
-    let mut archive = open_kelivo_zip(path)?;
+    let mut file_source = open_kelivo_source(path, parsed.source_kind)?;
+    let _file_reference_guard = crate::repo::stored_file::lock_file_references().await;
     let txn = db.begin().await?;
-
-    if options.import_provider_keys {
-        for provider in kelivo_providers(parsed.settings.as_ref()) {
-            match import_provider(&txn, master_key, &provider).await {
-                Ok(Some(imported_id)) => {
-                    provider_map.insert(provider.source_id.clone(), imported_id);
-                    result.imported_provider_count += 1;
+    let mut created_paths = Vec::new();
+    let operation = async {
+        if options.import_provider_keys {
+            let (providers, provider_warnings) = kelivo_providers(parsed.settings.as_ref());
+            result.warnings.extend(provider_warnings);
+            for provider in providers {
+                match import_provider(&txn, master_key, &provider).await {
+                    Ok(Some(imported_id)) => {
+                        provider_map.insert(provider.source_id.clone(), imported_id);
+                        result.imported_provider_count += 1;
+                    }
+                    Ok(None) => {}
+                    Err(error) => result.warnings.push(warning(
+                        "provider_import_failed",
+                        format!(
+                            "Failed to import Kelivo provider {}: {error}",
+                            provider.source_id
+                        ),
+                        Some(provider.source_id.clone()),
+                    )),
                 }
-                Ok(None) => {}
-                Err(error) => result.warnings.push(warning(
-                    "provider_import_failed",
-                    format!("Failed to import Kelivo provider {}: {error}", provider.source_id),
-                    Some(provider.source_id.clone()),
-                )),
             }
         }
-    }
 
-    for conversation in &parsed.chats.conversations {
-        let selected_messages = selected.get(&conversation.id).cloned().unwrap_or_default();
-        let planned_messages = planned_messages_for_import(&selected_messages, &parsed.chats.tool_events);
-        if planned_messages.is_empty() {
-            continue;
-        }
-        if conversations::Entity::find_by_id(&conversation.id)
-            .one(&txn)
-            .await?
-            .is_some()
-        {
-            result.skipped_duplicate_conversation_count += 1;
-            continue;
-        }
-
-        let first_message = planned_messages.first().map(|plan| plan.message);
-        let provider_message = planned_messages
-            .iter()
-            .map(|plan| plan.message)
-            .find(|message| {
-                message
-                    .provider_id
-                    .as_deref()
-                    .is_some_and(|provider_id| provider_map.contains_key(provider_id))
-            });
-        let source_provider_id = provider_message.and_then(|message| message.provider_id.clone());
-        let imported_provider_id = source_provider_id
-            .as_ref()
-            .and_then(|source_id| provider_map.get(source_id))
-            .cloned();
-        let provider_id = imported_provider_id.unwrap_or_else(|| fallback_provider_id.clone());
-        let model_message = provider_message.or_else(|| {
-            planned_messages
-                .iter()
-                .map(|plan| plan.message)
-                .find(|message| {
-                    message
-                        .model_id
-                        .as_deref()
-                        .is_some_and(|model_id| !model_id.trim().is_empty())
-                })
-        });
-        let model_id = model_message
-            .and_then(|message| message.model_id.clone())
-            .filter(|model_id| !model_id.trim().is_empty())
-            .unwrap_or_else(|| fallback_model_id.clone());
-        let created_at = parse_kelivo_ts_opt(conversation.created_at.as_deref())
-            .or_else(|| first_message.and_then(|message| parse_kelivo_ts_opt(message.timestamp.as_deref())))
-            .unwrap_or_else(now_ts);
-        let updated_at = parse_kelivo_ts_opt(conversation.updated_at.as_deref()).unwrap_or_else(|| {
-            selected_messages
-                .iter()
-                .filter_map(|message| parse_kelivo_ts_opt(message.timestamp.as_deref()))
-                .max()
-                .unwrap_or(created_at)
-        });
-        let title = if conversation.title.trim().is_empty() {
-            "Kelivo Chat".to_string()
-        } else {
-            conversation.title.clone()
-        };
-
-        conversations::ActiveModel {
-            id: Set(conversation.id.clone()),
-            title: Set(title),
-            model_id: Set(model_id.clone()),
-            provider_id: Set(provider_id.clone()),
-            system_prompt: Set(None),
-            temperature: Set(None),
-            max_tokens: Set(None),
-            top_p: Set(None),
-            frequency_penalty: Set(None),
-            search_enabled: Set(0),
-            search_provider_id: Set(None),
-            thinking_budget: Set(None),
-            thinking_level: Set(None),
-            enabled_mcp_server_ids: Set("[]".to_string()),
-            enabled_knowledge_base_ids: Set("[]".to_string()),
-            enabled_memory_namespace_ids: Set("[]".to_string()),
-            message_count: Set(planned_messages.iter().filter(|plan| plan.is_active).count() as i32),
-            created_at: Set(created_at),
-            updated_at: Set(updated_at),
-            is_pinned: Set(if conversation.is_pinned { 1 } else { 0 }),
-            is_archived: Set(0),
-            workspace_snapshot_json: Set("{}".to_string()),
-            active_branch_id: Set(None),
-            active_artifact_id: Set(None),
-            research_mode: Set(0),
-            context_compression: Set(0),
-            category_id: Set(None),
-            parent_conversation_id: Set(None),
-            mode: Set("chat".to_string()),
-        }
-        .insert(&txn)
-        .await?;
-        result.imported_conversation_count += 1;
-
-        for plan in planned_messages {
-            let message = plan.message;
-            if messages::Entity::find_by_id(&message.id)
+        for conversation in &parsed.chats.conversations {
+            let selected_messages = selected.get(&conversation.id).cloned().unwrap_or_default();
+            let planned_messages =
+                planned_messages_for_import(&selected_messages, &parsed.chats.tool_events);
+            if planned_messages.is_empty() {
+                continue;
+            }
+            if conversations::Entity::find_by_id(&conversation.id)
                 .one(&txn)
                 .await?
                 .is_some()
             {
+                result.skipped_duplicate_conversation_count += 1;
                 continue;
             }
-            let materialized = materialize_message(
-                &txn,
-                &file_store,
-                &mut archive,
-                &parsed.zip_entries,
-                &parsed.chats.tool_events,
-                message,
-                &provider_map,
-                &provider_id,
-                &model_id,
-                &conversation.id,
-                &mut result,
-            )
-            .await?;
-            messages::ActiveModel {
-                id: Set(message.id.clone()),
-                conversation_id: Set(conversation.id.clone()),
-                role: Set(materialized.role),
-                content: Set(materialized.content),
-                provider_id: Set(Some(materialized.provider_id)),
-                model_id: Set(Some(materialized.model_id)),
-                token_count: Set(materialized.token_count),
-                prompt_tokens: Set(materialized.prompt_tokens),
-                completion_tokens: Set(materialized.completion_tokens),
-                attachments: Set(serde_json::to_string(&materialized.attachments).map_err(|e| {
-                    AQBotError::Validation(format!("Failed to serialize Kelivo attachments: {e}"))
-                })?),
-                thinking: Set(materialized.thinking),
-                created_at: Set(materialized.created_at),
-                branch_id: Set(None),
-                parent_message_id: Set(plan.parent_message_id),
-                version_index: Set(plan.version_index),
-                is_active: Set(if plan.is_active { 1 } else { 0 }),
-                tool_calls_json: Set(None),
-                tool_call_id: Set(None),
-                status: Set(materialized.status),
-                tokens_per_second: Set(materialized.tokens_per_second),
-                first_token_latency_ms: Set(None),
+
+            let first_message = planned_messages.first().map(|plan| plan.message);
+            let provider_message =
+                planned_messages
+                    .iter()
+                    .map(|plan| plan.message)
+                    .find(|message| {
+                        message
+                            .provider_id
+                            .as_deref()
+                            .is_some_and(|provider_id| provider_map.contains_key(provider_id))
+                    });
+            let source_provider_id =
+                provider_message.and_then(|message| message.provider_id.clone());
+            let imported_provider_id = source_provider_id
+                .as_ref()
+                .and_then(|source_id| provider_map.get(source_id))
+                .cloned();
+            let provider_id = imported_provider_id.unwrap_or_else(|| fallback_provider_id.clone());
+            let model_message = provider_message.or_else(|| {
+                planned_messages
+                    .iter()
+                    .map(|plan| plan.message)
+                    .find(|message| {
+                        message
+                            .model_id
+                            .as_deref()
+                            .is_some_and(|model_id| !model_id.trim().is_empty())
+                    })
+            });
+            let model_id = model_message
+                .and_then(|message| message.model_id.clone())
+                .filter(|model_id| !model_id.trim().is_empty())
+                .unwrap_or_else(|| fallback_model_id.clone());
+            let created_at = parse_kelivo_ts_opt(conversation.created_at.as_deref())
+                .or_else(|| {
+                    first_message
+                        .and_then(|message| parse_kelivo_ts_opt(message.timestamp.as_deref()))
+                })
+                .unwrap_or_else(now_ts);
+            let updated_at = parse_kelivo_ts_opt(conversation.updated_at.as_deref())
+                .unwrap_or_else(|| {
+                    selected_messages
+                        .iter()
+                        .filter_map(|message| parse_kelivo_ts_opt(message.timestamp.as_deref()))
+                        .max()
+                        .unwrap_or(created_at)
+                });
+            let title = if conversation.title.trim().is_empty() {
+                "Kelivo Chat".to_string()
+            } else {
+                conversation.title.clone()
+            };
+
+            conversations::ActiveModel {
+                id: Set(conversation.id.clone()),
+                title: Set(title),
+                model_id: Set(model_id.clone()),
+                provider_id: Set(provider_id.clone()),
+                system_prompt: Set(None),
+                temperature: Set(None),
+                max_tokens: Set(None),
+                top_p: Set(None),
+                frequency_penalty: Set(None),
+                search_enabled: Set(0),
+                search_provider_id: Set(None),
+                thinking_budget: Set(None),
+                thinking_level: Set(None),
+                enabled_mcp_server_ids: Set("[]".to_string()),
+                enabled_knowledge_base_ids: Set("[]".to_string()),
+                enabled_memory_namespace_ids: Set("[]".to_string()),
+                message_count: Set(planned_messages
+                    .iter()
+                    .filter(|plan| plan.is_active)
+                    .count() as i32),
+                created_at: Set(created_at),
+                updated_at: Set(updated_at),
+                is_pinned: Set(if conversation.is_pinned { 1 } else { 0 }),
+                is_archived: Set(0),
+                workspace_snapshot_json: Set("{}".to_string()),
+                active_branch_id: Set(None),
+                active_artifact_id: Set(None),
+                research_mode: Set(0),
+                context_compression: Set(0),
+                context_strategy_override: Set(Some(
+                    ContextStrategy::RawTruncate.as_str().to_string(),
+                )),
+                context_message_limit: Set(None),
+                compression_keep_last_n: Set(None),
+                multi_model_display_mode_override: Set(None),
+                multi_model_targets_json: Set("[]".to_string()),
+                multi_model_continuation_mode: Set("selected".to_string()),
+                category_id: Set(None),
+                parent_conversation_id: Set(None),
+                sort_order: Set(0),
+                mode: Set("chat".to_string()),
+                tab_pin_order: Set(None),
             }
             .insert(&txn)
             .await?;
-            result.imported_message_count += 1;
+            result.imported_conversation_count += 1;
+
+            for plan in planned_messages {
+                let message = plan.message;
+                if messages::Entity::find_by_id(&message.id)
+                    .one(&txn)
+                    .await?
+                    .is_some()
+                {
+                    continue;
+                }
+                let materialized = materialize_message(
+                    &txn,
+                    &file_store,
+                    &mut file_source,
+                    &parsed.file_entries,
+                    &parsed.chats.tool_events,
+                    message,
+                    &provider_map,
+                    &provider_id,
+                    &model_id,
+                    &conversation.id,
+                    &mut result,
+                    &mut created_paths,
+                )
+                .await?;
+                messages::ActiveModel {
+                    id: Set(message.id.clone()),
+                    conversation_id: Set(conversation.id.clone()),
+                    role: Set(materialized.role),
+                    content: Set(materialized.content),
+                    provider_id: Set(Some(materialized.provider_id)),
+                    model_id: Set(Some(materialized.model_id)),
+                    token_count: Set(materialized.token_count),
+                    prompt_tokens: Set(materialized.prompt_tokens),
+                    completion_tokens: Set(materialized.completion_tokens),
+                    attachments: Set(serde_json::to_string(&materialized.attachments).map_err(
+                        |e| {
+                            AQBotError::Validation(format!(
+                                "Failed to serialize Kelivo attachments: {e}"
+                            ))
+                        },
+                    )?),
+                    thinking: Set(materialized.thinking),
+                    created_at: Set(materialized.created_at),
+                    branch_id: Set(None),
+                    parent_message_id: Set(plan.parent_message_id),
+                    version_index: Set(plan.version_index),
+                    is_active: Set(if plan.is_active { 1 } else { 0 }),
+                    tool_calls_json: Set(None),
+                    tool_call_id: Set(None),
+                    status: Set(materialized.status),
+                    tokens_per_second: Set(materialized.tokens_per_second),
+                    first_token_latency_ms: Set(None),
+                }
+                .insert(&txn)
+                .await?;
+                result.imported_message_count += 1;
+            }
         }
-    }
 
-    import_jobs::ActiveModel {
-        id: Set(gen_id()),
-        source_type: Set("kelivo".to_string()),
-        status: Set("success".to_string()),
-        summary_json: Set(Some(serde_json::to_string(&result).unwrap_or_default())),
-        conflict_count: Set(result.skipped_duplicate_conversation_count as i32),
-        created_at: Set(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
-    }
-    .insert(&txn)
-    .await?;
+        import_jobs::ActiveModel {
+            id: Set(gen_id()),
+            source_type: Set("kelivo".to_string()),
+            status: Set("success".to_string()),
+            summary_json: Set(Some(serde_json::to_string(&result).unwrap_or_default())),
+            conflict_count: Set(result.skipped_duplicate_conversation_count as i32),
+            created_at: Set(chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+        }
+        .insert(&txn)
+        .await?;
 
-    txn.commit().await?;
+        Ok::<(), AQBotError>(())
+    }
+    .await;
+    if let Err(error) = operation {
+        let rollback_error = txn.rollback().await.err();
+        let cleanup_errors = cleanup_import_created_paths(db, &file_store, &created_paths).await;
+        return Err(import_failure(error, rollback_error, cleanup_errors));
+    }
+    if let Err(error) = txn.commit().await {
+        let cleanup_errors = cleanup_import_created_paths(db, &file_store, &created_paths).await;
+        return Err(import_failure(error.into(), None, cleanup_errors));
+    }
     Ok(result)
 }
 
 fn parse_kelivo_backup(path: &Path) -> Result<ParsedKelivoBackup> {
-    if !path
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-    {
-        return Err(AQBotError::Validation("Kelivo import requires a zip backup file".into()));
-    }
+    let source_kind = detect_kelivo_backup_kind(path)?;
+    let mut file_source = open_kelivo_source(path, source_kind)?;
+    let file_entries = file_source.list_entries()?;
 
-    let mut archive = open_kelivo_zip(path)?;
-    let mut zip_entries = HashSet::new();
-    for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|e| {
-            AQBotError::Validation(format!("Invalid Kelivo zip backup entry: {e}"))
-        })?;
-        zip_entries.insert(entry.name().replace('\\', "/"));
-    }
-
-    let chats_bytes = read_zip_entry(&mut archive, "chats.json")
+    let chats_bytes = file_source
+        .read_entry("chats.json")
         .map_err(|_| AQBotError::Validation("Kelivo backup is missing chats.json".into()))?;
-    let chats = serde_json::from_slice::<KelivoChats>(&chats_bytes).map_err(|e| {
-        AQBotError::Validation(format!("Invalid Kelivo chats.json: {e}"))
-    })?;
-    let settings = match read_zip_entry(&mut archive, "settings.json") {
+    let chats = serde_json::from_slice::<KelivoChats>(&chats_bytes)
+        .map_err(|e| AQBotError::Validation(format!("Invalid Kelivo chats.json: {e}")))?;
+    let settings = match file_source.read_entry("settings.json") {
         Ok(bytes) => Some(serde_json::from_slice::<Value>(&bytes).map_err(|e| {
             AQBotError::Validation(format!("Invalid Kelivo settings.json: {e}"))
         })?),
@@ -465,24 +524,126 @@ fn parse_kelivo_backup(path: &Path) -> Result<ParsedKelivoBackup> {
     Ok(ParsedKelivoBackup {
         chats,
         settings,
-        zip_entries,
+        file_entries,
         warnings,
+        source_kind,
     })
 }
 
-fn open_kelivo_zip(path: &Path) -> Result<zip::ZipArchive<File>> {
-    let file = File::open(path)?;
-    zip::ZipArchive::new(file)
-        .map_err(|e| AQBotError::Validation(format!("Invalid Kelivo zip backup: {e}")))
+fn detect_kelivo_backup_kind(path: &Path) -> Result<KelivoBackupKind> {
+    if path.is_dir() {
+        return Ok(KelivoBackupKind::Directory);
+    }
+    if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
+        return Ok(KelivoBackupKind::Zip);
+    }
+    Err(AQBotError::Validation(
+        "Kelivo import requires a zip backup or an extracted backup directory containing chats.json"
+            .into(),
+    ))
 }
 
-fn read_zip_entry(archive: &mut zip::ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
-    let mut entry = archive
-        .by_name(name)
-        .map_err(|_| AQBotError::Validation(format!("Kelivo backup is missing {name}")))?;
-    let mut data = Vec::new();
-    entry.read_to_end(&mut data)?;
-    Ok(data)
+fn open_kelivo_source(path: &Path, kind: KelivoBackupKind) -> Result<KelivoFileSource> {
+    match kind {
+        KelivoBackupKind::Zip => {
+            let file = File::open(path)?;
+            let archive = zip::ZipArchive::new(file)
+                .map_err(|e| AQBotError::Validation(format!("Invalid Kelivo zip backup: {e}")))?;
+            Ok(KelivoFileSource::Zip(archive))
+        }
+        KelivoBackupKind::Directory => Ok(KelivoFileSource::Directory(path.to_path_buf())),
+    }
+}
+
+impl KelivoFileSource {
+    fn list_entries(&mut self) -> Result<HashSet<String>> {
+        match self {
+            KelivoFileSource::Zip(archive) => {
+                let mut entries = HashSet::new();
+                for index in 0..archive.len() {
+                    let entry = archive.by_index(index).map_err(|e| {
+                        AQBotError::Validation(format!("Invalid Kelivo zip backup entry: {e}"))
+                    })?;
+                    let name = entry.name().replace('\\', "/");
+                    if !name.ends_with('/') {
+                        entries.insert(name);
+                    }
+                }
+                Ok(entries)
+            }
+            KelivoFileSource::Directory(root) => list_directory_entries(root),
+        }
+    }
+
+    fn read_entry(&mut self, name: &str) -> Result<Vec<u8>> {
+        let normalized = name.replace('\\', "/");
+        match self {
+            KelivoFileSource::Zip(archive) => {
+                let mut entry = archive.by_name(&normalized).map_err(|_| {
+                    AQBotError::Validation(format!("Kelivo backup is missing {normalized}"))
+                })?;
+                let mut data = Vec::new();
+                entry.read_to_end(&mut data)?;
+                Ok(data)
+            }
+            KelivoFileSource::Directory(root) => {
+                let path = root.join(&normalized);
+                if !path.is_file() {
+                    return Err(AQBotError::Validation(format!(
+                        "Kelivo backup is missing {normalized}"
+                    )));
+                }
+                std::fs::read(&path).map_err(|e| {
+                    AQBotError::Validation(format!("Failed to read Kelivo backup file {normalized}: {e}"))
+                })
+            }
+        }
+    }
+}
+
+fn list_directory_entries(root: &Path) -> Result<HashSet<String>> {
+    let mut entries = HashSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read_dir = std::fs::read_dir(&dir).map_err(|e| {
+            AQBotError::Validation(format!(
+                "Failed to read Kelivo backup directory {}: {e}",
+                dir.display()
+            ))
+        })?;
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
+                AQBotError::Validation(format!(
+                    "Failed to read Kelivo backup directory entry: {e}"
+                ))
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| {
+                    AQBotError::Validation(format!(
+                        "Failed to resolve Kelivo backup relative path: {e}"
+                    ))
+                })?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !relative.is_empty() {
+                entries.insert(relative);
+            }
+        }
+    }
+    Ok(entries)
 }
 
 async fn summarize_kelivo_backup(
@@ -494,17 +655,21 @@ async fn summarize_kelivo_backup(
         ..Default::default()
     };
     let selected = selected_messages_by_conversation(&parsed.chats, &mut summary.warnings);
-    append_attachment_warnings(&selected, &parsed.zip_entries, &mut summary.warnings);
+    append_attachment_warnings(&selected, &parsed.file_entries, &mut summary.warnings);
 
     for conversation in &parsed.chats.conversations {
         let selected_messages = selected.get(&conversation.id).cloned().unwrap_or_default();
-        let planned_messages = planned_messages_for_import(&selected_messages, &parsed.chats.tool_events);
+        let planned_messages =
+            planned_messages_for_import(&selected_messages, &parsed.chats.tool_events);
         if planned_messages.is_empty() {
             summary.skipped_empty_topic_count += 1;
             continue;
         }
         summary.conversation_count += 1;
-        summary.message_count += planned_messages.iter().filter(|plan| plan.is_active).count() as u32;
+        summary.message_count += planned_messages
+            .iter()
+            .filter(|plan| plan.is_active)
+            .count() as u32;
         let planned_message_refs = planned_messages
             .iter()
             .map(|plan| plan.message)
@@ -519,9 +684,12 @@ async fn summarize_kelivo_backup(
         }
     }
 
-    summary.importable_provider_count = kelivo_providers(parsed.settings.as_ref())
+    let (providers, provider_warnings) = kelivo_providers(parsed.settings.as_ref());
+    summary.warnings.extend(provider_warnings);
+    // Only count providers that have a usable API key; keyless shells are skipped on purpose.
+    summary.importable_provider_count = providers
         .into_iter()
-        .filter(|provider| !importable_keys(&provider.config).is_empty())
+        .filter(is_importable_provider)
         .count() as u32;
 
     Ok(summary)
@@ -583,7 +751,12 @@ fn selected_messages_by_conversation<'a>(
             let group_id = _group_id;
             let selected_version = conversation.version_selections.get(&group_id).copied();
             let mut picked = selected_version
-                .and_then(|version| versions.iter().find(|message| message.version == version).copied())
+                .and_then(|version| {
+                    versions
+                        .iter()
+                        .find(|message| message.version == version)
+                        .copied()
+                })
                 .unwrap_or_else(|| *versions.last().unwrap());
             if is_incomplete_streaming_message(picked, &chats.tool_events) {
                 if let Some(fallback) = versions
@@ -779,30 +952,98 @@ fn message_has_importable_payload(
             .is_some_and(|events| !events.is_empty())
 }
 
-fn kelivo_providers(settings: Option<&Value>) -> Vec<KelivoProvider> {
+fn kelivo_providers(settings: Option<&Value>) -> (Vec<KelivoProvider>, Vec<ThirdPartyImportWarning>) {
+    let mut warnings = Vec::new();
     let Some(settings) = settings else {
-        return Vec::new();
+        return (Vec::new(), warnings);
     };
     let Some(raw) = settings.get("provider_configs_v1") else {
-        return Vec::new();
+        return (Vec::new(), warnings);
     };
     let providers_value = match raw {
-        Value::String(text) => serde_json::from_str::<Value>(text).ok(),
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warnings.push(warning(
+                    "provider_configs_parse_failed",
+                    format!("Could not parse Kelivo provider_configs_v1: {error}"),
+                    None,
+                ));
+                None
+            }
+        },
         value => Some(value.clone()),
     };
     let Some(Value::Object(map)) = providers_value else {
-        return Vec::new();
+        if warnings.is_empty() {
+            warnings.push(warning(
+                "provider_configs_invalid",
+                "Kelivo provider_configs_v1 is missing or not an object.",
+                None,
+            ));
+        }
+        return (Vec::new(), warnings);
     };
-    map.into_iter()
-        .filter_map(|(source_id, value)| {
-            serde_json::from_value::<KelivoProviderConfig>(value)
-                .ok()
-                .map(|config| KelivoProvider {
-                    source_id: config.id.clone().unwrap_or(source_id),
-                    config,
-                })
+
+    // Preserve providers_order_v1 when present so scan/import order matches Kelivo UI.
+    let order: Vec<String> = settings
+        .get("providers_order_v1")
+        .and_then(|value| match value {
+            Value::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            ),
+            Value::String(text) => serde_json::from_str::<Vec<String>>(text).ok(),
+            _ => None,
         })
-        .collect()
+        .unwrap_or_default();
+
+    let mut providers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut emit = |source_id: String, value: Value| {
+        if !seen.insert(source_id.clone()) {
+            return;
+        }
+        match serde_json::from_value::<KelivoProviderConfig>(value) {
+            Ok(config) => {
+                let source_id = config
+                    .id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or(source_id);
+                providers.push(KelivoProvider { source_id, config });
+            }
+            Err(error) => warnings.push(warning(
+                "provider_config_parse_failed",
+                format!("Could not parse Kelivo provider '{source_id}': {error}"),
+                Some(source_id),
+            )),
+        }
+    };
+
+    for source_id in order {
+        if let Some(value) = map.get(&source_id) {
+            emit(source_id, value.clone());
+        }
+    }
+    for (source_id, value) in map {
+        emit(source_id, value);
+    }
+
+    (providers, warnings)
+}
+
+fn is_importable_provider(provider: &KelivoProvider) -> bool {
+    if importable_keys(&provider.config).is_empty() {
+        return false;
+    }
+    let provider_type = map_provider_type(provider);
+    let base_url = provider_base_url(provider, &provider_type);
+    let (api_host, _) = split_api_url(&base_url);
+    !api_host.trim().is_empty()
 }
 
 async fn import_provider<C>(
@@ -843,7 +1084,12 @@ where
                 provider_type: Set(provider_type_storage(&provider_type).to_string()),
                 api_host: Set(api_host),
                 api_path: Set(api_path),
-                enabled: Set(if provider.config.enabled.unwrap_or(true) { 1 } else { 0 }),
+                aws_region: Set(None),
+                enabled: Set(if provider.config.enabled.unwrap_or(true) {
+                    1
+                } else {
+                    0
+                }),
                 proxy_config: Set(None),
                 custom_headers: Set(None),
                 icon: Set(None),
@@ -858,7 +1104,7 @@ where
         }
     };
 
-    let existing_keys = provider_keys::Entity::find()
+    let mut existing_keys = provider_keys::Entity::find()
         .filter(provider_keys::Column::ProviderId.eq(&provider_id))
         .all(db)
         .await?;
@@ -877,7 +1123,7 @@ where
             .max()
             .unwrap_or(-1)
             + 1;
-        provider_keys::ActiveModel {
+        let inserted = provider_keys::ActiveModel {
             id: Set(gen_id()),
             provider_id: Set(provider_id.clone()),
             key_encrypted: Set(encrypt_key(&raw_key, master_key)?),
@@ -890,21 +1136,27 @@ where
         }
         .insert(db)
         .await?;
+        existing_keys.push(inserted);
     }
 
     for (model_id, name) in kelivo_models(&provider.config) {
-        let model_type = ModelType::detect(&model_id);
+        let (model_type, capabilities) =
+            infer_model_type_and_capabilities(&model_id, &name);
         models::Entity::insert(models::ActiveModel {
             provider_id: Set(provider_id.clone()),
             model_id: Set(model_id),
             name: Set(name),
             group_name: Set(None),
             model_type: Set(model_type.to_string()),
-            capabilities: Set(serde_json::to_string(&default_capabilities(&model_type)).unwrap()),
+            capabilities: Set(serde_json::to_string(&capabilities).unwrap()),
             max_tokens: Set(None),
+            max_output_tokens: Set(None),
             enabled: Set(1),
             param_overrides: Set(empty_param_overrides_for_import(&provider_type)
                 .and_then(|value| serde_json::to_string(&value).ok())),
+            image_config_json: Set(None),
+            metadata_state_json: Set(None),
+            aliases_json: Set(None),
         })
         .on_conflict(
             OnConflict::columns([models::Column::ProviderId, models::Column::ModelId])
@@ -934,7 +1186,11 @@ fn provider_import_name(provider: &KelivoProvider) -> String {
 
 fn importable_keys(config: &KelivoProviderConfig) -> Vec<String> {
     let mut keys = Vec::new();
-    if let Some(key) = config.api_key.as_deref().filter(|value| is_importable_key(value)) {
+    if let Some(key) = config
+        .api_key
+        .as_deref()
+        .filter(|value| is_importable_key(value))
+    {
         keys.push(key.trim().to_string());
     }
     for key_config in &config.api_keys {
@@ -989,18 +1245,50 @@ fn map_provider_type(provider: &KelivoProvider) -> ProviderType {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    let id = provider.source_id.to_ascii_lowercase();
+    let name = provider
+        .config
+        .name
+        .clone()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let identity = format!("{id} {name}");
+
+    // Prefer explicit Kelivo providerType, then fall back to well-known id/name cues.
     match raw.as_str() {
         "openai" if provider.config.use_response_api == Some(true) => ProviderType::OpenAIResponses,
-        "openai" => ProviderType::OpenAI,
+        "openai" | "openai-compat" | "openai_compat" => {
+            if identity.contains("silicon") {
+                ProviderType::SiliconFlow
+            } else if identity.contains("deepseek") {
+                ProviderType::DeepSeek
+            } else if identity.contains("grok") || identity.contains("xai") {
+                ProviderType::XAI
+            } else if identity.contains("zhipu") || identity.contains("glm") {
+                ProviderType::GLM
+            } else {
+                ProviderType::OpenAI
+            }
+        }
         "claude" | "anthropic" => ProviderType::Anthropic,
         "google" | "gemini" => ProviderType::Gemini,
+        "deepseek" => ProviderType::DeepSeek,
+        "siliconflow" | "silicon" => ProviderType::SiliconFlow,
+        "xai" | "grok" => ProviderType::XAI,
+        "glm" | "zhipu" => ProviderType::GLM,
         _ => {
-            let id = provider.source_id.to_ascii_lowercase();
-            let name = provider.config.name.clone().unwrap_or_default().to_ascii_lowercase();
-            if id.contains("claude") || name.contains("claude") || id.contains("anthropic") {
+            if identity.contains("claude") || identity.contains("anthropic") {
                 ProviderType::Anthropic
-            } else if id.contains("gemini") || name.contains("gemini") || id.contains("google") {
+            } else if identity.contains("gemini") || identity.contains("google") {
                 ProviderType::Gemini
+            } else if identity.contains("deepseek") {
+                ProviderType::DeepSeek
+            } else if identity.contains("silicon") {
+                ProviderType::SiliconFlow
+            } else if identity.contains("grok") || identity.contains("xai") {
+                ProviderType::XAI
+            } else if identity.contains("zhipu") || identity.contains("glm") {
+                ProviderType::GLM
             } else {
                 ProviderType::Custom
             }
@@ -1040,8 +1328,8 @@ struct MaterializedMessage {
 async fn materialize_message<C>(
     db: &C,
     file_store: &FileStore,
-    archive: &mut zip::ZipArchive<File>,
-    zip_entries: &HashSet<String>,
+    file_source: &mut KelivoFileSource,
+    file_entries: &HashSet<String>,
     tool_events: &HashMap<String, Vec<Value>>,
     message: &KelivoMessage,
     provider_map: &HashMap<String, String>,
@@ -1049,6 +1337,7 @@ async fn materialize_message<C>(
     fallback_model_id: &str,
     conversation_id: &str,
     result: &mut ThirdPartyImportResult,
+    created_paths: &mut Vec<String>,
 ) -> Result<MaterializedMessage>
 where
     C: ConnectionTrait,
@@ -1057,16 +1346,22 @@ where
     let attachments = import_attachments(
         db,
         file_store,
-        archive,
-        zip_entries,
+        file_source,
+        file_entries,
         conversation_id,
         &refs,
         result,
+        created_paths,
     )
     .await?;
     let mut content = strip_attachment_markers(&message.content);
 
-    if let Some(translation) = message.translation.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(translation) = message
+        .translation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         append_markdown_section(&mut content, "Kelivo translation", translation);
     }
     if let Some(events) = tool_events.get(&message.id) {
@@ -1144,24 +1439,28 @@ fn is_kelivo_error_content(content: &str) -> bool {
 async fn import_attachments<C>(
     db: &C,
     file_store: &FileStore,
-    archive: &mut zip::ZipArchive<File>,
-    zip_entries: &HashSet<String>,
+    file_source: &mut KelivoFileSource,
+    file_entries: &HashSet<String>,
     conversation_id: &str,
     refs: &[KelivoAttachmentRef],
     result: &mut ThirdPartyImportResult,
+    created_paths: &mut Vec<String>,
 ) -> Result<Vec<Attachment>>
 where
     C: ConnectionTrait,
 {
     let mut attachments = Vec::new();
     for attachment_ref in refs {
-        let matches = matching_zip_entries(zip_entries, &attachment_candidates(attachment_ref));
+        let matches = matching_file_entries(file_entries, &attachment_candidates(attachment_ref));
         let entry_name = match matches.as_slice() {
             [entry] => entry.clone(),
             [] => {
                 result.warnings.push(warning(
                     "missing_attachment",
-                    format!("Kelivo attachment '{}' is missing from the backup.", attachment_ref.file_name),
+                    format!(
+                        "Kelivo attachment '{}' is missing from the backup.",
+                        attachment_ref.file_name
+                    ),
                     Some(attachment_ref.source_message_id.clone()),
                 ));
                 continue;
@@ -1169,14 +1468,21 @@ where
             _ => {
                 result.warnings.push(warning(
                     "ambiguous_attachment",
-                    format!("Kelivo attachment '{}' matched multiple files in the backup.", attachment_ref.file_name),
+                    format!(
+                        "Kelivo attachment '{}' matched multiple files in the backup.",
+                        attachment_ref.file_name
+                    ),
                     Some(attachment_ref.source_message_id.clone()),
                 ));
                 continue;
             }
         };
-        let bytes = read_zip_entry(archive, &entry_name)?;
-        let saved = file_store.save_file(&bytes, &attachment_ref.file_name, &attachment_ref.mime_type)?;
+        let bytes = file_source.read_entry(&entry_name)?;
+        let saved =
+            file_store.save_file(&bytes, &attachment_ref.file_name, &attachment_ref.mime_type)?;
+        if saved.created {
+            created_paths.push(saved.storage_path.clone());
+        }
         let id = gen_id();
         stored_files::ActiveModel {
             id: Set(id.clone()),
@@ -1203,6 +1509,50 @@ where
     Ok(attachments)
 }
 
+async fn cleanup_import_created_paths(
+    db: &DatabaseConnection,
+    file_store: &FileStore,
+    paths: &[String],
+) -> Vec<String> {
+    let mut unique_paths = paths.to_vec();
+    unique_paths.sort();
+    unique_paths.dedup();
+    let mut errors = Vec::new();
+    for path in unique_paths {
+        match crate::repo::stored_file::count_stored_files_with_storage_path(db, &path).await {
+            Ok(0) => {
+                if let Err(error) = file_store.delete_file(&path) {
+                    errors.push(format!("failed to delete {path}: {error}"));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(format!("failed to inspect {path}: {error}")),
+        }
+    }
+    errors
+}
+
+fn import_failure(
+    primary: AQBotError,
+    rollback: Option<sea_orm::DbErr>,
+    cleanup: Vec<String>,
+) -> AQBotError {
+    if rollback.is_none() && cleanup.is_empty() {
+        return primary;
+    }
+    AQBotError::Validation(format!(
+        "{primary}; rollback error: {}; cleanup errors: {}",
+        rollback
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        if cleanup.is_empty() {
+            "none".to_string()
+        } else {
+            cleanup.join(", ")
+        }
+    ))
+}
+
 fn attachment_refs_for_messages(messages: &[&KelivoMessage]) -> Vec<KelivoAttachmentRef> {
     let mut seen = HashSet::new();
     let mut refs = Vec::new();
@@ -1221,7 +1571,10 @@ fn attachment_refs_for_message(message: &KelivoMessage) -> Vec<KelivoAttachmentR
     let image_re = Regex::new(r"\[image:(.+?)\]").unwrap();
     let file_re = Regex::new(r"\[file:(.+?)\|(.+?)\|(.+?)\]").unwrap();
     for capture in image_re.captures_iter(&message.content) {
-        let raw_path = capture.get(1).map(|value| value.as_str().trim()).unwrap_or_default();
+        let raw_path = capture
+            .get(1)
+            .map(|value| value.as_str().trim())
+            .unwrap_or_default();
         if raw_path.is_empty() {
             continue;
         }
@@ -1234,7 +1587,10 @@ fn attachment_refs_for_message(message: &KelivoMessage) -> Vec<KelivoAttachmentR
         });
     }
     for capture in file_re.captures_iter(&message.content) {
-        let raw_path = capture.get(1).map(|value| value.as_str().trim()).unwrap_or_default();
+        let raw_path = capture
+            .get(1)
+            .map(|value| value.as_str().trim())
+            .unwrap_or_default();
         let file_name = capture
             .get(2)
             .map(|value| value.as_str().trim())
@@ -1263,7 +1619,7 @@ fn attachment_refs_for_message(message: &KelivoMessage) -> Vec<KelivoAttachmentR
 
 fn append_attachment_warnings(
     selected: &HashMap<String, Vec<&KelivoMessage>>,
-    zip_entries: &HashSet<String>,
+    file_entries: &HashSet<String>,
     warnings: &mut Vec<ThirdPartyImportWarning>,
 ) {
     let mut seen = HashSet::new();
@@ -1272,17 +1628,24 @@ fn append_attachment_warnings(
             if !seen.insert(attachment_ref.clone()) {
                 continue;
             }
-            let matches = matching_zip_entries(zip_entries, &attachment_candidates(&attachment_ref));
+            let matches =
+                matching_file_entries(file_entries, &attachment_candidates(&attachment_ref));
             match matches.len() {
                 0 => warnings.push(warning(
                     "missing_attachment",
-                    format!("Kelivo attachment '{}' is missing from the backup.", attachment_ref.file_name),
+                    format!(
+                        "Kelivo attachment '{}' is missing from the backup.",
+                        attachment_ref.file_name
+                    ),
                     Some(attachment_ref.source_message_id),
                 )),
                 1 => {}
                 _ => warnings.push(warning(
                     "ambiguous_attachment",
-                    format!("Kelivo attachment '{}' matched multiple files in the backup.", attachment_ref.file_name),
+                    format!(
+                        "Kelivo attachment '{}' matched multiple files in the backup.",
+                        attachment_ref.file_name
+                    ),
                     Some(attachment_ref.source_message_id),
                 )),
             }
@@ -1316,8 +1679,11 @@ fn attachment_candidates(attachment_ref: &KelivoAttachmentRef) -> HashSet<String
     candidates
 }
 
-fn matching_zip_entries(zip_entries: &HashSet<String>, candidates: &HashSet<String>) -> Vec<String> {
-    let mut matches = zip_entries
+fn matching_file_entries(
+    file_entries: &HashSet<String>,
+    candidates: &HashSet<String>,
+) -> Vec<String> {
+    let mut matches = file_entries
         .iter()
         .filter(|entry| candidates.contains(*entry))
         .cloned()
@@ -1404,6 +1770,7 @@ fn provider_type_storage(provider_type: &ProviderType) -> &'static str {
         ProviderType::Jina => "jina",
         ProviderType::Cohere => "cohere",
         ProviderType::Voyage => "voyage",
+        ProviderType::Bedrock => "bedrock",
         ProviderType::Custom => "custom",
     }
 }
@@ -1438,13 +1805,6 @@ fn key_prefix(raw_key: &str) -> String {
     }
 }
 
-fn default_capabilities(model_type: &ModelType) -> Vec<ModelCapability> {
-    match model_type {
-        ModelType::Chat => vec![ModelCapability::TextChat],
-        _ => Vec::new(),
-    }
-}
-
 fn empty_param_overrides_for_import(provider_type: &ProviderType) -> Option<ModelParamOverrides> {
     let reasoning_profile = match provider_type {
         ProviderType::OpenAIResponses => Some("openai_responses_reasoning".to_string()),
@@ -1461,6 +1821,7 @@ fn empty_param_overrides_for_import(provider_type: &ProviderType) -> Option<Mode
         frequency_penalty: None,
         use_max_completion_tokens: None,
         no_system_role: None,
+        omit_sampling_params: None,
         force_max_tokens: None,
         thinking_param_style: None,
         reasoning_profile: Some(profile),
@@ -1557,7 +1918,7 @@ mod tests {
     use crate::repo::provider;
     use crate::types::{Attachment, ProviderType};
     use chrono::TimeZone;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement};
     use serde_json::json;
     use std::fs::File;
     use std::io::Write;
@@ -1565,7 +1926,12 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 
-    fn write_kelivo_zip(path: &Path, settings: Option<serde_json::Value>, chats: serde_json::Value, files: &[(&str, &[u8])]) {
+    fn write_kelivo_zip(
+        path: &Path,
+        settings: Option<serde_json::Value>,
+        chats: serde_json::Value,
+        files: &[(&str, &[u8])],
+    ) {
         let file = File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         let options = SimpleFileOptions::default();
@@ -1711,7 +2077,10 @@ mod tests {
             &zip_path,
             Some(sample_settings_json()),
             sample_chats_json(),
-            &[("images/photo.png", b"pngdata"), ("upload/doc.pdf", b"pdfdata")],
+            &[
+                ("images/photo.png", b"pngdata"),
+                ("upload/doc.pdf", b"pdfdata"),
+            ],
         );
         let db = create_test_pool().await.unwrap();
 
@@ -1728,6 +2097,195 @@ mod tests {
         assert!(summary.warnings.is_empty());
     }
 
+    #[test]
+    fn kelivo_provider_config_tolerates_null_collection_fields() {
+        let config: KelivoProviderConfig = serde_json::from_value(json!({
+            "id": "OpenAI - shuai",
+            "enabled": true,
+            "name": "shuai",
+            "apiKey": "sk-real-key-123",
+            "baseUrl": "https://api.shuaiapi.com/v1",
+            "providerType": "openai",
+            "models": ["gpt-5.6"],
+            "modelOverrides": null,
+            "apiKeys": null
+        }))
+        .unwrap();
+
+        assert_eq!(config.api_key.as_deref(), Some("sk-real-key-123"));
+        assert!(config.api_keys.is_empty());
+        assert!(config.model_overrides.is_empty());
+        assert_eq!(config.models, vec!["gpt-5.6".to_string()]);
+        assert_eq!(importable_keys(&config), vec!["sk-real-key-123".to_string()]);
+    }
+
+    #[test]
+    fn kelivo_providers_preserve_order_and_skip_keyless_for_import() {
+        let settings = json!({
+            "providers_order_v1": ["SiliconFlow", "OpenAI - shuai", "MissingBuiltin", "OpenAI"],
+            "provider_configs_v1": serde_json::to_string(&json!({
+                "OpenAI": {
+                    "id": "OpenAI",
+                    "name": "OpenAI",
+                    "apiKey": "sk-openai",
+                    "baseUrl": "http://127.0.0.1:8000/v1",
+                    "providerType": "openai",
+                    "models": ["gpt-5.2"]
+                },
+                "SiliconFlow": {
+                    "id": "SiliconFlow",
+                    "name": "SiliconFlow",
+                    "apiKey": "",
+                    "baseUrl": "https://api.siliconflow.cn/v1",
+                    "providerType": "openai",
+                    "models": ["Qwen/Qwen3-8B"],
+                    "apiKeys": []
+                },
+                "OpenAI - shuai": {
+                    "id": "OpenAI - shuai",
+                    "name": "shuai",
+                    "apiKey": "sk-shuai",
+                    "baseUrl": "https://api.shuaiapi.com/v1",
+                    "providerType": "openai",
+                    "models": ["gpt-5.6"],
+                    "apiKeys": null
+                }
+            })).unwrap()
+        });
+
+        let (providers, warnings) = kelivo_providers(Some(&settings));
+        assert!(warnings.is_empty());
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.source_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SiliconFlow", "OpenAI - shuai", "OpenAI"]
+        );
+        // Keyless configs are parsed but not importable.
+        assert!(!is_importable_provider(&providers[0]));
+        assert!(is_importable_provider(&providers[1]));
+        assert!(is_importable_provider(&providers[2]));
+        assert_eq!(
+            importable_keys(&providers[1].config),
+            vec!["sk-shuai".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn import_kelivo_providers_without_api_keys_are_skipped() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("kelivo.zip");
+        let settings = json!({
+            "provider_configs_v1": serde_json::to_string(&json!({
+                "SiliconFlow": {
+                    "id": "SiliconFlow",
+                    "enabled": true,
+                    "name": "SiliconFlow",
+                    "apiKey": "",
+                    "baseUrl": "https://api.siliconflow.cn/v1",
+                    "providerType": "openai",
+                    "models": ["Qwen/Qwen3-8B"],
+                    "apiKeys": []
+                },
+                "OpenAI - shuai": {
+                    "id": "OpenAI - shuai",
+                    "enabled": true,
+                    "name": "shuai",
+                    "apiKey": "sk-shuai",
+                    "baseUrl": "https://api.shuaiapi.com/v1",
+                    "providerType": "openai",
+                    "models": ["gpt-5.6"],
+                    "apiKeys": null
+                }
+            })).unwrap()
+        });
+        write_kelivo_zip(
+            &zip_path,
+            Some(settings),
+            json!({
+                "version": 1,
+                "conversations": [],
+                "messages": [],
+                "toolEvents": {}
+            }),
+            &[],
+        );
+        let db = create_test_pool().await.unwrap();
+        let master_key = [9u8; 32];
+
+        let summary = scan_kelivo_import_from_path(&db.conn, &zip_path)
+            .await
+            .unwrap();
+        assert_eq!(summary.importable_provider_count, 1);
+
+        let result = import_kelivo_backup_from_path_with_root(
+            &db.conn,
+            &master_key,
+            &zip_path,
+            ThirdPartyImportOptions {
+                import_provider_keys: true,
+            },
+            &dir.path().join("docs"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.imported_provider_count, 1);
+        let providers = provider::list_providers(&db.conn).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "OpenAI - shuai");
+        assert_eq!(providers[0].keys.len(), 1);
+        assert!(providers[0]
+            .models
+            .iter()
+            .any(|model| model.model_id == "gpt-5.6"));
+    }
+
+    #[tokio::test]
+    async fn scan_and_import_kelivo_directory_backup() {
+        let dir = tempdir().unwrap();
+        let backup_dir = dir.path().join("kelivo_backup");
+        std::fs::create_dir_all(backup_dir.join("upload")).unwrap();
+        std::fs::write(
+            backup_dir.join("settings.json"),
+            serde_json::to_string(&sample_settings_json()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            backup_dir.join("chats.json"),
+            serde_json::to_string(&sample_chats_json()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(backup_dir.join("images").join("photo.png"), b"pngdata").ok();
+        std::fs::create_dir_all(backup_dir.join("images")).unwrap();
+        std::fs::write(backup_dir.join("images/photo.png"), b"pngdata").unwrap();
+        std::fs::write(backup_dir.join("upload/doc.pdf"), b"pdfdata").unwrap();
+
+        let db = create_test_pool().await.unwrap();
+        let summary = scan_kelivo_import_from_path(&db.conn, &backup_dir)
+            .await
+            .unwrap();
+        assert_eq!(summary.conversation_count, 1);
+        assert_eq!(summary.importable_provider_count, 2);
+        assert_eq!(summary.file_count, 2);
+
+        let result = import_kelivo_backup_from_path_with_root(
+            &db.conn,
+            &[3u8; 32],
+            &backup_dir,
+            ThirdPartyImportOptions {
+                import_provider_keys: true,
+            },
+            &dir.path().join("docs"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.imported_conversation_count, 1);
+        assert_eq!(result.imported_file_count, 2);
+        assert_eq!(result.imported_provider_count, 2);
+    }
+
     #[tokio::test]
     async fn import_kelivo_zip_materializes_history_files_thinking_and_providers() {
         let dir = tempdir().unwrap();
@@ -1737,7 +2295,10 @@ mod tests {
             &zip_path,
             Some(sample_settings_json()),
             sample_chats_json(),
-            &[("images/photo.png", b"pngdata"), ("upload/doc.pdf", b"pdfdata")],
+            &[
+                ("images/photo.png", b"pngdata"),
+                ("upload/doc.pdf", b"pdfdata"),
+            ],
         );
         let db = create_test_pool().await.unwrap();
         let master_key = [11u8; 32];
@@ -1764,6 +2325,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            conversation.context_strategy_override.as_deref(),
+            Some("raw_truncate")
+        );
+        assert_eq!(conversation.multi_model_display_mode_override, None);
         assert_eq!(conversation.title, "Kelivo imported chat");
         assert_eq!(conversation.message_count, 2);
         assert_eq!(conversation.is_pinned, 1);
@@ -1774,7 +2340,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(imported_messages.len(), 2);
-        assert!(imported_messages.iter().all(|message| message.id != "msg-assistant-v0"));
+        assert!(imported_messages
+            .iter()
+            .all(|message| message.id != "msg-assistant-v0"));
 
         let user = imported_messages
             .iter()
@@ -1783,8 +2351,12 @@ mod tests {
         assert_eq!(user.content, "hello");
         let attachments: Vec<Attachment> = serde_json::from_str(&user.attachments).unwrap();
         assert_eq!(attachments.len(), 2);
-        assert!(attachments.iter().any(|attachment| attachment.file_name == "photo.png"));
-        assert!(attachments.iter().any(|attachment| attachment.file_name == "doc.pdf"));
+        assert!(attachments
+            .iter()
+            .any(|attachment| attachment.file_name == "photo.png"));
+        assert!(attachments
+            .iter()
+            .any(|attachment| attachment.file_name == "doc.pdf"));
 
         let assistant = imported_messages
             .iter()
@@ -1814,10 +2386,15 @@ mod tests {
             .iter()
             .find(|provider| provider.name == "openai-main")
             .unwrap();
-        assert!(providers.iter().any(|provider| provider.name == "unused-provider"));
+        assert!(providers
+            .iter()
+            .any(|provider| provider.name == "unused-provider"));
         assert_eq!(conversation.provider_id, imported_provider.id);
         assert_eq!(conversation.model_id, "gpt-5-chat");
-        assert_eq!(imported_provider.provider_type, ProviderType::OpenAIResponses);
+        assert_eq!(
+            imported_provider.provider_type,
+            ProviderType::OpenAIResponses
+        );
         assert_eq!(imported_provider.api_host, "https://api.example.com");
         assert_eq!(imported_provider.api_path.as_deref(), Some("/v1"));
         assert_eq!(imported_provider.keys.len(), 2);
@@ -1853,6 +2430,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_failure_rolls_back_rows_and_removes_new_physical_files() {
+        let dir = tempdir().unwrap();
+        let zip_path = dir.path().join("kelivo.zip");
+        let docs_root = dir.path().join("aqbot-docs");
+        write_kelivo_zip(
+            &zip_path,
+            Some(sample_settings_json()),
+            sample_chats_json(),
+            &[
+                ("images/photo.png", b"pngdata"),
+                ("upload/doc.pdf", b"pdfdata"),
+            ],
+        );
+        let db = create_test_pool().await.unwrap();
+        db.conn
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE TRIGGER fail_kelivo_message BEFORE INSERT ON messages \
+                 BEGIN SELECT RAISE(ABORT, 'forced message insert failure'); END"
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let result = import_kelivo_backup_from_path_with_root(
+            &db.conn,
+            &[11u8; 32],
+            &zip_path,
+            ThirdPartyImportOptions {
+                import_provider_keys: false,
+            },
+            &docs_root,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(conversations::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(messages::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(stored_files::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+        for (name, mime, bytes) in [
+            ("photo.png", "image/png", b"pngdata".as_slice()),
+            ("doc.pdf", "application/pdf", b"pdfdata".as_slice()),
+        ] {
+            let hash = FileStore::hash_bytes(bytes);
+            let path = crate::storage_paths::build_relative_path(name, mime, &hash);
+            assert!(!docs_root.join(path).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn import_kelivo_provider_keys_is_opt_in() {
         let dir = tempdir().unwrap();
         let zip_path = dir.path().join("kelivo.zip");
@@ -1860,7 +2499,10 @@ mod tests {
             &zip_path,
             Some(sample_settings_json()),
             sample_chats_json(),
-            &[("images/photo.png", b"pngdata"), ("upload/doc.pdf", b"pdfdata")],
+            &[
+                ("images/photo.png", b"pngdata"),
+                ("upload/doc.pdf", b"pdfdata"),
+            ],
         );
         let db = create_test_pool().await.unwrap();
 
@@ -1981,10 +2623,12 @@ mod tests {
             .all(&db.conn)
             .await
             .unwrap();
+        assert!(imported_messages.iter().any(
+            |message| message.id == "stream-v1" && message.content == "latest complete answer"
+        ));
         assert!(imported_messages
             .iter()
-            .any(|message| message.id == "stream-v1" && message.content == "latest complete answer"));
-        assert!(imported_messages.iter().all(|message| message.id != "stream-v2"));
+            .all(|message| message.id != "stream-v2"));
 
         let conversation = conversations::Entity::find_by_id("kelivo-streaming-conv")
             .one(&db.conn)
@@ -2115,21 +2759,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(visible_messages.len(), 4);
-        assert!(visible_messages.iter().any(|message| message.id == "retry-user-1"));
-        assert!(visible_messages.iter().all(|message| message.id != "retry-user-2"));
-        assert!(visible_messages.iter().all(|message| message.id != "retry-user-3"));
+        assert!(visible_messages
+            .iter()
+            .any(|message| message.id == "retry-user-1"));
+        assert!(visible_messages
+            .iter()
+            .all(|message| message.id != "retry-user-2"));
+        assert!(visible_messages
+            .iter()
+            .all(|message| message.id != "retry-user-3"));
 
-        let versions = message_repo::list_message_versions(&db.conn, "kelivo-retry-conv", "retry-user-1")
-            .await
-            .unwrap();
+        let versions =
+            message_repo::list_message_versions(&db.conn, "kelivo-retry-conv", "retry-user-1")
+                .await
+                .unwrap();
         assert_eq!(versions.len(), 3);
         assert!(versions.iter().all(|message| message.status == "error"));
-        assert_eq!(versions[0].parent_message_id.as_deref(), Some("retry-user-1"));
+        assert_eq!(
+            versions[0].parent_message_id.as_deref(),
+            Some("retry-user-1")
+        );
         assert_eq!(versions[0].version_index, 0);
         assert_eq!(versions[1].version_index, 1);
         assert_eq!(versions[2].version_index, 2);
-        assert_eq!(versions.iter().filter(|message| message.is_active).count(), 1);
-        assert_eq!(versions.iter().find(|message| message.is_active).unwrap().id, "retry-a-3");
+        assert_eq!(
+            versions.iter().filter(|message| message.is_active).count(),
+            1
+        );
+        assert_eq!(
+            versions
+                .iter()
+                .find(|message| message.is_active)
+                .unwrap()
+                .id,
+            "retry-a-3"
+        );
 
         let conversation = conversations::Entity::find_by_id("kelivo-retry-conv")
             .one(&db.conn)
@@ -2143,8 +2807,7 @@ mod tests {
     #[test]
     fn parses_kelivo_naive_local_timestamp() {
         let raw = "2026-05-29T21:22:32.558343";
-        let naive = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
-            .unwrap();
+        let naive = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").unwrap();
         let expected = chrono::Local
             .from_local_datetime(&naive)
             .single()

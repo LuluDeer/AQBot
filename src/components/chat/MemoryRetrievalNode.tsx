@@ -3,7 +3,7 @@ import { theme } from 'antd';
 import { Brain, ChevronDown, ChevronRight, AlertCircle, Database } from 'lucide-react';
 import type { NodeComponentProps } from 'markstream-react';
 import { useTranslation } from 'react-i18next';
-import type { MemorySourceResult, MemoryRetrievedItem } from '@/lib/memoryUtils';
+import { translateDiagnosticError, type MemorySourceResult, type MemoryRetrievedItem } from '@/lib/memoryUtils';
 
 type MemoryRetrievalNodeData = {
   type: 'memory-retrieval';
@@ -96,7 +96,7 @@ export function MemoryRetrievalNode(props: NodeComponentProps<MemoryRetrievalNod
         }}
       >
         <AlertCircle size={16} />
-        <span>{node.content || t('chat.memoryRetrieval.error')}</span>
+        <span>{translateDiagnosticError(node.content, t, 'chat.memoryRetrieval.error')}</span>
       </div>
     );
   }
@@ -106,9 +106,6 @@ export function MemoryRetrievalNode(props: NodeComponentProps<MemoryRetrievalNod
     const messageKey = reason === 'threshold_filtered'
       ? 'chat.memoryRetrieval.emptyThreshold'
       : 'chat.memoryRetrieval.empty';
-    const defaultValue = reason === 'threshold_filtered'
-      ? '未找到符合检索阈值的记忆内容，可适当降低检索阈值。'
-      : '未找到相关记忆内容。';
     return (
       <div
         style={{
@@ -124,7 +121,7 @@ export function MemoryRetrievalNode(props: NodeComponentProps<MemoryRetrievalNod
         }}
       >
         <Brain size={16} />
-        <span>{t(messageKey, { defaultValue })}</span>
+        <span>{t(messageKey)}</span>
       </div>
     );
   }
@@ -158,7 +155,6 @@ export function MemoryRetrievalNode(props: NodeComponentProps<MemoryRetrievalNod
         <span style={{ fontSize: 13, fontWeight: 500 }}>
           {t('chat.memoryRetrieval.resultsCount', {
             count: totalItems,
-            defaultValue: '检索到 {{count}} 条记忆',
           })}
         </span>
         <span style={{ marginLeft: 'auto', color: token.colorTextTertiary }}>

@@ -1,11 +1,11 @@
 use aqbot_core::error::{AQBotError, Result};
 use aqbot_core::types::*;
 use async_trait::async_trait;
-use futures::{Stream, stream};
+use futures::{stream, Stream};
 use serde::Deserialize;
 use std::pin::Pin;
 
-use crate::{ProviderAdapter, ProviderRequestContext, build_http_client};
+use crate::{build_http_client, ProviderAdapter, ProviderRequestContext};
 
 const DEFAULT_BASE_URL: &str = "https://api.voyageai.com/v1";
 
@@ -51,9 +51,13 @@ pub(crate) fn voyage_models(provider_id: &str) -> Vec<Model> {
             group_name: None,
             model_type: ModelType::Rerank,
             capabilities: vec![],
-            max_tokens: None,
+            context_window: None,
+            max_output_tokens: None,
             enabled: true,
             param_overrides: None,
+            image_config: None,
+            metadata_state: None,
+            aliases: Vec::new(),
         })
         .collect()
 }

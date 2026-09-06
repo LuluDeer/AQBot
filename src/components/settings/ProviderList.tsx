@@ -1,5 +1,6 @@
 import {
   Button,
+  AutoComplete,
   Input,
   Modal,
   Form,
@@ -14,9 +15,12 @@ import {
   Tag,
   Typography,
   Empty,
+  Checkbox,
+  Popconfirm,
+  Space,
 } from 'antd';
-import { Plus, Search, GripVertical, BadgeCheck, Download } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Plus, Search, GripVertical, BadgeCheck, Download, ListChecks, X, Power, PowerOff, Trash2 } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import {
@@ -49,7 +53,22 @@ const PROVIDER_TYPE_OPTIONS: { label: string; value: ProviderType }[] = [
   { label: 'Jina', value: 'jina' },
   { label: 'Cohere', value: 'cohere' },
   { label: 'Voyage', value: 'voyage' },
+  { label: 'AWS Bedrock', value: 'bedrock' },
 ];
+
+const AWS_REGION_OPTIONS = [
+  'us-east-1',
+  'us-east-2',
+  'us-west-2',
+  'eu-central-1',
+  'eu-west-1',
+  'eu-west-2',
+  'eu-west-3',
+  'ap-northeast-1',
+  'ap-northeast-2',
+  'ap-southeast-1',
+  'ap-southeast-2',
+].map((value) => ({ value }));
 
 const DEFAULT_HOSTS: Record<ProviderType, string> = {
   openai: 'https://api.openai.com',
@@ -63,6 +82,7 @@ const DEFAULT_HOSTS: Record<ProviderType, string> = {
   jina: 'https://api.jina.ai',
   cohere: 'https://api.cohere.com',
   voyage: 'https://api.voyageai.com',
+  bedrock: '',
   custom: '',
 };
 
@@ -135,18 +155,30 @@ function BuiltinProviderIcon({
   );
 }
 
+function isBuiltinProvider(provider: ProviderConfig) {
+  return Boolean(provider.builtin_id || provider.id.startsWith('builtin_'));
+}
+
 function SortableProviderItem({
   provider,
   isSelected,
   token,
   onSelect,
   onToggle,
+  onRequestDelete,
+  batchMode,
+  batchChecked,
+  onBatchCheck,
 }: {
   provider: ProviderConfig;
   isSelected: boolean;
   token: any;
   onSelect: () => void;
   onToggle: (checked: boolean) => void;
+  onRequestDelete: () => void;
+  batchMode: boolean;
+  batchChecked: boolean;
+  onBatchCheck: (checked: boolean) => void;
 }) {
   const {
     attributes,
@@ -155,7 +187,7 @@ function SortableProviderItem({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: provider.id });
+  } = useSortable({ id: provider.id, disabled: batchMode });
   const { t } = useTranslation();
 
   const style = {
@@ -163,79 +195,175 @@ function SortableProviderItem({
     transition,
     opacity: isDragging ? 0.5 : 1,
     borderRadius: token.borderRadius,
-    backgroundColor: isSelected ? token.colorPrimaryBg : undefined,
+    backgroundColor: isSelected || (batchMode && batchChecked) ? token.colorPrimaryBg : undefined,
   };
 
   const disabled = !provider.enabled;
+  const isBuiltin = isBuiltinProvider(provider);
 
-  return (
+  const contextMenuItems = useMemo(() => {
+    const items: Array<{
+      key: string;
+      label: string;
+      icon: React.ReactNode;
+      danger?: boolean;
+    }> = [
+      provider.enabled
+        ? {
+            key: 'disable',
+            label: t('settings.disableProvider'),
+            icon: <PowerOff size={14} />,
+          }
+        : {
+            key: 'enable',
+            label: t('settings.enableProvider'),
+            icon: <Power size={14} />,
+          },
+    ];
+    if (!isBuiltin) {
+      items.push({
+        key: 'delete',
+        label: t('settings.deleteProvider'),
+        icon: <Trash2 size={14} />,
+        danger: true,
+      });
+    }
+    return items;
+  }, [provider.enabled, isBuiltin, t]);
+
+  const row = (
     <div
       ref={setNodeRef}
       style={style}
       className="flex items-center cursor-pointer px-3 py-2.5 transition-colors"
-      onClick={onSelect}
+      onClick={() => {
+        if (batchMode) {
+          onBatchCheck(!batchChecked);
+          return;
+        }
+        onSelect();
+      }}
       onMouseEnter={(e) => {
-        if (!isSelected) {
+        if (!isSelected && !(batchMode && batchChecked)) {
           e.currentTarget.style.backgroundColor = token.colorFillQuaternary;
         }
       }}
       onMouseLeave={(e) => {
-        if (!isSelected) {
+        if (!isSelected && !(batchMode && batchChecked)) {
           e.currentTarget.style.backgroundColor = '';
         }
       }}
     >
-      <div
-        {...attributes}
-        {...listeners}
-        className="flex items-center mr-2 cursor-grab"
-        style={{ color: token.colorTextQuaternary }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <GripVertical size={14} />
-      </div>
+      {batchMode ? (
+        <div
+          className="flex items-center mr-2"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <Checkbox
+            checked={batchChecked}
+            onChange={(e) => onBatchCheck(e.target.checked)}
+            aria-label={t('common.select')}
+          />
+        </div>
+      ) : (
+        <div
+          {...attributes}
+          {...listeners}
+          className="flex items-center mr-2 cursor-grab"
+          style={{ color: token.colorTextQuaternary }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <GripVertical size={14} />
+        </div>
+      )}
       <div
         className="min-w-0 flex-1 flex items-center gap-2"
         style={{ opacity: disabled ? 0.4 : 1 }}
       >
-        <BuiltinProviderIcon provider={provider} token={token} label={t('settings.builtinProviderBadge', '内置')} />
-        <span style={{ color: isSelected ? token.colorPrimary : undefined }}>{provider.name}</span>
+        <BuiltinProviderIcon provider={provider} token={token} label={t('settings.builtinProviderBadge')} />
+        <span style={{ color: isSelected || (batchMode && batchChecked) ? token.colorPrimary : undefined }}>{provider.name}</span>
       </div>
-      <Switch
-        size="small"
-        checked={provider.enabled}
-        onClick={(_, e) => e.stopPropagation()}
-        onChange={onToggle}
-      />
+      {!batchMode && (
+        <Switch
+          size="small"
+          checked={provider.enabled}
+          onClick={(_, e) => e.stopPropagation()}
+          onChange={onToggle}
+        />
+      )}
     </div>
+  );
+
+  if (batchMode) {
+    return row;
+  }
+
+  return (
+    <Dropdown
+      trigger={['contextMenu']}
+      menu={{
+        items: contextMenuItems,
+        onClick: ({ key, domEvent }) => {
+          domEvent.stopPropagation();
+          if (key === 'enable') onToggle(true);
+          else if (key === 'disable') onToggle(false);
+          else if (key === 'delete') onRequestDelete();
+        },
+      }}
+    >
+      {row}
+    </Dropdown>
   );
 }
 
 export function ProviderList() {
   const { t } = useTranslation();
   const { token } = theme.useToken();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const providers = useProviderStore((s) => s.providers);
   const createProvider = useProviderStore((s) => s.createProvider);
   const scanCcSwitchProviderImports = useProviderStore((s) => s.scanCcSwitchProviderImports);
   const importCcSwitchProviderConfigs = useProviderStore((s) => s.importCcSwitchProviderConfigs);
   const toggleProvider = useProviderStore((s) => s.toggleProvider);
+  const deleteProvider = useProviderStore((s) => s.deleteProvider);
   const reorderProviders = useProviderStore((s) => s.reorderProviders);
   const selectedProviderId = useUIStore((s) => s.selectedProviderId);
   const setSelectedProviderId = useUIStore((s) => s.setSelectedProviderId);
+
+  const handleRequestDeleteProvider = useCallback((providerId: string) => {
+    modal.confirm({
+      title: t('settings.deleteProviderConfirm'),
+      mask: { enabled: true, blur: true },
+      okText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        await deleteProvider(providerId);
+        if (selectedProviderId === providerId) {
+          const remaining = providers.filter((p) => p.id !== providerId);
+          setSelectedProviderId(remaining[0]?.id ?? null);
+        }
+      },
+    });
+  }, [modal, t, deleteProvider, selectedProviderId, providers, setSelectedProviderId]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
 
-  // Auto-select first provider if none selected
+  // Preserve the logical selection when a virtual built-in receives its real database ID.
   React.useEffect(() => {
-    if (
-      providers.length > 0 &&
-      (!selectedProviderId || !providers.some((p) => p.id === selectedProviderId))
-    ) {
-      setSelectedProviderId(providers[0].id);
+    if (providers.length === 0) return;
+    if (selectedProviderId && providers.some((provider) => provider.id === selectedProviderId)) {
+      return;
     }
+
+    const materializedProvider = providers.find(
+      (provider) =>
+        provider.builtin_id
+        && selectedProviderId === `builtin_${provider.builtin_id}`,
+    );
+    setSelectedProviderId(materializedProvider?.id ?? providers[0].id);
   }, [selectedProviderId, providers, setSelectedProviderId]);
 
   const [search, setSearch] = useState('');
@@ -245,7 +373,11 @@ export function ProviderList() {
   const [importSubmitting, setImportSubmitting] = useState(false);
   const [importCandidates, setImportCandidates] = useState<ProviderImportCandidate[]>([]);
   const [selectedImportIds, setSelectedImportIds] = useState<React.Key[]>([]);
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
   const [form] = Form.useForm();
+  const selectedProviderType = Form.useWatch<ProviderType>('provider_type', form);
 
   const filteredProviders = useMemo(
     () =>
@@ -264,6 +396,136 @@ export function ProviderList() {
     () => filteredProviders.filter((p) => !p.enabled),
     [filteredProviders],
   );
+
+  const handleEnterBatchMode = useCallback(() => {
+    setBatchMode(true);
+    setBatchSelected(new Set());
+  }, []);
+
+  const handleExitBatchMode = useCallback(() => {
+    setBatchMode(false);
+    setBatchSelected(new Set());
+  }, []);
+
+  const handleBatchCheck = useCallback((providerId: string, checked: boolean) => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(providerId);
+      else next.delete(providerId);
+      return next;
+    });
+  }, []);
+
+  const handleBatchToggleAll = useCallback((checked: boolean) => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev);
+      for (const provider of filteredProviders) {
+        if (checked) next.add(provider.id);
+        else next.delete(provider.id);
+      }
+      return next;
+    });
+  }, [filteredProviders]);
+
+  const handleBatchEnable = useCallback(async () => {
+    if (batchSelected.size === 0 || batchBusy) return;
+    setBatchBusy(true);
+    let ok = 0;
+    try {
+      for (const id of batchSelected) {
+        const provider = providers.find((p) => p.id === id);
+        if (!provider || provider.enabled) continue;
+        try {
+          await toggleProvider(id, true);
+          ok += 1;
+        } catch {
+          // continue remaining
+        }
+      }
+      if (ok > 0) {
+        message.success(t('settings.providerBatchEnableSuccess', { count: ok }));
+      }
+    } finally {
+      setBatchBusy(false);
+    }
+  }, [batchSelected, batchBusy, providers, toggleProvider, message, t]);
+
+  const handleBatchDisable = useCallback(async () => {
+    if (batchSelected.size === 0 || batchBusy) return;
+    setBatchBusy(true);
+    let ok = 0;
+    try {
+      for (const id of batchSelected) {
+        const provider = providers.find((p) => p.id === id);
+        if (!provider || !provider.enabled) continue;
+        try {
+          await toggleProvider(id, false);
+          ok += 1;
+        } catch {
+          // continue remaining
+        }
+      }
+      if (ok > 0) {
+        message.success(t('settings.providerBatchDisableSuccess', { count: ok }));
+      }
+    } finally {
+      setBatchBusy(false);
+    }
+  }, [batchSelected, batchBusy, providers, toggleProvider, message, t]);
+
+  const handleBatchDelete = useCallback(async () => {
+    if (batchSelected.size === 0 || batchBusy) return;
+    const selectedProviders = providers.filter((p) => batchSelected.has(p.id));
+    const deletable = selectedProviders.filter((p) => !isBuiltinProvider(p));
+    const skipped = selectedProviders.length - deletable.length;
+    if (deletable.length === 0) {
+      if (skipped > 0) {
+        message.warning(t('settings.providerBatchSkipBuiltin', { count: skipped }));
+      }
+      return;
+    }
+    setBatchBusy(true);
+    let ok = 0;
+    const deletedIds = new Set<string>();
+    try {
+      for (const provider of deletable) {
+        try {
+          await deleteProvider(provider.id);
+          deletedIds.add(provider.id);
+          ok += 1;
+        } catch {
+          // continue remaining
+        }
+      }
+      if (ok > 0) {
+        message.success(t('settings.providerBatchDeleteSuccess', { count: ok }));
+      }
+      if (skipped > 0) {
+        message.warning(t('settings.providerBatchSkipBuiltin', { count: skipped }));
+      }
+      setBatchSelected((prev) => {
+        const next = new Set(prev);
+        for (const id of deletedIds) next.delete(id);
+        return next;
+      });
+      if (selectedProviderId && deletedIds.has(selectedProviderId)) {
+        const remaining = providers.filter((p) => !deletedIds.has(p.id));
+        setSelectedProviderId(remaining[0]?.id ?? null);
+      }
+    } finally {
+      setBatchBusy(false);
+    }
+  }, [batchSelected, batchBusy, providers, deleteProvider, selectedProviderId, setSelectedProviderId, message, t]);
+
+  const allFilteredSelected =
+    filteredProviders.length > 0
+    && filteredProviders.every((p) => batchSelected.has(p.id));
+  const someFilteredSelected =
+    filteredProviders.some((p) => batchSelected.has(p.id))
+    && !allFilteredSelected;
+  const deletableSelectedCount = providers.filter(
+    (p) => batchSelected.has(p.id) && !isBuiltinProvider(p),
+  ).length;
 
   const importColumns = useMemo(
     () => [
@@ -335,10 +597,13 @@ export function ProviderList() {
   const handleAddProvider = async () => {
     try {
       const values = await form.validateFields();
+      const providerType = values.provider_type as ProviderType;
+      const isBedrock = providerType === 'bedrock';
       const provider = await createProvider({
         name: values.name,
-        provider_type: values.provider_type,
-        api_host: values.api_host || DEFAULT_HOSTS[values.provider_type as ProviderType],
+        provider_type: providerType,
+        api_host: isBedrock ? '' : values.api_host || DEFAULT_HOSTS[providerType],
+        aws_region: isBedrock ? values.aws_region.trim() : null,
         enabled: true,
       });
       setSelectedProviderId(provider.id);
@@ -398,6 +663,7 @@ export function ProviderList() {
 
   const handleTypeChange = (type: ProviderType) => {
     form.setFieldValue('api_host', DEFAULT_HOSTS[type]);
+    if (type !== 'bedrock') form.setFieldValue('aws_region', undefined);
   };
 
   const handleDragEnd = (sectionProviders: ProviderConfig[]) => (event: DragEndEvent) => {
@@ -432,48 +698,134 @@ export function ProviderList() {
   return (
     <div className="flex h-full flex-col">
       <div className="p-3 flex items-center gap-2">
-        <Input
-          prefix={<Search size={14} />}
-          placeholder={t('settings.filterProviders')}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          allowClear
-          style={{ flex: 1 }}
-        />
-        <Button
-          type="default"
-          aria-label={t('settings.addProvider')}
-          icon={<Plus size={16} />}
-          onClick={() => setModalOpen(true)}
-          style={{ flexShrink: 0 }}
-        />
-        <Dropdown
-          menu={{
-            items: [
-              {
-                key: 'cc-switch',
-                label: t('settings.importFromCcSwitch'),
-                onClick: handleScanCcSwitch,
-              },
-            ],
-          }}
-          trigger={['click']}
-        >
-          <Tooltip title={t('settings.importProviders')}>
+        {batchMode ? (
+          <>
+            <Checkbox
+              aria-label={t('common.selectAll')}
+              checked={allFilteredSelected}
+              indeterminate={someFilteredSelected}
+              disabled={filteredProviders.length === 0 || batchBusy}
+              onChange={(e) => handleBatchToggleAll(e.target.checked)}
+            >
+              <Typography.Text type="secondary" style={{ fontSize: 12, whiteSpace: 'nowrap' }}>
+                {t('settings.providerBatchSelected', {
+                  count: batchSelected.size,
+                })}
+              </Typography.Text>
+            </Checkbox>
+            <div className="flex-1" />
+            <Space size={2}>
+              <Tooltip title={t('settings.batchEnable')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<Power size={14} />}
+                  disabled={batchSelected.size === 0 || batchBusy}
+                  loading={batchBusy}
+                  onClick={() => void handleBatchEnable()}
+                  aria-label={t('settings.batchEnable')}
+                />
+              </Tooltip>
+              <Tooltip title={t('settings.batchDisable')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<PowerOff size={14} />}
+                  disabled={batchSelected.size === 0 || batchBusy}
+                  loading={batchBusy}
+                  onClick={() => void handleBatchDisable()}
+                  aria-label={t('settings.batchDisable')}
+                />
+              </Tooltip>
+              <Popconfirm
+                title={t('settings.providerBatchDeleteConfirm', {
+                  count: deletableSelectedCount,
+                })}
+                onConfirm={() => void handleBatchDelete()}
+                okText={t('common.confirm')}
+                cancelText={t('common.cancel')}
+                okButtonProps={{ danger: true }}
+                disabled={deletableSelectedCount === 0 || batchBusy}
+              >
+                <Tooltip title={t('settings.batchDeleteBtn')}>
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    icon={<Trash2 size={14} />}
+                    disabled={deletableSelectedCount === 0 || batchBusy}
+                    aria-label={t('settings.batchDeleteBtn')}
+                  />
+                </Tooltip>
+              </Popconfirm>
+              <Divider type="vertical" style={{ margin: '0 2px' }} />
+              <Tooltip title={t('settings.batchExit')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<X size={14} />}
+                  onClick={handleExitBatchMode}
+                  disabled={batchBusy}
+                  aria-label={t('settings.batchExit')}
+                />
+              </Tooltip>
+            </Space>
+          </>
+        ) : (
+          <>
+            <Input
+              prefix={<Search size={14} />}
+              placeholder={t('settings.filterProviders')}
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              allowClear
+              style={{ flex: 1 }}
+            />
+            <Tooltip title={t('settings.providerBatchMode')}>
+              <Button
+                type="default"
+                aria-label={t('settings.providerBatchMode')}
+                icon={<ListChecks size={16} />}
+                onClick={handleEnterBatchMode}
+                style={{ flexShrink: 0 }}
+              />
+            </Tooltip>
             <Button
               type="default"
-              aria-label={t('settings.importProviders')}
-              icon={<Download size={16} />}
-              loading={importScanning}
+              aria-label={t('settings.addProvider')}
+              icon={<Plus size={16} />}
+              onClick={() => setModalOpen(true)}
               style={{ flexShrink: 0 }}
             />
-          </Tooltip>
-        </Dropdown>
+            <Dropdown
+              menu={{
+                items: [
+                  {
+                    key: 'cc-switch',
+                    label: t('settings.importFromCcSwitch'),
+                    onClick: handleScanCcSwitch,
+                  },
+                ],
+              }}
+              trigger={['click']}
+            >
+              <Tooltip title={t('settings.importProviders')}>
+                <Button
+                  type="default"
+                  aria-label={t('settings.importProviders')}
+                  icon={<Download size={16} />}
+                  loading={importScanning}
+                  style={{ flexShrink: 0 }}
+                />
+              </Tooltip>
+            </Dropdown>
+          </>
+        )}
       </div>
       <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-0">
         {enabledProviders.length > 0 && (
           <>
-            <div style={sectionHeaderStyle}>{t('settings.enabledProviders', '已启用')}</div>
+            <div style={sectionHeaderStyle}>{t('settings.enabledProviders')}</div>
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
@@ -492,6 +844,10 @@ export function ProviderList() {
                       token={token}
                       onSelect={() => setSelectedProviderId(provider.id)}
                       onToggle={(checked) => toggleProvider(provider.id, checked)}
+                      onRequestDelete={() => handleRequestDeleteProvider(provider.id)}
+                      batchMode={batchMode}
+                      batchChecked={batchSelected.has(provider.id)}
+                      onBatchCheck={(checked) => handleBatchCheck(provider.id, checked)}
                     />
                   ))}
                 </div>
@@ -506,7 +862,7 @@ export function ProviderList() {
 
         {disabledProviders.length > 0 && (
           <>
-            <div style={sectionHeaderStyle}>{t('settings.disabledProviders', '未启用')}</div>
+            <div style={sectionHeaderStyle}>{t('settings.disabledProviders')}</div>
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
@@ -522,9 +878,13 @@ export function ProviderList() {
                       key={provider.id}
                       provider={provider}
                       isSelected={selectedProviderId === provider.id}
-                      token={token}
                       onSelect={() => setSelectedProviderId(provider.id)}
+                      token={token}
                       onToggle={(checked) => toggleProvider(provider.id, checked)}
+                      onRequestDelete={() => handleRequestDeleteProvider(provider.id)}
+                      batchMode={batchMode}
+                      batchChecked={batchSelected.has(provider.id)}
+                      onBatchCheck={(checked) => handleBatchCheck(provider.id, checked)}
                     />
                   ))}
                 </div>
@@ -561,9 +921,27 @@ export function ProviderList() {
           >
             <Select options={PROVIDER_TYPE_OPTIONS} onChange={handleTypeChange} />
           </Form.Item>
-          <Form.Item name="api_host" label={t('settings.apiHost')}>
-            <Input placeholder="https://api.openai.com" />
-          </Form.Item>
+          {selectedProviderType === 'bedrock' ? (
+            <Form.Item
+              name="aws_region"
+              label={t('settings.awsRegion')}
+              rules={[
+                { required: true, whitespace: true, message: t('settings.awsRegionRequired') },
+              ]}
+            >
+              <AutoComplete
+                options={AWS_REGION_OPTIONS}
+                placeholder="us-east-1"
+                filterOption={(input, option) =>
+                  String(option?.value ?? '').toLowerCase().includes(input.toLowerCase())
+                }
+              />
+            </Form.Item>
+          ) : (
+            <Form.Item name="api_host" label={t('settings.apiHost')}>
+              <Input placeholder="https://api.openai.com" />
+            </Form.Item>
+          )}
         </Form>
       </Modal>
 

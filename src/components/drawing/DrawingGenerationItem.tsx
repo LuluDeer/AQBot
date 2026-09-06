@@ -5,15 +5,18 @@ import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { DrawingGeneration, DrawingImage } from '@/types';
 import { describeDrawingSize } from '@/lib/drawingModels';
+import { getDrawingParameterValueLabel } from '@/lib/drawingParameterPresentation';
 import { CopyButton } from '@/components/common/CopyButton';
 import { invoke } from '@/lib/invoke';
 import { copyChatImage, saveChatImage } from '@/lib/chatImageActions';
+import { loadStoredMediaSource } from '@/lib/storedMedia';
 import { DrawingImageStrip } from './DrawingImageStrip';
+import { usePageTransientOpenState } from '@/components/layout/PageLifecycle';
 
 interface Props {
   generation: DrawingGeneration;
-  onEdit: (image: DrawingImage) => void;
-  onMaskEdit: (image: DrawingImage) => void;
+  onEdit?: (image: DrawingImage) => void;
+  onMaskEdit?: (image: DrawingImage) => void;
   onRetry: (generation: DrawingGeneration) => void;
   onStop?: (id: string) => void;
   onDelete: (id: string, deleteResources: boolean) => void;
@@ -29,49 +32,48 @@ function parseParams(generation: DrawingGeneration): Record<string, any> {
   }
 }
 
-function describeQuality(value: string | undefined, t: (key: string, fallback: string) => string) {
-  if (value === 'low') return t('drawing.option.quality.low', '低');
-  if (value === 'medium') return t('drawing.option.quality.medium', '中');
-  if (value === 'high') return t('drawing.option.quality.high', '高');
-  return t('drawing.option.auto', '自动');
+function describeAction(action: DrawingGeneration['action'], t: (key: string) => string) {
+  if (action === 'reference_generate') return t('drawing.action.referenceGenerate');
+  if (action === 'edit') return t('drawing.action.edit');
+  if (action === 'mask_edit') return t('drawing.action.maskEdit');
+  return t('drawing.action.generate');
 }
 
-function describeFormat(value: string | undefined) {
-  return (value || 'png').toUpperCase();
-}
-
-function describeBackground(value: string | undefined, t: (key: string, fallback: string) => string) {
-  if (value === 'opaque') return t('drawing.option.background.opaque', '不透明');
-  if (value === 'transparent') return t('drawing.option.background.transparent', '透明');
-  return t('drawing.option.auto', '自动');
-}
-
-function describeAction(action: DrawingGeneration['action'], t: (key: string, fallback: string) => string) {
-  if (action === 'reference_generate') return t('drawing.action.referenceGenerate', '参考图生成');
-  if (action === 'edit') return t('drawing.action.edit', '编辑');
-  if (action === 'mask_edit') return t('drawing.action.maskEdit', '区域编辑');
-  return t('drawing.action.generate', '文本生成');
-}
-
-function describeSize(value: string | undefined, t: (key: string, fallback: string) => string) {
-  if (!value || value === 'auto') return t('drawing.option.auto', '自动');
+function describeSize(value: string | undefined, t: (key: string) => string) {
+  if (!value || value === 'auto') return t('drawing.option.auto');
   return describeDrawingSize(value);
+}
+
+function outputFormatFromMimeType(mimeType: string | undefined): string | undefined {
+  if (mimeType === 'image/png') return 'png';
+  if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') return 'jpeg';
+  if (mimeType === 'image/webp') return 'webp';
+  return undefined;
 }
 
 const CONTEXT_THUMBNAIL_SIZE = 32;
 
-function DrawingContextThumbnail({ filePath, label }: { filePath: string; label: string }) {
+function DrawingContextThumbnail({
+  storedFileId,
+  filePath,
+  label,
+}: {
+  storedFileId: string;
+  filePath: string;
+  label: string;
+}) {
   const { token } = theme.useToken();
   const [src, setSrc] = useState<string | null>(null);
+  const [previewOpen, setPreviewOpen] = usePageTransientOpenState();
 
   useEffect(() => {
     let cancelled = false;
     setSrc(null);
-    invoke<string>('read_attachment_preview', { filePath })
+    loadStoredMediaSource(storedFileId, filePath)
       .then((data) => { if (!cancelled) setSrc(data); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [filePath]);
+  }, [filePath, storedFileId]);
 
   return (
     <Tooltip title={label}>
@@ -97,7 +99,12 @@ function DrawingContextThumbnail({ filePath, label }: { filePath: string; label:
               objectFit: 'cover',
               borderRadius: 6,
             }}
-            preview={{ mask: { blur: true }, scaleStep: 0.5 }}
+            preview={{
+              open: previewOpen,
+              onOpenChange: setPreviewOpen,
+              mask: { blur: true },
+              scaleStep: 0.5,
+            }}
           />
         ) : null}
       </span>
@@ -111,11 +118,11 @@ function DrawingImageMenuLabel({ image, label }: { image: DrawingImage; label: s
 
   useEffect(() => {
     let cancelled = false;
-    invoke<string>('read_attachment_preview', { filePath: image.storage_path })
+    loadStoredMediaSource(image.stored_file_id, image.storage_path)
       .then((data) => { if (!cancelled) setSrc(data); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [image.storage_path]);
+  }, [image.storage_path, image.stored_file_id]);
 
   return (
     <span className="inline-flex items-center gap-2">
@@ -155,7 +162,10 @@ export function DrawingGenerationItem({
   const firstImage = generation.images[0];
   const hasGeneratedImages = generation.images.length > 0;
   const isRunning = generation.status === 'running';
-  const isStopped = generation.status === 'stopped';
+  const isStopped = generation.status === 'stopped' || generation.status === 'cancelled';
+  const actualOutputFormat = generation.status === 'succeeded'
+    ? outputFormatFromMimeType(firstImage?.mime_type)
+    : undefined;
   const placeholderCount = Number(params.n || generation.images.length || 1);
   const hasMultipleImages = generation.images.length > 1;
   const imageMenuItems = useMemo(() => generation.images.map((image, index) => ({
@@ -170,33 +180,49 @@ export function DrawingGenerationItem({
   const contextThumbnails = useMemo(() => [
     ...(generation.source_images ?? []).map((image, index) => ({
       key: `source-${image.id}`,
+      storedFileId: image.stored_file_id,
       filePath: image.storage_path,
       label: t('drawing.sourceImageWithIndex', `原图 ${index + 1}`, { index: index + 1 }),
     })),
     ...(generation.mask_file ? [{
       key: `mask-${generation.mask_file.id}`,
+      storedFileId: generation.mask_file.id,
       filePath: generation.mask_file.storage_path,
-      label: t('drawing.maskImage', 'Mask 图'),
+      label: t('drawing.maskImage'),
     }] : []),
     ...(generation.reference_files ?? []).map((file, index) => ({
       key: `ref-${file.id}`,
+      storedFileId: file.id,
       filePath: file.storage_path,
       label: t('drawing.referenceImageWithIndex', `参考图 ${index + 1}`, { index: index + 1 }),
     })),
   ], [generation.mask_file, generation.reference_files, generation.source_images, t]);
   const metadata = [
-    { label: t('drawing.meta.action', '类型'), value: describeAction(generation.action, t) },
-    { label: t('drawing.meta.model', '模型'), value: generation.model_id },
-    { label: t('drawing.meta.size', '尺寸'), value: describeSize(params.size, t) },
-    { label: t('drawing.meta.quality', '质量'), value: describeQuality(params.quality, t) },
-    { label: t('drawing.meta.format', '格式'), value: describeFormat(params.output_format) },
-    { label: t('drawing.meta.background', '背景'), value: describeBackground(params.background, t) },
-    { label: t('drawing.meta.count', '张数'), value: String(placeholderCount) },
+    { label: t('drawing.meta.action'), value: describeAction(generation.action, t) },
+    { label: t('drawing.meta.model'), value: generation.model_id },
+    { label: t('drawing.meta.size'), value: describeSize(params.size, t) },
+    {
+      label: t('drawing.meta.quality'),
+      value: getDrawingParameterValueLabel('quality', params.quality ?? 'auto', t),
+    },
+    {
+      label: t('drawing.meta.format'),
+      value: getDrawingParameterValueLabel(
+        'output_format',
+        actualOutputFormat ?? params.output_format ?? 'png',
+        t,
+      ),
+    },
+    {
+      label: t('drawing.meta.background'),
+      value: getDrawingParameterValueLabel('background', params.background ?? 'auto', t),
+    },
+    { label: t('drawing.meta.count'), value: String(placeholderCount) },
   ];
 
   const resolveFirstImagePreview = async () => {
     if (!firstImage) throw new Error('No image to operate on.');
-    return invoke<string>('read_attachment_preview', { filePath: firstImage.storage_path });
+    return loadStoredMediaSource(firstImage.stored_file_id, firstImage.storage_path);
   };
 
   const handleRevealImage = async () => {
@@ -223,7 +249,7 @@ export function DrawingGenerationItem({
     try {
       const src = await resolveFirstImagePreview();
       await copyChatImage(src);
-      message.success(t('common.copySuccess', '已复制到剪贴板'));
+      message.success(t('common.copySuccess'));
     } catch (error) {
       message.error(String(error));
     }
@@ -233,16 +259,16 @@ export function DrawingGenerationItem({
     if (!onUseAsReference) return;
     try {
       onUseAsReference(image);
-      message.success(t('drawing.referenceAdded', '已加入参考图'));
+      message.success(t('drawing.referenceAdded'));
     } catch (error) {
       message.error(String(error));
     }
   };
 
   const renderRetryAction = () => (
-    <Tooltip title={t('drawing.regenerate', '再次生成')}>
+    <Tooltip title={t('drawing.regenerate')}>
       <Button
-        aria-label={t('drawing.regenerate', '再次生成')}
+        aria-label={t('drawing.regenerate')}
         size="small"
         color="default"
         variant="filled"
@@ -254,14 +280,14 @@ export function DrawingGenerationItem({
 
   const renderDirectDeleteAction = () => (
     <Popconfirm
-      title={t('drawing.deleteConfirmTitle', '删除这条绘画记录？')}
-      okText={t('common.confirm', '确认')}
-      cancelText={t('common.cancel', '取消')}
+      title={t('drawing.deleteConfirmTitle')}
+      okText={t('common.confirm')}
+      cancelText={t('common.cancel')}
       onConfirm={() => onDelete(generation.id, false)}
     >
-      <Tooltip title={t('drawing.deleteRecord', '删除')}>
+      <Tooltip title={t('drawing.deleteRecord')}>
         <Button
-          aria-label={t('drawing.deleteRecord', '删除')}
+          aria-label={t('drawing.deleteRecord')}
           size="small"
           color="danger"
           variant="filled"
@@ -330,6 +356,7 @@ export function DrawingGenerationItem({
             {contextThumbnails.map((item) => (
               <DrawingContextThumbnail
                 key={item.key}
+                storedFileId={item.storedFileId}
                 filePath={item.filePath}
                 label={item.label}
               />
@@ -339,7 +366,7 @@ export function DrawingGenerationItem({
                 role="button"
                 tabIndex={0}
                 className="drawing-prompt-trigger rounded-md"
-                aria-label={t('drawing.usePrompt', '使用提示词')}
+                aria-label={t('drawing.usePrompt')}
                 onClick={() => onUsePrompt(generation.prompt)}
                 onKeyDown={(event) => {
                   if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -355,22 +382,22 @@ export function DrawingGenerationItem({
                 </Typography.Text>
               </span>
             </span>
-            <Tooltip title={t('drawing.copyPrompt', '复制提示词')}>
+            <Tooltip title={t('drawing.copyPrompt')}>
               <CopyButton
                 className="drawing-prompt-copy"
                 text={generation.prompt}
-                successMessage={t('common.copySuccess', '已复制到剪贴板')}
+                successMessage={t('common.copySuccess')}
               />
             </Tooltip>
             <span className="ml-2 inline-flex align-middle">
               {generation.status === 'failed' && (
-                <Tag color="error" style={{ marginTop: 3 }}>{t('drawing.failed', '失败')}</Tag>
+                <Tag color="error" style={{ marginTop: 3 }}>{t('drawing.failed')}</Tag>
               )}
               {generation.status === 'running' && (
-                <Tag color="processing" style={{ marginTop: 3 }}>{t('drawing.generating', '生成中')}</Tag>
+                <Tag color="processing" style={{ marginTop: 3 }}>{t('drawing.generating')}</Tag>
               )}
               {isStopped && (
-                <Tag color="warning" style={{ marginTop: 3 }}>{t('drawing.stopped', '主动停止')}</Tag>
+                <Tag color="warning" style={{ marginTop: 3 }}>{t('drawing.stopped')}</Tag>
               )}
             </span>
           </div>
@@ -413,7 +440,7 @@ export function DrawingGenerationItem({
           <CopyButton
             className="drawing-error-copy"
             text={generation.error_message}
-            successMessage={t('common.copySuccess', '已复制到剪贴板')}
+            successMessage={t('common.copySuccess')}
           />
         </div>
       ) : (
@@ -430,15 +457,15 @@ export function DrawingGenerationItem({
       {isRunning && onStop && (
         <div className="mt-4 flex gap-2">
           <Popconfirm
-            title={t('drawing.stopConfirmTitle', '停止生成？')}
-            description={t('drawing.stopConfirmContent', '停止后这条记录会标记为主动停止。')}
-            okText={t('common.confirm', '确认')}
-            cancelText={t('common.cancel', '取消')}
+            title={t('drawing.stopConfirmTitle')}
+            description={t('drawing.stopConfirmContent')}
+            okText={t('common.confirm')}
+            cancelText={t('common.cancel')}
             onConfirm={() => onStop(generation.id)}
           >
-            <Tooltip title={t('common.stop', '停止')}>
+            <Tooltip title={t('common.stop')}>
               <Button
-                aria-label={t('common.stop', '停止')}
+                aria-label={t('common.stop')}
                 size="small"
                 color="default"
                 variant="filled"
@@ -465,17 +492,17 @@ export function DrawingGenerationItem({
                 {
                   key: 'reveal',
                   icon: <FolderOpen size={14} />,
-                  label: t('drawing.openOriginalDirectory', '打开原图目录'),
+                  label: t('drawing.openOriginalDirectory'),
                 },
                 {
                   key: 'save',
                   icon: <Save size={14} />,
-                  label: t('drawing.saveAs', '另存为'),
+                  label: t('drawing.saveAs'),
                 },
                 {
                   key: 'copy',
                   icon: <Clipboard size={14} />,
-                  label: t('drawing.copyToClipboard', '复制到剪切板'),
+                  label: t('drawing.copyToClipboard'),
                 },
               ],
               onClick: ({ key }) => {
@@ -485,9 +512,9 @@ export function DrawingGenerationItem({
               },
             }}
           >
-            <Tooltip title={t('drawing.download', '下载')}>
+            <Tooltip title={t('drawing.download')}>
               <Button
-                aria-label={t('drawing.download', '下载')}
+                aria-label={t('drawing.download')}
                 size="small"
                 color="default"
                 variant="filled"
@@ -498,21 +525,21 @@ export function DrawingGenerationItem({
           </Dropdown>
           {onUseAsReference && (
             renderImageAction({
-              title: t('drawing.useAsReference', '作为参考图'),
-              ariaLabel: t('drawing.useAsReference', '作为参考图'),
+              title: t('drawing.useAsReference'),
+              ariaLabel: t('drawing.useAsReference'),
               icon: <AtSign size={15} />,
               onSelect: handleUseAsReference,
             })
           )}
-          {renderImageAction({
-            title: t('drawing.reEdit', '重新编辑'),
-            ariaLabel: t('drawing.reEdit', '重新编辑'),
+          {onEdit && renderImageAction({
+            title: t('drawing.reEdit'),
+            ariaLabel: t('drawing.reEdit'),
             icon: <Pencil size={15} />,
             onSelect: onEdit,
           })}
-          {renderImageAction({
-            title: t('drawing.maskEdit', '区域编辑'),
-            ariaLabel: t('drawing.maskEdit', '区域编辑'),
+          {onMaskEdit && renderImageAction({
+            title: t('drawing.maskEdit'),
+            ariaLabel: t('drawing.maskEdit'),
             icon: <Focus size={15} />,
             onSelect: onMaskEdit,
           })}
@@ -523,11 +550,11 @@ export function DrawingGenerationItem({
               items: [
                 {
                   key: 'record',
-                  label: t('drawing.deleteRecordOnly', '仅删除记录'),
+                  label: t('drawing.deleteRecordOnly'),
                 },
                 {
                   key: 'all',
-                  label: t('drawing.deleteRecordAndImages', '全部删除'),
+                  label: t('drawing.deleteRecordAndImages'),
                   danger: true,
                 },
               ],
@@ -537,9 +564,9 @@ export function DrawingGenerationItem({
               },
             }}
           >
-            <Tooltip title={t('drawing.deleteRecord', '删除')}>
+            <Tooltip title={t('drawing.deleteRecord')}>
               <Button
-                aria-label={t('drawing.deleteRecord', '删除')}
+                aria-label={t('drawing.deleteRecord')}
                 size="small"
                 color="danger"
                 variant="filled"

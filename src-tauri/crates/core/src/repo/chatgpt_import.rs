@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::entity::{conversations, import_jobs, messages};
 use crate::error::{AQBotError, Result};
 use crate::repo::settings::get_settings;
+use crate::types::ContextStrategy;
 use crate::utils::{gen_id, now_ts};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -200,9 +201,19 @@ pub async fn import_chatgpt_export_from_path(
             active_artifact_id: Set(None),
             research_mode: Set(0),
             context_compression: Set(0),
+            context_strategy_override: Set(Some(
+                ContextStrategy::RawTruncate.as_str().to_string(),
+            )),
+            context_message_limit: Set(None),
+            compression_keep_last_n: Set(None),
+            multi_model_display_mode_override: Set(None),
+            multi_model_targets_json: Set("[]".to_string()),
+            multi_model_continuation_mode: Set("selected".to_string()),
             category_id: Set(None),
             parent_conversation_id: Set(None),
+            sort_order: Set(0),
             mode: Set("chat".to_string()),
+            tab_pin_order: Set(None),
         }
         .insert(&txn)
         .await?;
@@ -714,6 +725,11 @@ mod tests {
         assert_eq!(conversation.message_count, 4);
         assert_eq!(conversation.created_at, 1780000000);
         assert_eq!(conversation.updated_at, 1780000200);
+        assert_eq!(
+            conversation.context_strategy_override.as_deref(),
+            Some("raw_truncate")
+        );
+        assert_eq!(conversation.multi_model_display_mode_override, None);
 
         let imported_messages = messages::Entity::find()
             .filter(messages::Column::ConversationId.eq("chatgpt-conv-1"))

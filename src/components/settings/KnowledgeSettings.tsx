@@ -22,6 +22,7 @@ import { Plus, Trash2, Trash, Settings, GripVertical, MoreHorizontal, Search, Fi
 import { useTranslation } from 'react-i18next';
 import { useKnowledgeStore } from '@/stores';
 import { EmbeddingModelSelect } from '@/components/shared/EmbeddingModelSelect';
+import { BUILTIN_EMBEDDING_DIMENSIONS, isBuiltinEmbeddingRef } from '@/lib/embeddingProfiles';
 import { RerankModelSelect } from '@/components/shared/RerankModelSelect';
 import { IconEditor } from '@/components/shared/IconEditor';
 import { KnowledgeBaseIcon } from '@/components/shared/KnowledgeBaseIcon';
@@ -255,7 +256,7 @@ function KnowledgeBaseDetail({
   onDeleted: () => void;
 }) {
   const { t } = useTranslation();
-  const { documents, loading, updateBase, loadDocuments, addDocument, deleteDocument } =
+  const { documents, loading, updateBase, ensureDocumentsLoaded, loadDocuments, addDocument, deleteDocument } =
     useKnowledgeStore();
   const [messageApi, contextHolder] = message.useMessage();
 
@@ -312,8 +313,8 @@ function KnowledgeBaseDetail({
   const [rebuildingDocIds, setRebuildingDocIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    loadDocuments(base.id);
-  }, [base.id, loadDocuments]);
+    void ensureDocumentsLoaded(base.id);
+  }, [base.id, ensureDocumentsLoaded]);
 
   // Listen for indexing completion events to refresh document status in real-time
   useEffect(() => {
@@ -760,11 +761,15 @@ function KnowledgeBaseDetail({
             />
           </div>
           <Divider style={{ margin: 0 }} />
-          <div className="flex items-center justify-between">
-            <span>{t('settings.knowledge.embeddingModel')}</span>
+          <div className="flex items-start justify-between gap-3">
+            <span className="shrink-0 leading-8">{t('settings.knowledge.embeddingModel')}</span>
             <EmbeddingModelSelect
               value={settingsForm.embeddingProvider}
-              onChange={(val) => setSettingsForm(s => ({ ...s, embeddingProvider: val || undefined }))}
+              onChange={(val) => setSettingsForm(s => ({
+                ...s,
+                embeddingProvider: val || undefined,
+                embeddingDimensions: isBuiltinEmbeddingRef(val) ? BUILTIN_EMBEDDING_DIMENSIONS : s.embeddingDimensions,
+              }))}
               placeholder={t('settings.knowledge.embeddingModelPlaceholder')}
               style={{ width: 280 }}
             />
@@ -795,9 +800,7 @@ function KnowledgeBaseDetail({
               />
             </div>
             <Typography.Text type="secondary" style={{ alignSelf: 'flex-end', width: 280, fontSize: 12 }}>
-              {t('settings.knowledge.retrievalThresholdHelp', {
-                defaultValue: '最低相似度，值越高越严格；过高可能导致知识库无命中。',
-              })}
+              {t('settings.knowledge.retrievalThresholdHelp')}
             </Typography.Text>
           </div>
           <Divider style={{ margin: 0 }} />
@@ -1129,7 +1132,7 @@ function KnowledgeBaseDetail({
           <>
             <div className="flex items-center justify-between mb-3">
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {t('settings.knowledge.totalChunks', '共 {{count}} 个分段', { count: chunks.length })}
+                {t('settings.knowledge.totalChunks', { count: chunks.length })}
               </Typography.Text>
               <Button
                 size="small"
@@ -1247,14 +1250,14 @@ function KnowledgeBaseDetail({
 
 export default function KnowledgeSettings() {
   const { t } = useTranslation();
-  const { bases, loadBases, createBase, setSelectedBaseId } = useKnowledgeStore();
+  const { bases, ensureBasesLoaded, createBase, setSelectedBaseId } = useKnowledgeStore();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [form] = Form.useForm();
 
   useEffect(() => {
-    loadBases();
-  }, [loadBases]);
+    void ensureBasesLoaded();
+  }, [ensureBasesLoaded]);
 
   useEffect(() => {
     if (!selectedId && bases.length > 0) {
@@ -1327,8 +1330,7 @@ export default function KnowledgeSettings() {
           </Form.Item>
           <Form.Item
             name="embeddingProvider"
-            label={t('settings.knowledge.embeddingModel')}
-            rules={[{ required: true, message: t('settings.knowledge.embeddingModelPlaceholder') }]}
+            label={t('settings.knowledge.retrievalEngine')}
           >
             <EmbeddingModelSelect
               value={form.getFieldValue('embeddingProvider')}

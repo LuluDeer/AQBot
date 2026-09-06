@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DrawingGeneration } from '@/types';
+import { clearStoredMediaSourceCache } from '@/lib/storedMedia';
+import * as storedMedia from '@/lib/storedMedia';
 import { DrawingGenerationItem } from '../DrawingGenerationItem';
 
 const invokeMock = vi.hoisted(() => vi.fn());
@@ -9,6 +11,7 @@ const saveChatImageMock = vi.hoisted(() => vi.fn());
 
 vi.mock('@/lib/invoke', () => ({
   invoke: invokeMock,
+  isTauri: () => false,
 }));
 
 vi.mock('@/lib/chatImageActions', () => ({
@@ -18,7 +21,11 @@ vi.mock('@/lib/chatImageActions', () => ({
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (_key: string, fallback?: string) => fallback ?? _key,
+    t: (key: string, fallback?: string) => ({
+      'drawing.option.auto': '自动',
+      'drawing.option.quality.hd': '高清',
+      'drawing.option.quality.standard': '标准',
+    }[key] ?? fallback ?? key),
   }),
 }));
 
@@ -57,6 +64,7 @@ describe('DrawingGenerationItem', () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue('data:image/png;base64,abc');
+    clearStoredMediaSourceCache();
     copyChatImageMock.mockReset();
     copyChatImageMock.mockResolvedValue(undefined);
     saveChatImageMock.mockReset();
@@ -135,6 +143,7 @@ describe('DrawingGenerationItem', () => {
   });
 
   it('renders source, mask, and reference thumbnails before the prompt', async () => {
+    const loadSourceSpy = vi.spyOn(storedMedia, 'loadStoredMediaSource');
     render(
       <DrawingGenerationItem
         generation={generationFixture({
@@ -192,6 +201,10 @@ describe('DrawingGenerationItem', () => {
     expect(invokeMock).toHaveBeenCalledWith('read_attachment_preview', { filePath: 'images/source.png' });
     expect(invokeMock).toHaveBeenCalledWith('read_attachment_preview', { filePath: 'images/mask.png' });
     expect(invokeMock).toHaveBeenCalledWith('read_attachment_preview', { filePath: 'images/ref.png' });
+    expect(loadSourceSpy).toHaveBeenCalledWith('source-file-1', 'images/source.png');
+    expect(loadSourceSpy).toHaveBeenCalledWith('mask-file-1', 'images/mask.png');
+    expect(loadSourceSpy).toHaveBeenCalledWith('ref-file-1', 'images/ref.png');
+    loadSourceSpy.mockRestore();
   });
 
   it('fills the composer prompt when the prompt text is clicked and exposes CopyButton', () => {
@@ -247,6 +260,44 @@ describe('DrawingGenerationItem', () => {
     expect(screen.getByText('4')).toBeDefined();
   });
 
+  it('shows the persisted image format for a succeeded generation', () => {
+    invokeMock.mockImplementation(() => new Promise(() => {}));
+
+    render(
+      <DrawingGenerationItem
+        generation={generationFixture({
+          status: 'succeeded',
+          parameters_json: JSON.stringify({
+            n: 1,
+            size: '1024x1024',
+            quality: 'auto',
+            output_format: 'png',
+            background: 'auto',
+          }),
+          images: [{
+            id: 'image-1',
+            generation_id: 'generation-1',
+            stored_file_id: 'file-1',
+            storage_path: 'images/drawing.jpg',
+            mime_type: 'image/jpeg',
+            width: 1024,
+            height: 1024,
+            revised_prompt: null,
+            created_at: 1,
+          }],
+        })}
+        onEdit={() => {}}
+        onMaskEdit={() => {}}
+        onRetry={() => {}}
+        onDelete={() => {}}
+        onUsePrompt={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('JPEG')).toBeDefined();
+    expect(screen.queryByText('PNG')).toBeNull();
+  });
+
   it('localizes the automatic size value in generation metadata', () => {
     render(
       <DrawingGenerationItem
@@ -270,6 +321,35 @@ describe('DrawingGenerationItem', () => {
     expect(screen.getByText('尺寸')).toBeDefined();
     expect(screen.getAllByText('自动').length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText('auto')).toBeNull();
+  });
+
+  it('localizes hd and standard quality values in generation metadata', () => {
+    const renderItem = (quality: string) => (
+      <DrawingGenerationItem
+        generation={generationFixture({
+          parameters_json: JSON.stringify({
+            n: 1,
+            size: '1024x1024',
+            quality,
+            output_format: 'png',
+            background: 'auto',
+          }),
+        })}
+        onEdit={() => {}}
+        onMaskEdit={() => {}}
+        onRetry={() => {}}
+        onDelete={() => {}}
+        onUsePrompt={() => {}}
+      />
+    );
+    const { rerender } = render(renderItem('hd'));
+
+    expect(screen.getByText('高清')).toBeDefined();
+    expect(screen.queryByText('hd')).toBeNull();
+
+    rerender(renderItem('standard'));
+    expect(screen.getByText('标准')).toBeDefined();
+    expect(screen.queryByText('standard')).toBeNull();
   });
 
   it('shows failed generation errors with a copy action', () => {

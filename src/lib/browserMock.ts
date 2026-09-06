@@ -4,12 +4,107 @@
  * Provides CRUD operations for providers, conversations, apps, settings, and gateway.
  */
 
+import { defaultAgentAllowedTools } from '@/lib/agentAllowedTools';
+
 function genId(): string {
   return crypto.randomUUID();
 }
 
 function nowTs(): number {
   return Date.now();
+}
+
+function compareConversationOrder(a: any, b: any): number {
+  const aOrder = Number.isInteger(a.sort_order) ? a.sort_order : Number.MAX_SAFE_INTEGER;
+  const bOrder = Number.isInteger(b.sort_order) ? b.sort_order : Number.MAX_SAFE_INTEGER;
+  return aOrder - bOrder
+    || (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0)
+    || String(a.id).localeCompare(String(b.id));
+}
+
+function compareConversationListOrder(a: any, b: any): number {
+  return Number(Boolean(b.is_pinned)) - Number(Boolean(a.is_pinned))
+    || (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0)
+    || String(a.id).localeCompare(String(b.id));
+}
+
+function withConversationSortOrder(conversation: any): any {
+  return {
+    ...conversation,
+    multi_model_display_mode_override: conversation.multi_model_display_mode_override ?? null,
+    multi_model_targets: Array.isArray(conversation.multi_model_targets)
+      ? conversation.multi_model_targets
+      : [],
+    multi_model_continuation_mode: conversation.multi_model_continuation_mode === 'per_model'
+      ? 'per_model'
+      : 'selected',
+    sort_order: Number.isInteger(conversation.sort_order) ? conversation.sort_order : 0,
+    tab_pin_order: Number.isInteger(conversation.tab_pin_order) ? conversation.tab_pin_order : null,
+  };
+}
+
+function nextTabPinOrder(conversations: any[]): number {
+  return conversations.reduce((maximum: number, conversation: any) => {
+    if (conversation.is_archived || !Number.isInteger(conversation.tab_pin_order)) return maximum;
+    return Math.max(maximum, conversation.tab_pin_order);
+  }, 0) + 1;
+}
+
+function conversationSortPeers(
+  conversations: any[],
+  categoryId: string | null,
+  pinned: boolean,
+  excludedIds: Set<string>,
+): any[] {
+  return conversations
+    .filter((conversation: any) => (
+      !conversation.is_archived
+      && conversation.parent_conversation_id == null
+      && (conversation.category_id ?? null) === categoryId
+      && (categoryId !== null || Boolean(conversation.is_pinned) === pinned)
+      && !excludedIds.has(conversation.id)
+    ))
+    .sort(compareConversationOrder);
+}
+
+function conversationTopSortOrder(
+  conversations: any[],
+  categoryId: string | null,
+  pinned: boolean,
+  count: number,
+  excludedIds = new Set<string>(),
+): number {
+  const peers = conversationSortPeers(conversations, categoryId, pinned, excludedIds);
+  if (peers.length === 0) return 0;
+  const minimumOrder = peers.reduce(
+    (minimum: number, conversation: any) => Math.min(
+      minimum,
+      Number.isInteger(conversation.sort_order) ? conversation.sort_order : 0,
+    ),
+    Number.MAX_SAFE_INTEGER,
+  );
+  return minimumOrder - count;
+}
+
+function placeConversationsAtTop(
+  conversations: any[],
+  categoryId: string | null,
+  pinned: boolean,
+  conversationIds: string[],
+): void {
+  if (conversationIds.length === 0) return;
+  const movedIds = new Set(conversationIds);
+  const start = conversationTopSortOrder(
+    conversations,
+    categoryId,
+    pinned,
+    conversationIds.length,
+    movedIds,
+  );
+  conversationIds.forEach((id, index) => {
+    const conversation = conversations.find((candidate: any) => candidate.id === id);
+    if (conversation) conversation.sort_order = start + index;
+  });
 }
 
 function getStore<T>(key: string, defaultValue: T): T {
@@ -52,7 +147,6 @@ function chatModel(
   modelId: string,
   name: string,
   capabilities: string[],
-  maxTokens: number | null,
   enabled = true,
   paramOverrides: Record<string, unknown> | null = null,
 ) {
@@ -62,9 +156,12 @@ function chatModel(
     name,
     model_type: 'Chat',
     capabilities,
-    max_tokens: maxTokens,
+    context_window: null,
+    max_output_tokens: null,
     enabled,
     param_overrides: paramOverrides,
+    aliases: [],
+    metadata_state: null,
   };
 }
 
@@ -76,9 +173,12 @@ function imageModel(providerId: string, modelId: string, enabled = true) {
     group_name: 'gpt-image',
     model_type: 'Image',
     capabilities: [],
-    max_tokens: null,
+    context_window: null,
+    max_output_tokens: null,
     enabled,
     param_overrides: null,
+    aliases: [],
+    metadata_state: null,
   };
 }
 
@@ -89,9 +189,12 @@ function rerankModel(providerId: string, modelId: string, name: string, enabled 
     name,
     model_type: 'Rerank',
     capabilities: [],
-    max_tokens: null,
+    context_window: null,
+    max_output_tokens: null,
     enabled,
     param_overrides: null,
+    aliases: [],
+    metadata_state: null,
   };
 }
 
@@ -104,17 +207,17 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-openai', 'gpt-5.5', 'GPT-5.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1000000, true, OPENAI_REASONING_OVERRIDES),
-      chatModel('builtin-openai', 'gpt-5.4', 'GPT-5.4', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1000000, true, OPENAI_REASONING_OVERRIDES),
-      chatModel('builtin-openai', 'gpt-5.4-mini', 'GPT-5.4 Mini', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 400000, true, OPENAI_REASONING_OVERRIDES),
-      chatModel('builtin-openai', 'gpt-5.4-nano', 'GPT-5.4 Nano', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 400000, false, OPENAI_REASONING_OVERRIDES),
-      chatModel('builtin-openai', 'gpt-4.1', 'GPT-4.1', ['TextChat', 'Vision', 'FunctionCalling'], 1047576),
-      chatModel('builtin-openai', 'gpt-4.1-mini', 'GPT-4.1 Mini', ['TextChat', 'Vision', 'FunctionCalling'], 1047576),
-      chatModel('builtin-openai', 'gpt-4.1-nano', 'GPT-4.1 Nano', ['TextChat', 'Vision', 'FunctionCalling'], 1047576, false),
-      chatModel('builtin-openai', 'gpt-4o', 'GPT-4o', ['TextChat', 'Vision', 'FunctionCalling'], 128000, false),
-      chatModel('builtin-openai', 'gpt-4o-mini', 'GPT-4o Mini', ['TextChat', 'Vision', 'FunctionCalling'], 128000, false),
-      chatModel('builtin-openai', 'o3', 'o3', ['TextChat', 'Reasoning', 'FunctionCalling'], 200000, true, OPENAI_REASONING_OVERRIDES),
-      chatModel('builtin-openai', 'o4-mini', 'o4-mini', ['TextChat', 'Reasoning', 'FunctionCalling'], 200000, true, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'gpt-5.5', 'GPT-5.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'gpt-5.4', 'GPT-5.4', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'gpt-5.4-mini', 'GPT-5.4 Mini', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'gpt-5.4-nano', 'GPT-5.4 Nano', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], false, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'gpt-4.1', 'GPT-4.1', ['TextChat', 'Vision', 'FunctionCalling']),
+      chatModel('builtin-openai', 'gpt-4.1-mini', 'GPT-4.1 Mini', ['TextChat', 'Vision', 'FunctionCalling']),
+      chatModel('builtin-openai', 'gpt-4.1-nano', 'GPT-4.1 Nano', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-openai', 'gpt-4o', 'GPT-4o', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-openai', 'gpt-4o-mini', 'GPT-4o Mini', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-openai', 'o3', 'o3', ['TextChat', 'Reasoning', 'FunctionCalling'], true, OPENAI_REASONING_OVERRIDES),
+      chatModel('builtin-openai', 'o4-mini', 'o4-mini', ['TextChat', 'Reasoning', 'FunctionCalling'], true, OPENAI_REASONING_OVERRIDES),
       imageModel('builtin-openai', 'gpt-image-2'),
       imageModel('builtin-openai', 'gpt-image-1.5'),
       imageModel('builtin-openai', 'gpt-image-1', false),
@@ -134,14 +237,14 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-openai-responses', 'gpt-5.5', 'GPT-5.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1000000, true, OPENAI_RESPONSES_REASONING_OVERRIDES),
-      chatModel('builtin-openai-responses', 'gpt-5.4', 'GPT-5.4', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1000000, true, OPENAI_RESPONSES_REASONING_OVERRIDES),
-      chatModel('builtin-openai-responses', 'gpt-5.4-mini', 'GPT-5.4 Mini', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 400000, true, OPENAI_RESPONSES_REASONING_OVERRIDES),
-      chatModel('builtin-openai-responses', 'gpt-4.1', 'GPT-4.1', ['TextChat', 'Vision', 'FunctionCalling'], 1047576),
-      chatModel('builtin-openai-responses', 'gpt-4o', 'GPT-4o', ['TextChat', 'Vision', 'FunctionCalling'], 128000, false),
-      chatModel('builtin-openai-responses', 'gpt-4o-mini', 'GPT-4o Mini', ['TextChat', 'Vision', 'FunctionCalling'], 128000, false),
-      chatModel('builtin-openai-responses', 'o3', 'o3', ['TextChat', 'Reasoning', 'FunctionCalling'], 200000, true, OPENAI_RESPONSES_REASONING_OVERRIDES),
-      chatModel('builtin-openai-responses', 'o4-mini', 'o4-mini', ['TextChat', 'Reasoning', 'FunctionCalling'], 200000, true, OPENAI_RESPONSES_REASONING_OVERRIDES),
+      chatModel('builtin-openai-responses', 'gpt-5.5', 'GPT-5.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_RESPONSES_REASONING_OVERRIDES),
+      chatModel('builtin-openai-responses', 'gpt-5.4', 'GPT-5.4', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_RESPONSES_REASONING_OVERRIDES),
+      chatModel('builtin-openai-responses', 'gpt-5.4-mini', 'GPT-5.4 Mini', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, OPENAI_RESPONSES_REASONING_OVERRIDES),
+      chatModel('builtin-openai-responses', 'gpt-4.1', 'GPT-4.1', ['TextChat', 'Vision', 'FunctionCalling']),
+      chatModel('builtin-openai-responses', 'gpt-4o', 'GPT-4o', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-openai-responses', 'gpt-4o-mini', 'GPT-4o Mini', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-openai-responses', 'o3', 'o3', ['TextChat', 'Reasoning', 'FunctionCalling'], true, OPENAI_RESPONSES_REASONING_OVERRIDES),
+      chatModel('builtin-openai-responses', 'o4-mini', 'o4-mini', ['TextChat', 'Reasoning', 'FunctionCalling'], true, OPENAI_RESPONSES_REASONING_OVERRIDES),
     ],
     keys: [],
     proxy_config: null,
@@ -157,12 +260,12 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-gemini', 'gemini-3.1-pro-preview', 'Gemini 3.1 Pro Preview', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1048576, true, { reasoning_profile: 'gemini_thinking_level' }),
-      chatModel('builtin-gemini', 'gemini-3.1-flash-lite-preview', 'Gemini 3.1 Flash-Lite Preview', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1048576, true, { reasoning_profile: 'gemini_thinking_level' }),
-      chatModel('builtin-gemini', 'gemini-2.5-pro', 'Gemini 2.5 Pro', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1048576, true, { reasoning_profile: 'gemini_thinking_budget' }),
-      chatModel('builtin-gemini', 'gemini-2.5-flash', 'Gemini 2.5 Flash', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1048576, true, { reasoning_profile: 'gemini_thinking_budget' }),
-      chatModel('builtin-gemini', 'gemini-2.5-flash-lite', 'Gemini 2.5 Flash-Lite', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 1048576, true, { reasoning_profile: 'gemini_thinking_budget' }),
-      chatModel('builtin-gemini', 'gemini-2.0-flash', 'Gemini 2.0 Flash', ['TextChat', 'Vision', 'FunctionCalling'], 1048576, false),
+      chatModel('builtin-gemini', 'gemini-3.1-pro-preview', 'Gemini 3.1 Pro Preview', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'gemini_thinking_level' }),
+      chatModel('builtin-gemini', 'gemini-3.1-flash-lite-preview', 'Gemini 3.1 Flash-Lite Preview', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'gemini_thinking_level' }),
+      chatModel('builtin-gemini', 'gemini-2.5-pro', 'Gemini 2.5 Pro', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'gemini_thinking_budget' }),
+      chatModel('builtin-gemini', 'gemini-2.5-flash', 'Gemini 2.5 Flash', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'gemini_thinking_budget' }),
+      chatModel('builtin-gemini', 'gemini-2.5-flash-lite', 'Gemini 2.5 Flash-Lite', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'gemini_thinking_budget' }),
+      chatModel('builtin-gemini', 'gemini-2.0-flash', 'Gemini 2.0 Flash', ['TextChat', 'Vision', 'FunctionCalling'], false),
     ],
     keys: [],
     proxy_config: null,
@@ -178,9 +281,9 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-anthropic', 'claude-opus-4-7-20260127', 'Claude Opus 4.7', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 200000, true, { reasoning_profile: 'anthropic_adaptive' }),
-      chatModel('builtin-anthropic', 'claude-sonnet-4-6-20251117', 'Claude Sonnet 4.6', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 200000, true, { reasoning_profile: 'anthropic_adaptive' }),
-      chatModel('builtin-anthropic', 'claude-haiku-4-5-20251001', 'Claude Haiku 4.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], 200000, true, { reasoning_profile: 'anthropic_budget_tokens' }),
+      chatModel('builtin-anthropic', 'claude-opus-4-7-20260127', 'Claude Opus 4.7', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'anthropic_adaptive' }),
+      chatModel('builtin-anthropic', 'claude-sonnet-4-6-20251117', 'Claude Sonnet 4.6', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'anthropic_adaptive' }),
+      chatModel('builtin-anthropic', 'claude-haiku-4-5-20251001', 'Claude Haiku 4.5', ['TextChat', 'Vision', 'FunctionCalling', 'Reasoning'], true, { reasoning_profile: 'anthropic_budget_tokens' }),
     ],
     keys: [],
     proxy_config: null,
@@ -196,10 +299,10 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-deepseek', 'deepseek-v4-flash', 'DeepSeek v4 Flash', ['TextChat', 'Reasoning', 'FunctionCalling'], 1000000, true, { reasoning_profile: 'openai_reasoning_effort' }),
-      chatModel('builtin-deepseek', 'deepseek-v4-pro', 'DeepSeek v4 Pro', ['TextChat', 'Reasoning', 'FunctionCalling'], 1000000, true, { reasoning_profile: 'openai_reasoning_effort' }),
-      chatModel('builtin-deepseek', 'deepseek-chat', 'DeepSeek Chat', ['TextChat', 'FunctionCalling'], 64000, false),
-      chatModel('builtin-deepseek', 'deepseek-reasoner', 'DeepSeek Reasoner', ['TextChat', 'Reasoning'], 64000, false, { reasoning_profile: 'openai_reasoning_effort' }),
+      chatModel('builtin-deepseek', 'deepseek-v4-flash', 'DeepSeek v4 Flash', ['TextChat', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'openai_reasoning_effort' }),
+      chatModel('builtin-deepseek', 'deepseek-v4-pro', 'DeepSeek v4 Pro', ['TextChat', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'openai_reasoning_effort' }),
+      chatModel('builtin-deepseek', 'deepseek-chat', 'DeepSeek Chat', ['TextChat', 'FunctionCalling'], false),
+      chatModel('builtin-deepseek', 'deepseek-reasoner', 'DeepSeek Reasoner', ['TextChat', 'Reasoning'], false, { reasoning_profile: 'openai_reasoning_effort' }),
     ],
     keys: [],
     proxy_config: null,
@@ -215,9 +318,9 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-xai', 'grok-4.3', 'Grok 4.3', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], null, true, { reasoning_profile: 'none' }),
-      chatModel('builtin-xai', 'grok-3', 'Grok 3', ['TextChat', 'Vision', 'FunctionCalling'], 131072, false),
-      chatModel('builtin-xai', 'grok-3-mini', 'Grok 3 Mini', ['TextChat', 'Reasoning', 'FunctionCalling'], 131072, false, { reasoning_profile: 'none' }),
+      chatModel('builtin-xai', 'grok-4.3', 'Grok 4.3', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'none' }),
+      chatModel('builtin-xai', 'grok-3', 'Grok 3', ['TextChat', 'Vision', 'FunctionCalling'], false),
+      chatModel('builtin-xai', 'grok-3-mini', 'Grok 3 Mini', ['TextChat', 'Reasoning', 'FunctionCalling'], false, { reasoning_profile: 'none' }),
     ],
     keys: [],
     proxy_config: null,
@@ -233,9 +336,9 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-glm', 'glm-5.1', 'GLM-5.1', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], 200000, true, { reasoning_profile: 'glm_thinking' }),
-      chatModel('builtin-glm', 'glm-5', 'GLM-5', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], 128000, true, { reasoning_profile: 'glm_thinking' }),
-      chatModel('builtin-glm', 'glm-4.6', 'GLM-4.6', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], 128000, false, { reasoning_profile: 'glm_thinking' }),
+      chatModel('builtin-glm', 'glm-5.1', 'GLM-5.1', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'glm_thinking' }),
+      chatModel('builtin-glm', 'glm-5', 'GLM-5', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'glm_thinking' }),
+      chatModel('builtin-glm', 'glm-4.6', 'GLM-4.6', ['TextChat', 'Vision', 'Reasoning', 'FunctionCalling'], false, { reasoning_profile: 'glm_thinking' }),
     ],
     keys: [],
     proxy_config: null,
@@ -251,10 +354,10 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-siliconflow', 'deepseek-ai/DeepSeek-V3.2-Exp', 'DeepSeek-V3.2-Exp', ['TextChat', 'FunctionCalling'], 64000),
-      chatModel('builtin-siliconflow', 'deepseek-ai/DeepSeek-R1', 'DeepSeek-R1', ['TextChat', 'Reasoning'], 64000, true, { reasoning_profile: 'siliconflow_enable_thinking' }),
-      chatModel('builtin-siliconflow', 'Qwen/Qwen3-235B-A22B', 'Qwen3-235B-A22B', ['TextChat', 'Reasoning', 'FunctionCalling'], 262144, true, { reasoning_profile: 'siliconflow_enable_thinking' }),
-      chatModel('builtin-siliconflow', 'Qwen/Qwen3-Coder-480B-A35B-Instruct', 'Qwen3-Coder-480B-A35B-Instruct', ['TextChat', 'FunctionCalling'], 262144),
+      chatModel('builtin-siliconflow', 'deepseek-ai/DeepSeek-V3.2-Exp', 'DeepSeek-V3.2-Exp', ['TextChat', 'FunctionCalling']),
+      chatModel('builtin-siliconflow', 'deepseek-ai/DeepSeek-R1', 'DeepSeek-R1', ['TextChat', 'Reasoning'], true, { reasoning_profile: 'siliconflow_enable_thinking' }),
+      chatModel('builtin-siliconflow', 'Qwen/Qwen3-235B-A22B', 'Qwen3-235B-A22B', ['TextChat', 'Reasoning', 'FunctionCalling'], true, { reasoning_profile: 'siliconflow_enable_thinking' }),
+      chatModel('builtin-siliconflow', 'Qwen/Qwen3-Coder-480B-A35B-Instruct', 'Qwen3-Coder-480B-A35B-Instruct', ['TextChat', 'FunctionCalling']),
     ],
     keys: [],
     proxy_config: null,
@@ -270,13 +373,58 @@ const BUILT_IN_PROVIDERS = [
     api_path: null,
     enabled: true,
     models: [
-      chatModel('builtin-minimax', 'MiniMax-M2.7', 'MiniMax-M2.7', ['TextChat', 'FunctionCalling'], 250000, true, MINIMAX_M2_OVERRIDES),
-      chatModel('builtin-minimax', 'MiniMax-M2.5', 'MiniMax-M2.5', ['TextChat', 'FunctionCalling'], 250000, true, MINIMAX_M2_OVERRIDES),
-      chatModel('builtin-minimax', 'MiniMax-M1', 'MiniMax-M1', ['TextChat', 'Reasoning', 'FunctionCalling'], 1000000, false),
+      chatModel('builtin-minimax', 'MiniMax-M2.7', 'MiniMax-M2.7', ['TextChat', 'FunctionCalling'], true, MINIMAX_M2_OVERRIDES),
+      chatModel('builtin-minimax', 'MiniMax-M2.5', 'MiniMax-M2.5', ['TextChat', 'FunctionCalling'], true, MINIMAX_M2_OVERRIDES),
+      chatModel('builtin-minimax', 'MiniMax-M1', 'MiniMax-M1', ['TextChat', 'Reasoning', 'FunctionCalling'], false),
     ],
     keys: [],
     proxy_config: null,
     sort_order: 8,
+    created_at: 1700000000000,
+    updated_at: 1700000000000,
+  },
+  {
+    id: 'builtin-shuaiapi',
+    builtin_id: 'shuaiapi',
+    name: 'SHUAI API',
+    provider_type: 'openai',
+    api_host: 'https://api.shuaiapi.com',
+    api_path: null,
+    enabled: false,
+    models: [],
+    keys: [],
+    proxy_config: null,
+    sort_order: 9,
+    created_at: 1700000000000,
+    updated_at: 1700000000000,
+  },
+  {
+    id: 'builtin-gptnb',
+    builtin_id: 'gptnb',
+    name: 'GPTNB',
+    provider_type: 'openai',
+    api_host: 'https://goapi.gptnb.ai',
+    api_path: null,
+    enabled: false,
+    models: [],
+    keys: [],
+    proxy_config: null,
+    sort_order: 10,
+    created_at: 1700000000000,
+    updated_at: 1700000000000,
+  },
+  {
+    id: 'builtin-newapi',
+    builtin_id: 'newapi',
+    name: 'New API',
+    provider_type: 'openai',
+    api_host: '',
+    api_path: null,
+    enabled: false,
+    models: [],
+    keys: [],
+    proxy_config: null,
+    sort_order: 11,
     created_at: 1700000000000,
     updated_at: 1700000000000,
   },
@@ -294,7 +442,7 @@ const BUILT_IN_PROVIDERS = [
     ],
     keys: [],
     proxy_config: null,
-    sort_order: 9,
+    sort_order: 12,
     created_at: 1700000000000,
     updated_at: 1700000000000,
   },
@@ -313,7 +461,7 @@ const BUILT_IN_PROVIDERS = [
     ],
     keys: [],
     proxy_config: null,
-    sort_order: 10,
+    sort_order: 13,
     created_at: 1700000000000,
     updated_at: 1700000000000,
   },
@@ -332,30 +480,94 @@ const BUILT_IN_PROVIDERS = [
     ],
     keys: [],
     proxy_config: null,
-    sort_order: 11,
+    sort_order: 14,
     created_at: 1700000000000,
     updated_at: 1700000000000,
   },
 ];
 
+function cloneBuiltInValue<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+/** Pre-SHUAI API sort orders for rerank providers (before sort_order 9 was taken). */
+const LEGACY_RERANK_SORT_BEFORE_SHUAIAPI: Record<string, number> = {
+  'builtin-jina': 9,
+  'builtin-cohere': 10,
+  'builtin-voyage': 11,
+};
+
+/** Pre-GPTNB sort orders (after SHUAI API occupied 9). */
+const LEGACY_RERANK_SORT_BEFORE_GPTNB: Record<string, number> = {
+  'builtin-jina': 10,
+  'builtin-cohere': 11,
+  'builtin-voyage': 12,
+};
+
+/** Pre-New API sort orders (after GPTNB occupied 10). */
+const LEGACY_RERANK_SORT_BEFORE_NEWAPI: Record<string, number> = {
+  'builtin-jina': 11,
+  'builtin-cohere': 12,
+  'builtin-voyage': 13,
+};
+
+function shiftRerankProviderSortOrders(
+  providers: any[],
+  legacyMap: Record<string, number>,
+): boolean {
+  let dirty = false;
+  for (const [providerId, legacySortOrder] of Object.entries(legacyMap)) {
+    const provider = providers.find((item: any) => item.id === providerId);
+    if (provider?.sort_order === legacySortOrder) {
+      provider.sort_order = legacySortOrder + 1;
+      dirty = true;
+    }
+  }
+  return dirty;
+}
+
 function initProviders(): any[] {
   const existing = getStore<any[]>('providers', []);
   if (existing.length === 0) {
-    setStore('providers', BUILT_IN_PROVIDERS);
-    return [...BUILT_IN_PROVIDERS];
+    const providers = cloneBuiltInValue(BUILT_IN_PROVIDERS);
+    setStore('providers', providers);
+    return providers;
   }
-  // Restore missing models for built-in providers (e.g. after a bad fetch_remote_models wipe)
+  // Restore missing built-in providers and models (e.g. after an upgrade or a bad fetch_remote_models wipe)
+  const isShuaiApiMissing = !existing.some((provider: any) => provider.id === 'builtin-shuaiapi');
+  const isGptnbMissing = !existing.some((provider: any) => provider.id === 'builtin-gptnb');
+  const isNewApiMissing = !existing.some((provider: any) => provider.id === 'builtin-newapi');
   let dirty = false;
+  if (isShuaiApiMissing) {
+    dirty = shiftRerankProviderSortOrders(existing, LEGACY_RERANK_SORT_BEFORE_SHUAIAPI) || dirty;
+  }
+  if (isGptnbMissing) {
+    dirty = shiftRerankProviderSortOrders(existing, LEGACY_RERANK_SORT_BEFORE_GPTNB) || dirty;
+  }
+  if (isNewApiMissing) {
+    dirty = shiftRerankProviderSortOrders(existing, LEGACY_RERANK_SORT_BEFORE_NEWAPI) || dirty;
+  }
   for (const builtin of BUILT_IN_PROVIDERS) {
     const stored = existing.find((p: any) => p.id === builtin.id);
-    if (stored && (!stored.models || stored.models.length === 0)) {
-      stored.models = [...builtin.models];
+    if (!stored) {
+      const insertionIndex = existing.findIndex(
+        (provider: any) => (provider.sort_order ?? Number.MAX_SAFE_INTEGER) >= builtin.sort_order,
+      );
+      const provider = cloneBuiltInValue(builtin);
+      if (insertionIndex === -1) {
+        existing.push(provider);
+      } else {
+        existing.splice(insertionIndex, 0, provider);
+      }
       dirty = true;
-    } else if (stored) {
+    } else if (builtin.models.length > 0 && (!stored.models || stored.models.length === 0)) {
+      stored.models = cloneBuiltInValue(builtin.models);
+      dirty = true;
+    } else if (builtin.models.length > 0) {
       const storedModelIds = new Set((stored.models || []).map((model: any) => model.model_id));
       const missingModels = builtin.models.filter((model: any) => !storedModelIds.has(model.model_id));
       if (missingModels.length > 0) {
-        stored.models = [...(stored.models || []), ...missingModels];
+        stored.models = [...(stored.models || []), ...cloneBuiltInValue(missingModels)];
         dirty = true;
       }
     }
@@ -370,11 +582,26 @@ const DEFAULT_SETTINGS = {
   theme_mode: 'system',
   primary_color: '#17A93D',
   font_size: 14,
+  settings_sidebar_density: 'standard',
   language: 'zh-CN',
   minimize_to_tray: true,
+  tray_enabled: true,
+  tray_icon_style: 'color',
+  tray_icon_file_id: null,
+  use_tray_icon_as_app_icon: false,
   release_webview_on_tray: false,
+  multi_model_execution_mode: 'parallel',
+  multi_model_sequential_interval_seconds: 3,
+  multi_model_side_by_side_width_mode: 'scroll',
+  multi_model_popout_side_by_side_width_mode: 'scroll',
+  selection_toolbar: {
+    placement: 'below',
+    result_pinned_by_default: false,
+    result_pinning_mode: 'global',
+  },
   send_on_enter: true,
   stream_response: true,
+  model_catalog_source: 'builtin',
   global_shortcut: 'CmdOrCtrl+Shift+A',
   shortcut_toggle_current_window: 'CmdOrCtrl+Shift+A',
   shortcut_toggle_all_windows: 'CmdOrCtrl+Shift+Alt+A',
@@ -392,6 +619,7 @@ const DEFAULT_SETTINGS = {
   global_shortcuts_enabled: true,
   shortcut_registration_logs_enabled: false,
   shortcut_trigger_toast_enabled: false,
+  titlebar_icon_visibility: {},
   proxy_enabled: false,
   proxy_url: '',
   auto_backup: false,
@@ -408,11 +636,14 @@ const DEFAULT_SETTINGS = {
   chat_ai_message_area_dark_color: 'rgba(255, 255, 255, 0.06)',
   chat_ai_message_area_border_width: 1,
   inherit_conversation_preferences_on_create: true,
+  conversation_tabs_enabled: false,
   chat_stream_first_packet_timeout_secs: 180,
   chat_stream_idle_timeout_secs: 90,
   agent_workspace_root: null,
   agent_workspace_name_strategy: 'uuid',
   agent_workspace_datetime_format: 'YYYY-MM-DD-HH-mm-ss',
+  agent_allowed_tools_enabled: false,
+  agent_allowed_tools: defaultAgentAllowedTools(),
   s3_bucket: null,
   s3_region: 'us-east-1',
   s3_endpoint: null,
@@ -440,7 +671,7 @@ const MARKETPLACE_ROLES = [
     description: '把输入翻译成英文并改写得更自然。',
     system_prompt: 'Act as an English translator and writing improver. Translate the user input into fluent, natural English.',
     opening_message: 'Send text to translate or polish in English.',
-    opening_questions: ['Translate this paragraph'],
+    opening_questions: [{ title: null, content: 'Translate this paragraph' }],
     tags: ['translation', 'writing'],
     avatar: '🌐',
     avatar_type: 'emoji',
@@ -457,7 +688,7 @@ const MARKETPLACE_ROLES = [
     description: '按雅思写作评分维度给出建议。',
     system_prompt: '你是雅思写作考官。请根据雅思写作评分维度评价用户作文并给出修改建议。',
     opening_message: '把你的雅思作文发给我。',
-    opening_questions: ['评估这篇作文'],
+    opening_questions: [{ title: null, content: '评估这篇作文' }],
     tags: ['中文', '写作'],
     avatar: '📝',
     avatar_type: 'emoji',
@@ -485,12 +716,140 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
     case 'get_settings':
       return getStore('settings', DEFAULT_SETTINGS) as T;
     case 'save_settings': {
-      const settings = (args as any)?.settings;
+      const settings = (args as any)?.settings ?? {};
       const current = getStore('settings', DEFAULT_SETTINGS);
-      const merged = { ...current, ...settings };
+      const {
+        multi_model_side_by_side_width_mode: _mainWidthMode,
+        multi_model_popout_side_by_side_width_mode: _popoutWidthMode,
+        ...rest
+      } = settings;
+      const merged = {
+        ...current,
+        ...rest,
+        multi_model_side_by_side_width_mode: current.multi_model_side_by_side_width_mode,
+        multi_model_popout_side_by_side_width_mode: current.multi_model_popout_side_by_side_width_mode,
+      };
       setStore('settings', merged);
-      return merged as T;
+      return { saved: true, warnings: [] } as T;
     }
+    case 'get_multi_model_column_layout':
+      return getStore('multi_model_column_layout', {
+        mainWidthMode: 'scroll',
+        popoutWidthMode: 'scroll',
+        columnWidths: {},
+      }) as T;
+    case 'set_multi_model_side_by_side_width_mode': {
+      const current = getStore('multi_model_column_layout', {
+        mainWidthMode: 'scroll',
+        popoutWidthMode: 'scroll',
+        columnWidths: {},
+      });
+      const view = (args as any)?.view;
+      const mode = (args as any)?.mode === 'fit' ? 'fit' : 'scroll';
+      const next = {
+        ...current,
+        ...(view === 'popout' ? { popoutWidthMode: mode } : { mainWidthMode: mode }),
+      };
+      setStore('multi_model_column_layout', next);
+      return next as T;
+    }
+    case 'set_multi_model_column_width': {
+      const current = getStore('multi_model_column_layout', {
+        mainWidthMode: 'scroll',
+        popoutWidthMode: 'scroll',
+        columnWidths: {},
+      });
+      const view = (args as any)?.view;
+      const providerId = String((args as any)?.providerId ?? '');
+      const modelId = String((args as any)?.modelId ?? '');
+      const widthPx = (args as any)?.widthPx as number | null | undefined;
+      const key = `${providerId}:${modelId}`;
+      const columnWidths: Record<string, number> = { ...(current.columnWidths ?? {}) };
+      if (widthPx == null) {
+        delete columnWidths[key];
+      } else {
+        columnWidths[key] = widthPx;
+      }
+      const next = {
+        ...current,
+        columnWidths,
+        ...(widthPx == null
+          ? {}
+          : view === 'popout'
+            ? { popoutWidthMode: 'scroll' }
+            : { mainWidthMode: 'scroll' }),
+      };
+      setStore('multi_model_column_layout', next);
+      return next as T;
+    }
+    case 'list_system_fonts':
+      return [] as T;
+    case 'list_system_font_faces':
+      return [] as T;
+    case 'get_previous_crash_report':
+      return null as T;
+    case 'acknowledge_previous_crash_report':
+      return undefined as T;
+    case 'selection_toolbar_get_runtime_status':
+    case 'selection_toolbar_retry_monitoring':
+      return {
+        state: 'unavailable',
+        platform: 'unsupported',
+        permission: 'unknown',
+        last_error: {
+          code: 'browser_preview',
+          message: 'Selection monitoring is unavailable in browser preview mode.',
+        },
+        global_dismissal_supported: false,
+      } as T;
+    case 'selection_toolbar_get_snapshot':
+      return {
+        runtime: {
+          state: 'unavailable',
+          platform: 'unsupported',
+          permission: 'unknown',
+          last_error: {
+            code: 'browser_preview',
+            message: 'Selection monitoring is unavailable in browser preview mode.',
+          },
+          global_dismissal_supported: false,
+        },
+        session: null,
+        run: null,
+        history: [],
+        capture_error: null,
+      } as T;
+    case 'selection_toolbar_frontend_ready':
+    case 'selection_toolbar_set_translate_target':
+    case 'selection_toolbar_stop_generation':
+    case 'selection_toolbar_copy_selection':
+    case 'selection_toolbar_copy_result':
+    case 'selection_toolbar_drag_ended':
+    case 'selection_toolbar_close':
+    case 'selection_toolbar_clear_capture_error':
+    case 'selection_toolbar_register_screenshot_shortcut':
+      return undefined as T;
+    case 'selection_toolbar_set_pinned':
+      return Boolean(args?.pinned) as T;
+    case 'selection_toolbar_set_surface':
+      return (args?.surface === 'overflow' ? 'below' : null) as T;
+    case 'selection_toolbar_prepare_overflow':
+      return 'below' as T;
+    case 'capture_overlay_snapshot':
+    case 'capture_overlay_image':
+    case 'capture_overlay_confirm':
+    case 'capture_overlay_cancel':
+      throw { code: 'capture_unavailable', detail: 'Screen capture is unavailable in browser preview mode.' };
+    case 'selection_toolbar_open_permission_settings':
+    case 'selection_toolbar_request_permission':
+    case 'selection_toolbar_trigger':
+    case 'selection_toolbar_capture_screenshot':
+    case 'selection_toolbar_get_input':
+    case 'selection_toolbar_read_image':
+    case 'selection_toolbar_execute_tool':
+    case 'selection_toolbar_follow_up':
+    case 'selection_toolbar_regenerate':
+      throw new Error('Selection toolbar is unavailable in browser preview mode.');
 
     // ── Providers ─────────────────────────────────────────────────────
     case 'list_providers':
@@ -504,6 +863,8 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
         name: input.name,
         provider_type: input.provider_type,
         api_host: input.api_host,
+        api_path: input.api_path ?? null,
+        aws_region: input.aws_region ?? null,
         enabled: input.enabled ?? true,
         models: [],
         keys: [],
@@ -577,6 +938,70 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       }
       return key as T;
     }
+    case 'update_provider_key': {
+      const { keyId, rawKey } = args as any;
+      const providers = getStore<any[]>('providers', []);
+      for (const provider of providers) {
+        const key = provider.keys.find((current: any) => current.id === keyId);
+        if (key) {
+          key.key_encrypted = rawKey;
+          key.key_prefix = rawKey.substring(0, 8) + '...';
+          setStore('providers', providers);
+          return key as T;
+        }
+      }
+      throw new Error('Provider key not found');
+    }
+    case 'get_decrypted_provider_key': {
+      const { keyId } = args as any;
+      for (const provider of getStore<any[]>('providers', [])) {
+        const key = provider.keys.find((current: any) => current.id === keyId);
+        if (key) return key.key_encrypted as T;
+      }
+      throw new Error('Provider key not found');
+    }
+    case 'add_bedrock_credentials': {
+      const { providerId, credentials } = args as any;
+      const key = {
+        id: genId(),
+        provider_id: providerId,
+        key_encrypted: JSON.stringify(credentials),
+        key_prefix: credentials.access_key_id.substring(0, 8) + '…',
+        enabled: true,
+        last_validated_at: null,
+        last_error: null,
+        rotation_index: 0,
+        created_at: nowTs(),
+      };
+      const providers = getStore<any[]>('providers', []);
+      const provider = providers.find((current: any) => current.id === providerId);
+      if (!provider) throw new Error('Provider not found');
+      provider.keys.push(key);
+      setStore('providers', providers);
+      return key as T;
+    }
+    case 'update_bedrock_credentials': {
+      const { keyId, credentials } = args as any;
+      const providers = getStore<any[]>('providers', []);
+      for (const provider of providers) {
+        const key = provider.keys.find((current: any) => current.id === keyId);
+        if (key) {
+          key.key_encrypted = JSON.stringify(credentials);
+          key.key_prefix = credentials.access_key_id.substring(0, 8) + '…';
+          setStore('providers', providers);
+          return key as T;
+        }
+      }
+      throw new Error('Provider key not found');
+    }
+    case 'get_decrypted_bedrock_credentials': {
+      const { keyId } = args as any;
+      for (const provider of getStore<any[]>('providers', [])) {
+        const key = provider.keys.find((current: any) => current.id === keyId);
+        if (key) return JSON.parse(key.key_encrypted) as T;
+      }
+      throw new Error('Provider key not found');
+    }
     case 'delete_provider_key': {
       const { keyId } = args as any;
       const providers = getStore<any[]>('providers', []);
@@ -639,16 +1064,126 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
     case 'fetch_remote_models': {
       const providers = getStore('providers', []) as any[];
       const target = providers.find((p: any) => p.id === (args as any).providerId);
-      return (target?.models ?? []) as T;
+      return {
+        candidates: (target?.models ?? []).map((model: any) => ({
+          proposed_model: model,
+          status: 'synced',
+          catalog_mode: null,
+          inference_source: 'default',
+          changes: [],
+          unsupported_reason: null,
+        })),
+        catalog: {
+          configured_source: 'builtin',
+          source: 'unavailable',
+          freshness: 'unknown',
+          matched_context_windows: 0,
+          total_chat_models: 0,
+          matched_models: 0,
+          autofilled_fields: 0,
+          inferred_types: 0,
+          unsupported_models: 0,
+          checked_at: null,
+          warning: 'Model catalog is unavailable in browser preview mode.',
+        },
+      } as T;
+    }
+    case 'infer_model_metadata': {
+      const model = { ...(args as any).model };
+      if ((args as any).automaticOnly) {
+        model.context_window = null;
+        model.max_output_tokens = null;
+        model.param_overrides = {
+          ...(model.param_overrides ?? {}),
+          no_system_role: undefined,
+          omit_sampling_params: undefined,
+          reasoning_options: undefined,
+        };
+      }
+      const normalized = `${model.model_id} ${model.name}`.toLowerCase();
+      if (/(^|[^a-z0-9])(rerank|reranker|colbert)([^a-z0-9]|$)/.test(normalized)) {
+        model.model_type = 'Rerank';
+        model.capabilities = [];
+      } else if (/(^|[^a-z0-9])(embed|embedding)([^a-z0-9]|$)/.test(normalized)) {
+        model.model_type = 'Embedding';
+        model.capabilities = [];
+      } else if (/(gpt-image|dall-e|imagen|flux|stable-diffusion|(^|[^a-z0-9])image([^a-z0-9]|$))/.test(normalized)) {
+        model.model_type = 'Image';
+        model.capabilities = [];
+      } else if (/(^|[^a-z0-9])(voice|tts|speech|whisper|audio|realtime)([^a-z0-9]|$)/.test(normalized)) {
+        model.model_type = 'Voice';
+        model.capabilities = normalized.includes('realtime') ? ['RealtimeVoice'] : [];
+      } else {
+        model.model_type = 'Chat';
+        model.capabilities = ['TextChat'];
+      }
+      const typeSource = model.model_type === 'Chat' ? 'default' : 'heuristic';
+      model.metadata_state = {
+        schema_version: 1,
+        catalog_key: null,
+        catalog_mode: null,
+        model_type: typeSource,
+        capabilities: typeSource,
+        context_window: 'default',
+        max_output_tokens: 'default',
+        no_system_role: 'default',
+        omit_sampling_params: 'default',
+        reasoning_options: 'default',
+      };
+      return {
+        proposed_model: model,
+        status: 'remote-only',
+        catalog_mode: null,
+        inference_source: typeSource,
+        changes: [],
+        unsupported_reason: null,
+      } as T;
+    }
+    case 'apply_model_sync': {
+      const { providerId, models } = args as any;
+      const providers = getStore<any[]>('providers', []);
+      const provider = providers.find((item: any) => item.id === providerId);
+      if (provider) provider.models = models;
+      setStore('providers', providers);
+      return undefined as T;
+    }
+    case 'update_model_metadata': {
+      const { providerId, model } = args as any;
+      const providers = getStore<any[]>('providers', []);
+      const provider = providers.find((item: any) => item.id === providerId);
+      if (!provider) throw new Error('Provider not found');
+      const index = provider.models.findIndex((item: any) => item.model_id === model.model_id);
+      if (index >= 0) provider.models[index] = model;
+      else provider.models.push(model);
+      setStore('providers', providers);
+      return model as T;
+    }
+    case 'reset_model_metadata': {
+      const providers = getStore<any[]>('providers', []);
+      const provider = providers.find((item: any) => item.id === (args as any).providerId);
+      return (provider?.models ?? []) as T;
     }
 
     // ── Conversations ─────────────────────────────────────────────────
     case 'list_conversations':
-      return getStore('conversations', []).filter((c: any) => !c.is_archived) as T;
+      return getStore<any[]>('conversations', [])
+        .filter((c: any) => !c.is_archived)
+        .sort(compareConversationListOrder)
+        .map(withConversationSortOrder) as T;
+    case 'get_conversation_snapshot': {
+      const conversation = getStore<any[]>('conversations', [])
+        .find((item: any) => item.id === (args as any).id);
+      if (!conversation) throw new Error('Conversation not found');
+      return withConversationSortOrder(conversation) as T;
+    }
     case 'list_archived_conversations':
-      return getStore('conversations', []).filter((c: any) => c.is_archived) as T;
+      return getStore<any[]>('conversations', [])
+        .filter((c: any) => c.is_archived)
+        .map(withConversationSortOrder) as T;
     case 'create_conversation': {
       const { title, modelId, providerId } = args as any;
+      const convs = getStore<any[]>('conversations', []);
+      const sortOrder = conversationTopSortOrder(convs, null, false, 1);
       const conv = {
         id: genId(),
         title,
@@ -669,10 +1204,21 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
         message_count: 0,
         is_pinned: false,
         is_archived: false,
+        context_compression: false,
+        context_strategy_override: null,
+        context_message_limit: null,
+        compression_keep_last_n: null,
+        multi_model_display_mode_override: null,
+        multi_model_targets: [],
+        multi_model_continuation_mode: 'selected',
+        category_id: null,
+        parent_conversation_id: null,
+        mode: 'chat',
+        sort_order: sortOrder,
+        tab_pin_order: null,
         created_at: nowTs(),
         updated_at: nowTs(),
       };
-      const convs = getStore<any[]>('conversations', []);
       convs.push(conv);
       setStore('conversations', convs);
       return conv as T;
@@ -682,9 +1228,31 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const convs = getStore<any[]>('conversations', []);
       const idx = convs.findIndex((c: any) => c.id === id);
       if (idx !== -1) {
-        convs[idx] = { ...convs[idx], ...input, updated_at: nowTs() };
+        const previousCategoryId = convs[idx].category_id ?? null;
+        const nextCategoryId = input.category_id ?? null;
+        const movedToCategory = Object.prototype.hasOwnProperty.call(input, 'category_id')
+          && input.category_id !== undefined
+          && nextCategoryId !== previousCategoryId;
+        const movedSortOrder = movedToCategory && convs[idx].parent_conversation_id == null
+          ? conversationTopSortOrder(
+            convs,
+            nextCategoryId,
+            input.is_pinned ?? Boolean(convs[idx].is_pinned),
+            1,
+            new Set([id]),
+          )
+          : null;
+        convs[idx] = {
+          ...convs[idx],
+          ...input,
+          ...(movedSortOrder !== null
+            ? { sort_order: movedSortOrder }
+            : {}),
+          ...(input.is_archived ? { tab_pin_order: null } : {}),
+          updated_at: nowTs(),
+        };
         setStore('conversations', convs);
-        return convs[idx] as T;
+        return withConversationSortOrder(convs[idx]) as T;
       }
       throw new Error('Conversation not found');
     }
@@ -701,22 +1269,66 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const convs = getStore<any[]>('conversations', []);
       const idx = convs.findIndex((c: any) => c.id === id);
       if (idx !== -1) {
-        convs[idx].is_pinned = !convs[idx].is_pinned;
+        const newPinned = !convs[idx].is_pinned;
+        if (convs[idx].parent_conversation_id == null && convs[idx].category_id == null) {
+          convs[idx].sort_order = conversationTopSortOrder(
+            convs,
+            null,
+            newPinned,
+            1,
+            new Set([id]),
+          );
+        }
+        convs[idx].is_pinned = newPinned;
         convs[idx].updated_at = nowTs();
         setStore('conversations', convs);
-        return convs[idx] as T;
+        return withConversationSortOrder(convs[idx]) as T;
       }
       throw new Error('Conversation not found');
+    }
+    case 'set_conversation_tab_pinned': {
+      const { id, pinned } = args as any;
+      const convs = getStore<any[]>('conversations', []);
+      const idx = convs.findIndex((c: any) => c.id === id);
+      if (idx === -1) throw new Error('Conversation not found');
+      if (pinned && convs[idx].is_archived) {
+        throw new Error('Cannot pin an archived conversation to the tab bar');
+      }
+      const currentlyPinned = Number.isInteger(convs[idx].tab_pin_order);
+      if (Boolean(pinned) === currentlyPinned) {
+        return withConversationSortOrder(convs[idx]) as T;
+      }
+      convs[idx] = {
+        ...convs[idx],
+        tab_pin_order: pinned ? nextTabPinOrder(convs) : null,
+      };
+      setStore('conversations', convs);
+      return withConversationSortOrder(convs[idx]) as T;
     }
     case 'toggle_archive_conversation': {
       const { id } = args as any;
       const convs = getStore<any[]>('conversations', []);
       const aidx = convs.findIndex((c: any) => c.id === id);
       if (aidx !== -1) {
+        const isUnarchiving = convs[aidx].is_archived;
+        const targetCategoryId = convs[aidx].category_id ?? null;
+        const movesToTop = isUnarchiving && convs[aidx].parent_conversation_id == null;
+        let topSortOrder = convs[aidx].sort_order;
+        if (movesToTop) {
+          topSortOrder = conversationTopSortOrder(
+            convs,
+            targetCategoryId,
+            Boolean(convs[aidx].is_pinned),
+            1,
+            new Set([id]),
+          );
+        }
         convs[aidx].is_archived = !convs[aidx].is_archived;
+        if (convs[aidx].is_archived) convs[aidx].tab_pin_order = null;
+        if (movesToTop) convs[aidx].sort_order = topSortOrder;
         convs[aidx].updated_at = nowTs();
         setStore('conversations', convs);
-        return convs[aidx] as T;
+        return withConversationSortOrder(convs[aidx]) as T;
       }
       throw new Error('Conversation not found');
     }
@@ -775,6 +1387,21 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const cats = getStore<any[]>('conversation_categories', []).filter((c: any) => c.id !== id);
       setStore('conversation_categories', cats);
       const convs = getStore<any[]>('conversations', []);
+      const movedRoots = convs
+        .filter((c: any) => (
+          c.category_id === id
+          && !c.is_archived
+          && c.parent_conversation_id == null
+        ))
+        .sort(compareConversationOrder);
+      const movedPinnedIds = movedRoots
+        .filter((conversation: any) => conversation.is_pinned)
+        .map((conversation: any) => conversation.id);
+      const movedUnpinnedIds = movedRoots
+        .filter((conversation: any) => !conversation.is_pinned)
+        .map((conversation: any) => conversation.id);
+      placeConversationsAtTop(convs, null, true, movedPinnedIds);
+      placeConversationsAtTop(convs, null, false, movedUnpinnedIds);
       convs.forEach((c: any) => { if (c.category_id === id) c.category_id = null; });
       setStore('conversations', convs);
       return undefined as T;
@@ -788,6 +1415,48 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       }
       cats.sort((a: any, b: any) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
       setStore('conversation_categories', cats);
+      return undefined as T;
+    }
+    case 'reorder_conversations': {
+      const { categoryId = null, conversationIds } = args as any;
+      if (categoryId !== null && typeof categoryId !== 'string') {
+        throw new Error('categoryId must be a string or null');
+      }
+      if (!Array.isArray(conversationIds) || conversationIds.some((id: unknown) => typeof id !== 'string')) {
+        throw new Error('conversationIds must be an array of strings');
+      }
+      if (new Set(conversationIds).size !== conversationIds.length) {
+        throw new Error('conversationIds must not contain duplicates');
+      }
+      if (categoryId !== null) {
+        const categories = getStore<any[]>('conversation_categories', []);
+        if (!categories.some((category: any) => category.id === categoryId)) {
+          throw new Error('Category not found');
+        }
+      }
+
+      const conversations = getStore<any[]>('conversations', []);
+      const expectedIds = conversations
+        .filter((conversation: any) => (
+          !conversation.is_archived
+          && conversation.parent_conversation_id == null
+          && (conversation.category_id ?? null) === categoryId
+        ))
+        .map((conversation: any) => conversation.id);
+      const expectedIdSet = new Set(expectedIds);
+      if (
+        conversationIds.length !== expectedIds.length
+        || conversationIds.some((id: string) => !expectedIdSet.has(id))
+      ) {
+        throw new Error('conversationIds must contain every conversation in the container exactly once');
+      }
+
+      const orderById = new Map(conversationIds.map((id: string, index: number) => [id, index]));
+      const reordered = conversations.map((conversation: any) => {
+        const sortOrder = orderById.get(conversation.id);
+        return sortOrder === undefined ? conversation : { ...conversation, sort_order: sortOrder };
+      });
+      setStore('conversations', reordered);
       return undefined as T;
     }
     case 'set_conversation_category_collapsed': {
@@ -836,6 +1505,53 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       setStore('messages', msgs);
       return userMsg as T;
     }
+    case 'start_multi_model_run': {
+      const { conversationId, content, attachments, targets } = args as any;
+      const userMsg = {
+        id: genId(),
+        conversation_id: conversationId,
+        role: 'user',
+        content,
+        thinking: null,
+        attachments: attachments || [],
+        created_at: nowTs(),
+        parent_message_id: null,
+        version_index: 0,
+        is_active: true,
+      };
+      const msgs = getStore<any[]>('messages', []);
+      msgs.push(userMsg);
+      const models = Array.isArray(targets) ? targets : [];
+      models.forEach((target: { providerId: string; modelId: string }, index: number) => {
+        msgs.push({
+          id: genId(),
+          conversation_id: conversationId,
+          role: 'assistant',
+          content: generateBrowserResponse(content),
+          thinking: null,
+          attachments: [],
+          created_at: nowTs() + index + 1,
+          parent_message_id: userMsg.id,
+          version_index: index,
+          is_active: index === 0,
+          provider_id: target.providerId,
+          model_id: target.modelId,
+        });
+      });
+      setStore('messages', msgs);
+      return {
+        conversationId,
+        revision: 1,
+        activeRun: null,
+      } as T;
+    }
+    case 'get_multi_model_run_snapshot': {
+      const { conversationId } = args as any;
+      return { conversationId, revision: 0, activeRun: null } as T;
+    }
+    case 'skip_multi_model_target':
+    case 'stop_multi_model_run':
+      return { conversationId: '', revision: 0, activeRun: null } as T;
     case 'list_messages': {
       const { conversationId } = args as any;
       const msgs = getStore<any[]>('messages', []).filter(
@@ -917,7 +1633,7 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
     case 'get_context_usage':
       return {
         used_tokens: 0,
-        max_tokens: null,
+        context_window: null,
         threshold_tokens: null,
         has_summary: false,
         compressed_until_message_id: null,
@@ -925,10 +1641,49 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       } as T;
     case 'search_conversations': {
       const { query } = args as any;
-      const convs = getStore<any[]>('conversations', []);
-      const results = convs
-        .filter((c: any) => c.title.toLowerCase().includes(query.toLowerCase()))
-        .map((c: any) => ({ conversation_id: c.id, title: c.title, snippet: '' }));
+      const q = String(query ?? '').trim().toLowerCase();
+      if (!q) return [] as T;
+      const convs = getStore<any[]>('conversations', []).filter((c: any) => !c.is_archived);
+      const messages = getStore<any[]>('messages', []);
+      const seen = new Set<string>();
+      const results: any[] = [];
+
+      for (const c of convs) {
+        if (String(c.title ?? '').toLowerCase().includes(q)) {
+          seen.add(c.id);
+          results.push({ conversation: c, matched_message_preview: null });
+        }
+      }
+      for (const m of messages) {
+        if (seen.has(m.conversation_id)) {
+          // Enrich title-only hits with a content preview when available
+          if (String(m.content ?? '').toLowerCase().includes(q)) {
+            const hit = results.find((r) => r.conversation.id === m.conversation_id);
+            if (hit && !hit.matched_message_preview) {
+              const content = String(m.content ?? '');
+              const idx = content.toLowerCase().indexOf(q);
+              const start = Math.max(0, idx - 24);
+              const end = Math.min(content.length, idx + q.length + 48);
+              hit.matched_message_preview =
+                (start > 0 ? '...' : '') + content.slice(start, end) + (end < content.length ? '...' : '');
+            }
+          }
+          continue;
+        }
+        if (!String(m.content ?? '').toLowerCase().includes(q)) continue;
+        const conv = convs.find((c: any) => c.id === m.conversation_id);
+        if (!conv) continue;
+        seen.add(conv.id);
+        const content = String(m.content ?? '');
+        const idx = content.toLowerCase().indexOf(q);
+        const start = Math.max(0, idx - 24);
+        const end = Math.min(content.length, idx + q.length + 48);
+        results.push({
+          conversation: conv,
+          matched_message_preview:
+            (start > 0 ? '...' : '') + content.slice(start, end) + (end < content.length ? '...' : ''),
+        });
+      }
       return results as T;
     }
     case 'regenerate_message': {
@@ -974,6 +1729,21 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const { parentMessageId } = args as any;
       const allMsgs = getStore<any[]>('messages', []);
       return allMsgs.filter((m: any) => m.parent_message_id === parentMessageId) as T;
+    }
+    case 'list_message_versions_batch': {
+      const { conversationId, parentMessageIds = [] } = args as any;
+      const requestedParents = new Set<string>(parentMessageIds);
+      const result: Record<string, any[]> = {};
+      for (const parentMessageId of requestedParents) result[parentMessageId] = [];
+      for (const message of getStore<any[]>('messages', [])) {
+        if (
+          message.conversation_id === conversationId
+          && requestedParents.has(message.parent_message_id)
+        ) {
+          result[message.parent_message_id].push(message);
+        }
+      }
+      return result as T;
     }
     case 'switch_message_version': {
       const { parentMessageId: switchParent, messageId: switchTarget } = args as any;
@@ -1243,9 +2013,89 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
     case 'clear_knowledge_index':
       return undefined as T;
 
+    case 'get_embedding_artifact_status':
+      return {
+        status: 'missing',
+        artifactId: 'multilingual-e5-small',
+        revision: '761b726',
+        path: '~/.aqbot/models/embeddings/multilingual-e5-small/761b726/onnx/model_int8.onnx',
+        sizeBytes: 118054593,
+        downloadedBytes: 0,
+        license: 'MIT',
+      } as T;
+    case 'install_embedding_artifact':
+    case 'cancel_embedding_artifact_install':
+      return { status: 'missing' } as T;
+
     // ── Phase 2: Memory ───────────────────────────────────────────────
+    case 'get_memory_l1': {
+      return getStore('memory_l1', {
+        enabled: true,
+        markdown: '',
+        revision: 0,
+        sortOrder: 0,
+        updatedAt: new Date().toISOString(),
+      }) as T;
+    }
+    case 'uninstall_embedding_artifact': {
+      return {
+        status: 'missing',
+        artifactId: 'multilingual-e5-small',
+        revision: '761b726',
+        path: '~/.aqbot/models/embeddings/multilingual-e5-small/761b726/onnx/model_int8.onnx',
+        sizeBytes: 118054593,
+        downloadedBytes: 0,
+        license: 'MIT',
+      } as T;
+    }
+    case 'save_memory_l1': {
+      const current = getStore<any>('memory_l1', {
+        enabled: true,
+        markdown: '',
+        revision: 0,
+        sortOrder: 0,
+        updatedAt: new Date().toISOString(),
+      });
+      const input = (args as any)?.input ?? args;
+      const markdown = String(input?.markdown ?? '');
+      if (new TextEncoder().encode(markdown).length > 5000) {
+        throw new Error(JSON.stringify({ code: 'MEMORY_L1_TOO_LARGE', args: { limit: 5000 } }));
+      }
+      if (Number(input?.revision) !== Number(current.revision)) {
+        throw new Error(JSON.stringify({
+          code: 'MEMORY_L1_REVISION_CONFLICT',
+          args: { expected: input?.revision, actual: current.revision },
+        }));
+      }
+      const saved = {
+        enabled: Boolean(input?.enabled),
+        markdown,
+        revision: Number(current.revision) + 1,
+        sortOrder: Number(current.sortOrder) || 0,
+        updatedAt: new Date().toISOString(),
+      };
+      setStore('memory_l1', saved);
+      return saved as T;
+    }
     case 'list_memory_namespaces':
       return getStore('memory_namespaces', []) as T;
+    case 'reorder_memory_namespaces': {
+      const ids = ((args as any)?.namespaceIds ?? []) as string[];
+      const mns = getStore<any[]>('memory_namespaces', []);
+      const l1 = getStore<any>('memory_l1', { sortOrder: 0 });
+      ids.forEach((id, index) => {
+        if (id === 'aqbot-memory-l1') {
+          l1.sortOrder = index;
+        } else {
+          const ns = mns.find((item) => item.id === id);
+          if (ns) ns.sortOrder = index;
+        }
+      });
+      mns.sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+      setStore('memory_namespaces', mns);
+      setStore('memory_l1', l1);
+      return undefined as T;
+    }
     case 'create_memory_namespace': {
       const mns = getStore<any[]>('memory_namespaces', []);
       const mn = { id: genId(), ...(args as any), items: [], created_at: nowTs(), updated_at: nowTs() };
@@ -1262,14 +2112,20 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const mns3 = getStore<any[]>('memory_namespaces', []);
       const inputMem = (args as any)?.input ?? args;
       const mni = mns3.findIndex(n => n.id === inputMem?.namespaceId);
-      if (mni >= 0) {
-        const item = { id: genId(), ...inputMem, created_at: nowTs() };
-        mns3[mni].items = [...(mns3[mni].items || []), item];
-        mns3[mni].updated_at = nowTs();
-        setStore('memory_namespaces', mns3);
-        return item as T;
-      }
-      return undefined as T;
+      if (mni < 0) throw new Error(`Memory namespace not found: ${inputMem?.namespaceId ?? ''}`);
+      const item = {
+        id: genId(),
+        namespaceId: inputMem.namespaceId,
+        title: inputMem.title,
+        content: inputMem.content,
+        source: inputMem.source ?? 'manual',
+        indexStatus: mns3[mni].embeddingProvider ? 'indexing' : 'skipped',
+        updatedAt: new Date().toISOString(),
+      };
+      mns3[mni].items = [item, ...(mns3[mni].items || [])];
+      mns3[mni].updated_at = nowTs();
+      setStore('memory_namespaces', mns3);
+      return item as T;
     }
     case 'list_memory_items': {
       const mns4 = getStore<any[]>('memory_namespaces', []);
@@ -1582,7 +2438,24 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
           missing: !backup.filePath,
         })) as T;
       }
-      return [] as T;
+      const files = getStore<any[]>('drawing_files', []);
+      return files
+        .filter((file: any) => category === 'images'
+          ? String(file.mime_type).startsWith('image/')
+          : !String(file.mime_type).startsWith('image/'))
+        .map((file: any) => ({
+          id: `attachment::${file.id}`,
+          storedFileId: file.id,
+          sourceKind: 'attachment',
+          category,
+          displayName: file.original_name,
+          path: file.storage_path,
+          storagePath: file.storage_path,
+          sizeBytes: file.size_bytes,
+          createdAt: file.created_at ?? new Date(0).toISOString(),
+          missing: false,
+          previewUrl: null,
+        })) as T;
     }
     case 'open_files_page_entry':
     case 'reveal_files_page_entry':
@@ -1693,6 +2566,11 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
         { key: 'notification', supported: 'Notification' in globalThis },
         { key: 'devtools_context_menu', supported: false },
       ] as T;
+    case 'open_conversation_popout':
+      console.log('[Mock] open_conversation_popout:', (args as any)?.conversationId);
+      return undefined as T;
+    case 'report_conversation_popout_ready':
+      return undefined as T;
     case 'open_devtools':
       return undefined as T;
     case 'get_window_state':
@@ -1717,6 +2595,10 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       return undefined as T;
     case 'set_tray_actions':
       return undefined as T;
+    case 'refresh_tray_menu':
+      return undefined as T;
+    case 'take_pending_tray_action':
+      return null as T;
     case 'handle_protocol_launch':
       return undefined as T;
 
@@ -1749,6 +2631,10 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
         avatar_value: input.avatar_value ?? input.avatar ?? null,
         temperature: input.temperature ?? null,
         top_p: input.top_p ?? null,
+        enabled_mcp_server_ids: input.enabled_mcp_server_ids ?? [],
+        enabled_skill_names: input.enabled_skill_names ?? [],
+        enabled_knowledge_base_ids: input.enabled_knowledge_base_ids ?? [],
+        enabled_memory_namespace_ids: input.enabled_memory_namespace_ids ?? [],
         source_kind: input.source_kind ?? 'local',
         source_ref: input.source_ref ?? null,
         created_at: now,
@@ -1801,7 +2687,16 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
       const entry = MARKETPLACE_ROLES.find((role) => role.source_ref === sourceRef);
       if (!entry) throw new Error('Role source not found');
       const now = nowTs();
-      const role = { ...entry, id: genId(), created_at: now, updated_at: now };
+      const role = {
+        ...entry,
+        id: genId(),
+        enabled_mcp_server_ids: [],
+        enabled_skill_names: [],
+        enabled_knowledge_base_ids: [],
+        enabled_memory_namespace_ids: [],
+        created_at: now,
+        updated_at: now,
+      };
       setStore('roles', [role, ...getStore<any[]>('roles', [])]);
       return role as T;
     }
@@ -1815,6 +2710,27 @@ export async function handleCommand<T>(cmd: string, args?: Record<string, unknow
     }
 
     // ── Skills ────────────────────────────────────────────────────────
+    case 'inspect_skills':
+      return {
+        items: [
+          {
+            name: 'codex-demo',
+            description: 'Example Codex skill',
+            source: 'codex',
+            sourcePath: '/Users/demo/.codex/skills/codex-demo/SKILL.md',
+            enabled: true,
+            disableModelInvocation: false,
+            userInvocable: true,
+            effective: true,
+            effectiveSourcePath: '/Users/demo/.codex/skills/codex-demo/SKILL.md',
+            callable: true,
+            reasons: [{ code: 'callable', params: {} }],
+          },
+        ],
+        scanErrors: [],
+        skillToolAllowed: true,
+      } as T;
+
     case 'list_skills':
       return [
         {

@@ -1,12 +1,26 @@
 import { create } from 'zustand';
+import { defaultAgentAllowedTools } from '@/lib/agentAllowedTools';
 import { invoke } from '@/lib/invoke';
 import {
   DEFAULT_AGENT_WORKSPACE_DATETIME_FORMAT,
   DEFAULT_AGENT_WORKSPACE_NAME_STRATEGY,
+  DEFAULT_CHAT_INPUT_ACTIONS_SCALE,
   DEFAULT_MCP_TOOL_LOOP_MAX_ITERATIONS,
+  DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS,
+  createDefaultSelectionToolbarSettings,
+  normalizeChatInputActionsScale,
   type AppSettings,
 } from '@/types';
 import { DEFAULT_SHORTCUT_BINDINGS } from '@/lib/shortcuts';
+import { isResourceFresh } from '@/lib/resourceState';
+import type {
+  EnsureLoadedOptions,
+  ResourceInvalidationReason,
+  ResourceMeta,
+} from '@/lib/resourceState';
+
+const SETTINGS_RESOURCE_KEY = 'settings';
+let settingsRequest: { revision: number; promise: Promise<void> } | null = null;
 
 const DEFAULT_SETTINGS: AppSettings = {
   language: 'zh-CN',
@@ -17,13 +31,17 @@ const DEFAULT_SETTINGS: AppSettings = {
   show_on_start: true,
   minimize_to_tray: true,
   font_size: 14,
+  settings_sidebar_density: 'standard',
   font_weight: 400,
   font_family: '',
+  font_style: 'normal',
   code_font_family: '',
   chat_font_size: 15,
   chat_line_height: 1.7,
   chat_font_family: '',
   chat_font_weight: 400,
+  chat_font_style: 'normal',
+  chat_input_actions_scale: DEFAULT_CHAT_INPUT_ACTIONS_SCALE,
   bubble_style: 'minimal',
   chat_user_message_area_style: 'none',
   chat_user_message_area_light_color: 'rgba(0, 0, 0, 0)',
@@ -42,6 +60,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   default_top_p: null,
   default_frequency_penalty: null,
   default_context_count: null,
+  default_context_strategy: 'raw_truncate',
   title_summary_provider_id: null,
   title_summary_model_id: null,
   title_summary_temperature: null,
@@ -57,7 +76,9 @@ const DEFAULT_SETTINGS: AppSettings = {
   compression_top_p: null,
   compression_frequency_penalty: null,
   compression_prompt: null,
-  proxy_type: null,
+  default_compression_keep_last_n: null,
+  model_catalog_source: 'builtin',
+  proxy_type: 'system',
   proxy_address: null,
   proxy_port: null,
   global_shortcut: DEFAULT_SHORTCUT_BINDINGS.toggleCurrentWindow,
@@ -83,8 +104,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   gateway_ssl_key_path: null,
   gateway_ssl_port: 8443,
   gateway_force_ssl: false,
+  gateway_auto_model_routing: false,
   always_on_top: false,
   tray_enabled: true,
+  tray_icon_style: 'color',
+  tray_icon_file_id: null,
+  use_tray_icon_as_app_icon: false,
   global_shortcuts_enabled: true,
   shortcut_registration_logs_enabled: false,
   shortcut_trigger_toast_enabled: false,
@@ -93,27 +118,39 @@ const DEFAULT_SETTINGS: AppSettings = {
   start_minimized: false,
   close_to_tray: true,
   release_webview_on_tray: false,
+  confirm_on_quit: true,
   notify_backup: true,
   notify_import: true,
   notify_errors: true,
   last_selected_conversation_id: null,
   documents_root_override: null,
+  auto_check_update: true,
   update_check_interval: 60,
   default_system_prompt: null,
   chat_minimap_enabled: false,
   chat_minimap_style: 'faq',
   chat_sidebar_collapsed: false,
   inherit_conversation_preferences_on_create: true,
+  conversation_tabs_enabled: false,
   chat_stream_first_packet_timeout_secs: 180,
   chat_stream_idle_timeout_secs: 90,
   mcp_tool_loop_max_iterations: DEFAULT_MCP_TOOL_LOOP_MAX_ITERATIONS,
   document_attachment_reading_enabled: false,
   show_image_models_in_model_selector: false,
   multi_model_display_mode: 'tabs',
+  multi_model_execution_mode: 'parallel',
+  multi_model_sequential_interval_seconds: DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS,
+  multi_model_side_by_side_width_mode: 'scroll',
+  multi_model_popout_side_by_side_width_mode: 'scroll',
   render_user_markdown: false,
   agent_workspace_root: null,
   agent_workspace_name_strategy: DEFAULT_AGENT_WORKSPACE_NAME_STRATEGY,
   agent_workspace_datetime_format: DEFAULT_AGENT_WORKSPACE_DATETIME_FORMAT,
+  agent_bash_path: null,
+  agent_allowed_tools_enabled: false,
+  agent_allowed_tools: defaultAgentAllowedTools(),
+  selection_toolbar: createDefaultSelectionToolbarSettings(),
+  titlebar_icon_visibility: {},
   // WebDAV sync settings — must be present so stale saves never omit them
   webdav_host: null,
   webdav_username: null,
@@ -136,9 +173,44 @@ const DEFAULT_SETTINGS: AppSettings = {
   s3_include_documents: false,
 };
 
+function normalizeSelectionToolbarTools(
+  tools: AppSettings['selection_toolbar']['tools'] | undefined,
+): AppSettings['selection_toolbar']['tools'] {
+  if (!tools) return DEFAULT_SETTINGS.selection_toolbar.tools;
+  const normalized = tools.map((tool) => tool.kind === 'builtin_action' ? tool : {
+    ...tool,
+    ai: {
+      ...tool.ai,
+      text_direct_send: tool.ai.text_direct_send ?? true,
+      screenshot_direct_send: tool.ai.screenshot_direct_send ?? true,
+    },
+  });
+  if (!normalized.some((tool) =>
+    tool.kind === 'builtin_ai' && tool.builtin_key === 'explain')) {
+    const explain = DEFAULT_SETTINGS.selection_toolbar.tools.find((tool) =>
+      tool.kind === 'builtin_ai' && tool.builtin_key === 'explain');
+    if (explain) {
+      const translateIndex = normalized.findIndex((tool) =>
+        tool.kind === 'builtin_ai' && tool.builtin_key === 'translate');
+      normalized.splice(translateIndex < 0 ? 0 : translateIndex + 1, 0, explain);
+    }
+  }
+  if (!normalized.some((tool) =>
+    tool.kind === 'builtin_action' && tool.builtin_key === 'search')) {
+    const search = DEFAULT_SETTINGS.selection_toolbar.tools.find((tool) =>
+      tool.kind === 'builtin_action' && tool.builtin_key === 'search');
+    if (search) {
+      const copyIndex = normalized.findIndex((tool) =>
+        tool.kind === 'builtin_action' && tool.builtin_key === 'copy');
+      normalized.splice(copyIndex < 0 ? normalized.length : copyIndex + 1, 0, search);
+    }
+  }
+  return normalized;
+}
+
 export interface GlobalShortcutDiagnostic {
   timestamp: string;
-  phase: 'env' | 'register' | 'cleanup';
+  phase: 'env' | 'register' | 'trigger' | 'cleanup';
   level: 'info' | 'warn' | 'error';
   message: string;
   action?: string;
@@ -154,18 +226,23 @@ export interface GlobalShortcutStatus {
 }
 
 interface SettingsState {
+  trayIconRevision: number;
   settings: AppSettings;
   loading: boolean;
   /** Set once after the first successful fetchSettings; guards saveSettings from writing stale data. */
   _loaded: boolean;
   error: string | null;
   globalShortcutStatus: GlobalShortcutStatus;
+  settingsMeta: ResourceMeta;
+  ensureSettingsLoaded: (options?: EnsureLoadedOptions) => Promise<void>;
+  invalidateSettings: (reason: ResourceInvalidationReason) => void;
   fetchSettings: () => Promise<void>;
-  saveSettings: (settings: Partial<AppSettings>) => Promise<void>;
+  saveSettings: (settings: Partial<AppSettings>) => Promise<string[]>;
   setGlobalShortcutStatus: (status: GlobalShortcutStatus) => void;
 }
 
 export const useSettingsStore = create<SettingsState>((set, get) => ({
+  trayIconRevision: -1,
   settings: DEFAULT_SETTINGS,
   loading: true,
   _loaded: false,
@@ -176,28 +253,163 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     failed: [],
     diagnostics: [],
   },
+  settingsMeta: { status: 'idle', key: null, loadedAt: null, revision: 0 },
 
-  fetchSettings: async () => {
-    set({ loading: true });
-    try {
-      const fetched = await invoke<Partial<AppSettings>>('get_settings');
-      set({ settings: { ...DEFAULT_SETTINGS, ...fetched }, loading: false, _loaded: true, error: null });
-    } catch (e) {
-      set({ error: String(e), loading: false, _loaded: true });
+  ensureSettingsLoaded: async (options = {}) => {
+    const state = get();
+    if (!options.force && isResourceFresh(state.settingsMeta, {
+      ...options,
+      key: SETTINGS_RESOURCE_KEY,
+    })) return;
+    if (settingsRequest?.revision === state.settingsMeta.revision && !options.force) {
+      return settingsRequest.promise;
     }
+    if (settingsRequest) {
+      await settingsRequest.promise;
+      return get().ensureSettingsLoaded(options);
+    }
+
+    const revision = state.settingsMeta.revision;
+    set((current) => ({
+      loading: true,
+      settingsMeta: {
+        ...current.settingsMeta,
+        status: 'loading',
+        key: SETTINGS_RESOURCE_KEY,
+      },
+    }));
+    let promise!: Promise<void>;
+    promise = (async () => {
+      let reloadAfterCompletion = false;
+      try {
+        const fetched = await invoke<Partial<AppSettings>>('get_settings');
+        if (get().settingsMeta.revision !== revision) {
+          reloadAfterCompletion = true;
+          set({ loading: false });
+        } else {
+          set({
+            settings: {
+              ...DEFAULT_SETTINGS,
+              ...fetched,
+              chat_input_actions_scale: normalizeChatInputActionsScale(
+                fetched.chat_input_actions_scale,
+              ),
+              selection_toolbar: {
+                ...DEFAULT_SETTINGS.selection_toolbar,
+                ...fetched.selection_toolbar,
+                tools: normalizeSelectionToolbarTools(
+                  fetched.selection_toolbar?.tools,
+                ),
+                app_filter: fetched.selection_toolbar?.app_filter
+                  ?? DEFAULT_SETTINGS.selection_toolbar.app_filter,
+                app_filter_mode: fetched.selection_toolbar?.app_filter_mode
+                  ?? DEFAULT_SETTINGS.selection_toolbar.app_filter_mode,
+                placement: fetched.selection_toolbar?.placement
+                  ?? DEFAULT_SETTINGS.selection_toolbar.placement,
+                result_pinned_by_default: fetched.selection_toolbar?.result_pinned_by_default
+                  ?? DEFAULT_SETTINGS.selection_toolbar.result_pinned_by_default,
+                result_pinning_mode: fetched.selection_toolbar?.result_pinning_mode
+                  ?? DEFAULT_SETTINGS.selection_toolbar.result_pinning_mode,
+              },
+            },
+            loading: false,
+            _loaded: true,
+            error: null,
+            settingsMeta: {
+              status: 'ready',
+              key: SETTINGS_RESOURCE_KEY,
+              loadedAt: Date.now(),
+              revision,
+            },
+          });
+        }
+      } catch (e) {
+        if (get().settingsMeta.revision !== revision) {
+          reloadAfterCompletion = true;
+          set({ loading: false });
+        } else {
+          set((current) => ({
+            error: String(e),
+            loading: false,
+            _loaded: true,
+            settingsMeta: { ...current.settingsMeta, status: 'error' },
+          }));
+        }
+      } finally {
+        settingsRequest = null;
+      }
+      if (reloadAfterCompletion) await get().ensureSettingsLoaded();
+    })();
+    settingsRequest = { revision, promise };
+    return promise;
   },
+
+  invalidateSettings: (_reason) => set((state) => ({
+    settingsMeta: {
+      status: 'idle',
+      key: null,
+      loadedAt: null,
+      revision: state.settingsMeta.revision + 1,
+    },
+  })),
+
+  fetchSettings: () => get().ensureSettingsLoaded({ force: true }),
 
   saveSettings: async (partial) => {
     if (!get()._loaded) {
-      console.warn('[settingsStore] saveSettings skipped: settings not loaded yet');
-      return;
+      await get().ensureSettingsLoaded();
+      if (get().settingsMeta.status !== 'ready') {
+        console.error('[settingsStore] saveSettings failed: settings could not be loaded');
+        return [];
+      }
     }
-    const merged = { ...get().settings, ...partial };
-    set({ settings: merged, error: null });
+    const previous = get().settings;
+    const merged = {
+      ...previous,
+      ...partial,
+      tray_icon_file_id: previous.tray_icon_file_id,
+      use_tray_icon_as_app_icon: previous.use_tray_icon_as_app_icon,
+      chat_input_actions_scale: normalizeChatInputActionsScale(
+        partial.chat_input_actions_scale ?? previous.chat_input_actions_scale,
+      ),
+    };
+    set((state) => ({
+      settings: merged,
+      error: null,
+      settingsMeta: {
+        status: 'ready',
+        key: SETTINGS_RESOURCE_KEY,
+        loadedAt: Date.now(),
+        revision: state.settingsMeta.revision + 1,
+      },
+    }));
     try {
-      await invoke('save_settings', { settings: merged });
+      const {
+        multi_model_side_by_side_width_mode: _mainWidthMode,
+        multi_model_popout_side_by_side_width_mode: _popoutWidthMode,
+        tray_icon_file_id: _trayIconFileId,
+        use_tray_icon_as_app_icon: _useTrayIconAsAppIcon,
+        ...settingsWithoutLayoutModes
+      } = merged;
+      const result = await invoke<{ saved?: boolean; warnings?: string[] } | void>('save_settings', {
+        settings: settingsWithoutLayoutModes,
+      });
+      return result && typeof result === 'object' ? result.warnings ?? [] : [];
     } catch (e) {
-      set({ error: String(e) });
+      set((state) => ({
+        settings: {
+          ...previous,
+          tray_icon_file_id: state.settings.tray_icon_file_id,
+          use_tray_icon_as_app_icon: state.settings.use_tray_icon_as_app_icon,
+        },
+        error: String(e),
+        settingsMeta: {
+          ...state.settingsMeta,
+          loadedAt: Date.now(),
+          revision: state.settingsMeta.revision + 1,
+        },
+      }));
+      return [];
     }
   },
 

@@ -1,10 +1,14 @@
 use crate::AppState;
-use aqbot_agent::permission::{classify_tool_risk, decide_permission, PermissionAction};
-use aqbot_agent::security::check_path_safety;
+use aqbot_agent::permission::{
+    allows_persistent_approval, classify_tool_risk, decide_permission, PermissionAction,
+};
+use aqbot_agent::security::check_path_safety_with_runtime;
+use aqbot_core::inline_media::{InlineDataStreamCapture, InlineDataStreamFilter};
 use aqbot_core::repo::{agent_session, conversation, message, provider, tool_execution};
 use aqbot_core::types::{
-    AgentSession, AppSettings, Attachment, AttachmentInput, MessageRole, ProviderProxyConfig,
-    ProviderType,
+    resolve_agent_allowed_tools, should_inject_skills_summary, AgentSession, AppSettings,
+    Attachment, AttachmentInput, MessageRole, ProviderProxyConfig, ProviderType,
+    AGENT_HIDDEN_SDK_TOOLS,
 };
 use aqbot_providers::{resolve_base_url_for_type, ProviderAdapter, ProviderRequestContext};
 use open_agent_sdk::{
@@ -31,6 +35,7 @@ const MAX_AGENT_WORKSPACE_NAME_LEN: usize = 80;
 struct RunningAgentGuard {
     conversation_id: String,
     run_id: String,
+    conversation_runs: crate::conversation_run::ConversationRunRegistry,
 }
 
 impl Drop for RunningAgentGuard {
@@ -40,20 +45,28 @@ impl Drop for RunningAgentGuard {
                 running.remove(&self.conversation_id);
             }
         }
+        self.conversation_runs
+            .release(&self.conversation_id, &self.run_id);
     }
 }
 
 struct AgentCancelTokenGuard {
     conversation_id: String,
-    tokens: Arc<tokio::sync::Mutex<HashMap<String, open_agent_sdk::CancellationToken>>>,
+    run_id: String,
+    tokens: Arc<tokio::sync::Mutex<HashMap<String, crate::AgentCancelEntry>>>,
 }
 
 impl Drop for AgentCancelTokenGuard {
     fn drop(&mut self) {
         let conversation_id = self.conversation_id.clone();
+        let run_id = self.run_id.clone();
         let tokens = self.tokens.clone();
         tokio::spawn(async move {
-            tokens.lock().await.remove(&conversation_id);
+            let mut map = tokens.lock().await;
+            if map.get(&conversation_id).map(|entry| entry.run_id.as_str()) == Some(run_id.as_str())
+            {
+                map.remove(&conversation_id);
+            }
         });
     }
 }
@@ -68,13 +81,22 @@ fn agent_workspace_root(settings: &AppSettings) -> PathBuf {
         .unwrap_or_else(|| crate::paths::aqbot_home().join("workspace"))
 }
 
+#[cfg(test)]
 fn agent_workspace_dir_name(
     conv: &aqbot_core::types::Conversation,
     settings: &AppSettings,
 ) -> String {
+    agent_workspace_dir_name_for(&conv.id, conv.created_at, settings)
+}
+
+fn agent_workspace_dir_name_for(
+    conversation_id: &str,
+    created_at: i64,
+    settings: &AppSettings,
+) -> String {
     let raw = match settings.agent_workspace_name_strategy.as_str() {
-        "conversation_id" | "uuid" => conv.id.clone(),
-        "created_timestamp" => conv.created_at.to_string(),
+        "conversation_id" | "uuid" => conversation_id.to_string(),
+        "created_timestamp" => created_at.to_string(),
         "created_datetime" => {
             let format = settings
                 .agent_workspace_datetime_format
@@ -82,9 +104,9 @@ fn agent_workspace_dir_name(
                 .map(str::trim)
                 .filter(|format| !format.is_empty())
                 .unwrap_or(DEFAULT_AGENT_WORKSPACE_DATETIME_FORMAT);
-            format_agent_workspace_datetime(conv.created_at, format)
+            format_agent_workspace_datetime(created_at, format)
         }
-        _ => conv.id.clone(),
+        _ => conversation_id.to_string(),
     };
 
     sanitize_workspace_dir_name(&raw)
@@ -167,14 +189,22 @@ fn resolve_agent_workspace_dir(
     settings: &AppSettings,
     conv: &aqbot_core::types::Conversation,
 ) -> PathBuf {
+    resolve_agent_workspace_dir_for(settings, &conv.id, conv.created_at)
+}
+
+pub(crate) fn resolve_agent_workspace_dir_for(
+    settings: &AppSettings,
+    conversation_id: &str,
+    created_at: i64,
+) -> PathBuf {
     let root = agent_workspace_root(settings);
-    let base_name = agent_workspace_dir_name(conv, settings);
+    let base_name = agent_workspace_dir_name_for(conversation_id, created_at, settings);
     let first = root.join(&base_name);
     if !first.exists() {
         return first;
     }
 
-    let id_suffix = short_conversation_id(&conv.id);
+    let id_suffix = short_conversation_id(conversation_id);
     let with_id = root.join(append_workspace_suffix(&base_name, &id_suffix));
     if !with_id.exists() {
         return with_id;
@@ -220,6 +250,39 @@ fn short_conversation_id(conversation_id: &str) -> String {
     sanitize_workspace_dir_name(if prefix.is_empty() { "conv" } else { &prefix })
 }
 
+const INLINE_MEDIA_PENDING_PLACEHOLDER: &str = "[图片接收中]";
+
+fn agent_persistable_snapshot(content: &str) -> &str {
+    if content
+        .as_bytes()
+        .windows(b"data:image/".len())
+        .any(|window| window.eq_ignore_ascii_case(b"data:image/"))
+    {
+        INLINE_MEDIA_PENDING_PLACEHOLDER
+    } else {
+        content
+    }
+}
+
+async fn persist_agent_stream_snapshot(
+    db: &sea_orm::DatabaseConnection,
+    message_id: &str,
+    content: &str,
+) -> bool {
+    match message::update_message_content(db, message_id, agent_persistable_snapshot(content)).await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(
+                message_id,
+                error = %error,
+                "Failed to persist agent stream snapshot"
+            );
+            false
+        }
+    }
+}
+
 async fn ensure_agent_assistant_message(
     db: &sea_orm::DatabaseConnection,
     app: &tauri::AppHandle,
@@ -237,7 +300,7 @@ async fn ensure_agent_assistant_message(
         db,
         conv_id,
         MessageRole::Assistant,
-        content,
+        agent_persistable_snapshot(content),
         &[],
         Some(user_msg_id),
         0,
@@ -285,8 +348,173 @@ async fn persist_agent_partial_content(
         assistant_id_for_task,
     )
     .await?;
-    let _ = message::update_message_content(db, &message_id, content).await;
+    persist_agent_stream_snapshot(db, &message_id, content).await;
     Some(message_id)
+}
+
+async fn create_agent_assistant_placeholder(
+    db: &sea_orm::DatabaseConnection,
+    app: &tauri::AppHandle,
+    conv_id: &str,
+    user_msg_id: &str,
+    run_id: &str,
+) -> Result<String, String> {
+    let assist_msg = message::create_message(
+        db,
+        conv_id,
+        MessageRole::Assistant,
+        "",
+        &[],
+        Some(user_msg_id),
+        0,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Err(error) = conversation::increment_message_count(db, conv_id).await {
+        let rollback_errors =
+            super::conversations::rollback_new_message(db, &assist_msg.id, &[]).await;
+        return Err(super::conversations::format_new_message_failure(
+            &assist_msg.id,
+            "agent assistant message-count update failed",
+            error,
+            rollback_errors,
+        ));
+    }
+    let _ = app.emit(
+        "agent-message-id",
+        serde_json::json!({
+            "conversationId": conv_id,
+            "assistantMessageId": assist_msg.id.clone(),
+            "runId": run_id,
+        }),
+    );
+    Ok(assist_msg.id)
+}
+
+async fn fail_agent_turn(
+    app: &tauri::AppHandle,
+    db: &sea_orm::DatabaseConnection,
+    session_id: &str,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    run_id: &str,
+    message: &str,
+) -> Result<(), String> {
+    let safe_message = filter_complete_agent_event_text(message);
+    let _ = message::update_message_content(db, assistant_message_id, &safe_message).await;
+    let _ = message::update_message_status(db, assistant_message_id, "error").await;
+    let _ = agent_session::update_agent_session_status(db, session_id, "idle").await;
+    let _ = app.emit(
+        "agent-error",
+        AgentErrorPayload {
+            conversation_id: conversation_id.to_string(),
+            run_id: Some(run_id.to_string()),
+            assistant_message_id: Some(assistant_message_id.to_string()),
+            message: safe_message,
+        },
+    );
+    Ok(())
+}
+
+fn filtered_agent_stream_chunk(filter: &mut InlineDataStreamFilter, chunk: &str) -> Option<String> {
+    let filtered = filter.push(chunk);
+    (!filtered.is_empty()).then_some(filtered)
+}
+
+fn filtered_agent_stream_tail(filter: &mut InlineDataStreamFilter) -> Option<String> {
+    let filtered = filter.finish();
+    (!filtered.is_empty()).then_some(filtered)
+}
+
+fn filter_complete_agent_event_text(text: &str) -> String {
+    let mut filter = InlineDataStreamFilter::default();
+    let mut filtered = filter.push(text);
+    filtered.push_str(&filter.finish());
+    filtered
+}
+
+fn filter_agent_tool_identity(tool_use_id: &str, tool_name: &str) -> (String, String) {
+    (
+        filter_complete_agent_event_text(tool_use_id),
+        filter_complete_agent_event_text(tool_name),
+    )
+}
+
+fn escape_tool_call_attribute(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn append_captured_agent_text(
+    capture: &mut InlineDataStreamCapture,
+    target: &mut String,
+    text: &str,
+) -> aqbot_core::error::Result<()> {
+    let delta = capture.push(text)?;
+    target.push_str(&delta.content);
+    Ok(())
+}
+
+fn filter_agent_event_json(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(filter_complete_agent_event_text(text)),
+        Value::Array(values) => Value::Array(values.iter().map(filter_agent_event_json).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        filter_complete_agent_event_text(key),
+                        filter_agent_event_json(value),
+                    )
+                })
+                .collect(),
+        ),
+        value => value.clone(),
+    }
+}
+
+fn flush_agent_stream_filters(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    run_id: &str,
+    assistant_message_id: Option<&str>,
+    text_filter: &mut InlineDataStreamFilter,
+    thinking_filter: &mut InlineDataStreamFilter,
+) {
+    let assistant_message_id = assistant_message_id.unwrap_or_default().to_string();
+    if let Some(text) = filtered_agent_stream_tail(text_filter) {
+        let _ = app.emit(
+            "agent-stream-text",
+            AgentTextPayload {
+                conversation_id: conversation_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                assistant_message_id: assistant_message_id.clone(),
+                text,
+            },
+        );
+    }
+    if let Some(thinking) = filtered_agent_stream_tail(thinking_filter) {
+        let _ = app.emit(
+            "agent-stream-thinking",
+            AgentThinkingPayload {
+                conversation_id: conversation_id.to_string(),
+                run_id: Some(run_id.to_string()),
+                assistant_message_id,
+                thinking,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +525,8 @@ async fn persist_agent_partial_content(
 pub struct AgentDonePayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
+    #[serde(rename = "runId", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(rename = "assistantMessageId")]
     pub assistant_message_id: String,
     pub text: String,
@@ -317,6 +547,8 @@ pub struct AgentUsagePayload {
 pub struct AgentErrorPayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
+    #[serde(rename = "runId", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(rename = "assistantMessageId")]
     pub assistant_message_id: Option<String>,
     pub message: String,
@@ -366,6 +598,19 @@ pub struct AgentToolResultPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentToolOutputPayload {
+    #[serde(rename = "conversationId")]
+    pub conversation_id: String,
+    #[serde(rename = "assistantMessageId")]
+    pub assistant_message_id: String,
+    #[serde(rename = "toolUseId")]
+    pub tool_use_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPermissionRequestPayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
@@ -378,6 +623,8 @@ pub struct AgentPermissionRequestPayload {
     pub input: Value,
     #[serde(rename = "riskLevel")]
     pub risk_level: String,
+    #[serde(rename = "workingDirectory", skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -388,13 +635,6 @@ struct AgentAskUserPayload {
     ask_id: String,
     question: String,
     options: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentStatusPayload {
-    #[serde(rename = "conversationId")]
-    pub conversation_id: String,
-    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +650,8 @@ pub struct AgentRateLimitPayload {
 pub struct AgentThinkingPayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
+    #[serde(rename = "runId", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(rename = "assistantMessageId")]
     pub assistant_message_id: String,
     pub thinking: String,
@@ -419,6 +661,8 @@ pub struct AgentThinkingPayload {
 pub struct AgentTextPayload {
     #[serde(rename = "conversationId")]
     pub conversation_id: String,
+    #[serde(rename = "runId", skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(rename = "assistantMessageId")]
     pub assistant_message_id: String,
     pub text: String,
@@ -441,6 +685,7 @@ fn provider_type_to_registry_key(pt: &ProviderType) -> &'static str {
         ProviderType::Jina => "jina",
         ProviderType::Cohere => "cohere",
         ProviderType::Voyage => "voyage",
+        ProviderType::Bedrock => "bedrock",
         ProviderType::Custom => "custom",
     }
 }
@@ -466,6 +711,7 @@ fn create_adapter_arc(pt: &ProviderType) -> Result<Arc<dyn ProviderAdapter>, Str
         ProviderType::OpenAIResponses => Ok(Arc::new(
             aqbot_providers::openai_responses::OpenAIResponsesAdapter::new(),
         )),
+        ProviderType::Bedrock => Ok(Arc::new(aqbot_providers::bedrock::BedrockAdapter::new())),
         ProviderType::Jina | ProviderType::Cohere | ProviderType::Voyage => {
             Err("Rerank-only providers cannot be used as agent chat providers".to_string())
         }
@@ -477,7 +723,8 @@ fn truncate_preview(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len.min(s.len())])
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}…", truncated)
     }
 }
 
@@ -540,6 +787,16 @@ fn build_agent_prompt_with_attachments(
     )
 }
 
+fn ensure_agent_prompt_safe_for_persistence(prompt: &str) -> Result<(), String> {
+    if aqbot_core::inline_media::contains_inline_image_data(prompt) {
+        return Err(
+            "Agent prompt contains inline image data; attach the image as a file instead"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -553,6 +810,11 @@ pub async fn agent_query(
     provider_id: String,
     model_id: String,
     attachments: Option<Vec<AttachmentInput>>,
+    enabled_mcp_server_ids: Vec<String>,
+    enabled_knowledge_base_ids: Option<Vec<String>>,
+    enabled_memory_namespace_ids: Option<Vec<String>>,
+    stream_id: Option<String>,
+    run_id: Option<String>,
 ) -> Result<(), String> {
     // 1. Get agent session (must exist)
     let session =
@@ -561,28 +823,89 @@ pub async fn agent_query(
             .map_err(|e| e.to_string())?
             .ok_or("Agent session not found. Please switch to Agent mode first.")?;
 
-    // 2. Concurrent check — use in-memory set as source of truth
+    ensure_agent_prompt_safe_for_persistence(&prompt)?;
+    // 2. Atomically reserve this conversation before any persistence or SDK
+    // initialization so concurrent queries cannot both pass a separate check.
+    let run_id = run_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(aqbot_core::utils::gen_id);
+    let mut conversation_run_guard = state.conversation_runs.admit(
+        &conversation_id,
+        &run_id,
+        stream_id.as_deref(),
+        crate::conversation_run::ConversationRunMode::Agent,
+    )?;
     {
-        let running = RUNNING_AGENTS.lock().unwrap();
+        let mut running = RUNNING_AGENTS.lock().unwrap();
         if running.contains_key(&conversation_id) {
             return Err("Agent is already running".to_string());
         }
+        running.insert(conversation_id.clone(), run_id.clone());
     }
+    let running_guard = RunningAgentGuard {
+        conversation_id: conversation_id.clone(),
+        run_id: run_id.clone(),
+        conversation_runs: state.conversation_runs.clone(),
+    };
+    conversation_run_guard.defuse();
+    let cancel_token = open_agent_sdk::CancellationToken::new();
+    let stream_id = stream_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| run_id.clone());
+    state.agent_cancel_tokens.lock().await.insert(
+        conversation_id.clone(),
+        crate::AgentCancelEntry {
+            run_id: run_id.clone(),
+            token: cancel_token.clone(),
+        },
+    );
+    let cancel_guard = AgentCancelTokenGuard {
+        conversation_id: conversation_id.clone(),
+        run_id: run_id.clone(),
+        tokens: state.agent_cancel_tokens.clone(),
+    };
+    super::agent_status::emit_agent_stage(
+        &app,
+        &conversation_id,
+        &run_id,
+        super::agent_status::AgentWaitStage::PreparingResources,
+    );
+    let mut status_clear_guard = super::agent_status::AgentStatusClearGuard::new(
+        app.clone(),
+        conversation_id.clone(),
+        run_id.clone(),
+    );
 
     let real_provider_id = resolve_agent_provider_id(&state.sea_db, &provider_id).await?;
+    let pre_conv = conversation::get_conversation(&state.sea_db, &conversation_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mcp_tools, mcp_display_names) = super::agent_mcp::build_agent_mcp_tools(
+        &state.sea_db,
+        state.mcp_stdio_clients.clone(),
+        &enabled_mcp_server_ids,
+    )
+    .await?;
+    let mcp_aliases: Vec<String> = mcp_tools
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    let mcp_display_names = Arc::new(mcp_display_names);
+    let is_first_message = pre_conv.message_count <= 1;
+    let global_settings = aqbot_core::repo::settings::get_settings(&state.sea_db)
+        .await
+        .map_err(|e| format!("Failed to load application settings: {e}"))?;
     let attachment_inputs = attachments.unwrap_or_default();
     let persisted_attachments =
         super::conversations::persist_attachments(&state, &conversation_id, &attachment_inputs)
             .await
             .map_err(|e| e.to_string())?;
 
-    // 3. Set runtime_status to 'running'
-    agent_session::update_agent_session_status(&state.sea_db, &session.id, "running")
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 4. Save user message
-    let user_message = message::create_message(
+    // 3. Save user message. The session is not marked running until every
+    // fallible provider/SDK initialization step below has succeeded.
+    let user_message = match message::create_message(
         &state.sea_db,
         &conversation_id,
         MessageRole::User,
@@ -592,17 +915,40 @@ pub async fn agent_query(
         0,
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(message) => message,
+        Err(error) => {
+            let cleanup_errors = super::conversations::cleanup_new_message_attachments(
+                &state.sea_db,
+                &persisted_attachments,
+            )
+            .await;
+            return Err(format!(
+                "Agent message creation failed: {error}; attachment rollback errors: {}",
+                if cleanup_errors.is_empty() {
+                    "none".to_string()
+                } else {
+                    cleanup_errors.join(", ")
+                }
+            ));
+        }
+    };
 
-    // Check if first message BEFORE incrementing
-    let pre_conv = conversation::get_conversation(&state.sea_db, &conversation_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let is_first_message = pre_conv.message_count <= 1;
-
-    conversation::increment_message_count(&state.sea_db, &conversation_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = conversation::increment_message_count(&state.sea_db, &conversation_id).await
+    {
+        let rollback_errors = super::conversations::rollback_new_message(
+            &state.sea_db,
+            &user_message.id,
+            &user_message.attachments,
+        )
+        .await;
+        return Err(super::conversations::format_new_message_failure(
+            &user_message.id,
+            "agent message-count update failed",
+            error,
+            rollback_errors,
+        ));
+    }
 
     // Auto-title: set fallback + async AI title for first message
     if is_first_message {
@@ -636,15 +982,131 @@ pub async fn agent_query(
         .map_err(|e| e.to_string())?;
     let decrypted_key = aqbot_core::crypto::decrypt_key(&key_row.key_encrypted, &state.master_key)
         .map_err(|e| e.to_string())?;
-    let model_param_overrides = provider::get_model(&state.sea_db, &real_provider_id, &model_id)
+    let resolved_model = provider::get_model(&state.sea_db, &real_provider_id, &model_id)
         .await
-        .ok()
-        .and_then(|model| model.param_overrides);
+        .ok();
+    let model_supports_tools = super::agent_context::model_supports_function_calling(
+        resolved_model
+            .as_ref()
+            .map(|model| model.capabilities.as_slice()),
+    );
+    let kb_ids = super::agent_context::resolve_turn_resource_ids(
+        enabled_knowledge_base_ids,
+        &pre_conv.enabled_knowledge_base_ids,
+    );
+    let mem_ids = super::agent_context::resolve_turn_resource_ids(
+        enabled_memory_namespace_ids,
+        &pre_conv.enabled_memory_namespace_ids,
+    );
+    let prepared_turn = aqbot_core::context_engine::prepare_turn(
+        &state.sea_db,
+        aqbot_core::context_engine::PrepareTurnRequest {
+            enabled_knowledge_base_ids: &kb_ids,
+            enabled_memory_namespace_ids: &mem_ids,
+            inject_l1: true,
+            model_supports_tools,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let assistant_message_id = create_agent_assistant_placeholder(
+        &state.sea_db,
+        &app,
+        &conversation_id,
+        &user_message.id,
+        &run_id,
+    )
+    .await?;
+    if let Some(diagnostic) =
+        super::agent_context::first_blocking_diagnostic(&prepared_turn.diagnostics)
+    {
+        return fail_agent_turn(
+            &app,
+            &state.sea_db,
+            &session.id,
+            &conversation_id,
+            &assistant_message_id,
+            &run_id,
+            &diagnostic.code,
+        )
+        .await;
+    }
+    let mut rag_result = aqbot_core::types::RagContextResult {
+        context_parts: Vec::new(),
+        source_results: Vec::new(),
+        errors: Vec::new(),
+        empty_results: Vec::new(),
+    };
+    if super::agent_context::prepared_turn_has_retrieval(&prepared_turn) {
+        match super::agent_context::collect_agent_rag_context(
+            &state.sea_db,
+            &state.master_key,
+            state.vector_store.as_ref(),
+            &prompt,
+            &prepared_turn.knowledge_ids,
+            &prepared_turn.auto_memory_ids,
+            &cancel_token,
+        )
+        .await
+        {
+            super::agent_context::AgentRagOutcome::Cancelled => {
+                return fail_agent_turn(
+                    &app,
+                    &state.sea_db,
+                    &session.id,
+                    &conversation_id,
+                    &assistant_message_id,
+                    &run_id,
+                    "已停止生成",
+                )
+                .await;
+            }
+            super::agent_context::AgentRagOutcome::Ready(result) => rag_result = result,
+        }
+    }
+    super::agent_context::emit_agent_rag_context(
+        &app,
+        &conversation_id,
+        &assistant_message_id,
+        &stream_id,
+        &rag_result,
+        &prepared_turn.diagnostics,
+    );
+    let retrieval_tag =
+        super::conversations::build_memory_retrieval_tag(&rag_result.source_results);
+    if !retrieval_tag.is_empty() {
+        let _ =
+            message::update_message_content(&state.sea_db, &assistant_message_id, &retrieval_tag)
+                .await;
+    }
+    if !rag_result.errors.is_empty() {
+        let message = rag_result
+            .errors
+            .first()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "检索失败".to_string());
+        return fail_agent_turn(
+            &app,
+            &state.sea_db,
+            &session.id,
+            &conversation_id,
+            &assistant_message_id,
+            &run_id,
+            &message,
+        )
+        .await;
+    }
+    let append_system_prompt = super::agent_context::build_append_system_prompt(
+        prepared_turn.l1_system_message.as_deref(),
+        &rag_result.context_parts,
+    );
+    let memory_tool_scope = prepared_turn.memory_tool.map(|binding| binding.scope);
+    let model_max_output_tokens = resolved_model
+        .as_ref()
+        .and_then(|model| model.max_output_tokens);
+    let model_param_overrides = resolved_model.and_then(|model| model.param_overrides);
 
     // 6. Build ProviderRequestContext
-    let global_settings = aqbot_core::repo::settings::get_settings(&state.sea_db)
-        .await
-        .unwrap_or_default();
     let file_store = aqbot_core::file_store::FileStore::new();
     let agent_prompt = build_agent_prompt_with_attachments(
         &file_store,
@@ -663,6 +1125,7 @@ pub async fn agent_query(
             &prov.provider_type,
         )),
         api_path: prov.api_path.clone(),
+        aws_region: prov.aws_region.clone(),
         proxy_config: resolved_proxy,
         custom_headers: prov
             .custom_headers
@@ -677,22 +1140,65 @@ pub async fn agent_query(
     let bridge = aqbot_agent::bridge::AQBotProviderBridge::new(adapter, ctx, provider_type_str)
         .map_err(|e| e.to_string())?
         .with_model_param_overrides(model_param_overrides)
+        .with_model_max_output_tokens(model_max_output_tokens)
+        .with_stream_timeouts(
+            super::agent_status::duration_from_timeout_secs(
+                global_settings.chat_stream_first_packet_timeout_secs,
+            ),
+            super::agent_status::duration_from_timeout_secs(
+                global_settings.chat_stream_idle_timeout_secs,
+            ),
+        )
         .with_app(app.clone(), conversation_id.clone());
+
+    super::agent_status::emit_agent_stage(
+        &app,
+        &conversation_id,
+        &run_id,
+        super::agent_status::AgentWaitStage::PreparingSkills,
+    );
+    let inject_skills_summary = should_inject_skills_summary(
+        global_settings.agent_allowed_tools_enabled,
+        &global_settings.agent_allowed_tools,
+    );
+    let disabled = aqbot_core::repo::skill::get_disabled_skills(&state.sea_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let home = dirs::home_dir().unwrap_or_default();
+    let session_id_for_skills = session.id.clone();
+    let workspace_for_skills = session.cwd.clone().map(PathBuf::from);
+    let prepared_skills = tokio::task::spawn_blocking(move || {
+        super::agent_skills::prepare_agent_skills(
+            &home,
+            disabled,
+            inject_skills_summary,
+            workspace_for_skills.as_deref(),
+            &session_id_for_skills,
+        )
+    })
+    .await
+    .map_err(|error| format!("Failed to prepare skills: {error}"))?
+    .map_err(|error| format!("Failed to prepare skills: {error}"))?;
+    if cancel_token.is_cancelled() {
+        return Err("Agent cancelled during initialization".to_string());
+    }
+    let skill_runtime = prepared_skills.runtime.clone().map(Arc::new);
 
     // 8. Build permission callback (CanUseToolFn)
     let permission_mode =
         aqbot_agent::permission::PermissionMode::from_str(&session.permission_mode);
     let cwd_for_check = session.cwd.clone().unwrap_or_default();
-    let cancel_token = open_agent_sdk::CancellationToken::new();
     let always_allowed_map = state.agent_always_allowed.clone();
     let conv_id_for_allowed = conversation_id.clone();
     let permission_senders = state.agent_permission_senders.clone();
     let app_for_perm = app.clone();
     let conv_id_for_perm = conversation_id.clone();
-    let current_assistant_id_for_perm: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let current_assistant_id_for_perm: Arc<RwLock<Option<String>>> =
+        Arc::new(RwLock::new(Some(assistant_message_id.clone())));
     let assistant_id_for_task = current_assistant_id_for_perm.clone();
     let db_for_perm = state.sea_db.clone();
     let cancel_token_for_perm = cancel_token.clone();
+    let mcp_display_names_for_perm = mcp_display_names.clone();
 
     let can_use_tool: CanUseToolFn = Arc::new(move |tool_name: &str, input: &Value| {
         let tool_name = tool_name.to_string();
@@ -706,34 +1212,44 @@ pub async fn agent_query(
         let assistant_id = current_assistant_id_for_perm.clone();
         let db = db_for_perm.clone();
         let cancel_token = cancel_token_for_perm.clone();
+        let mcp_display_names = mcp_display_names_for_perm.clone();
+        let skill_runtime = skill_runtime.clone();
 
         Box::pin(async move {
             if cancel_token.is_cancelled() {
                 return PermissionDecision::Deny("Agent cancelled".to_string());
             }
 
-            // 1. CWD safety check (hard deny, skipped in FullAccess mode)
-            if permission_mode != aqbot_agent::permission::PermissionMode::FullAccess
-                && !cwd.is_empty()
-            {
-                if let Some(deny) = check_path_safety(&tool_name, &input, &cwd) {
+            // Skill runtime writes are denied even in FullAccess. Other path
+            // checks stay skipped in FullAccess.
+            let enforce_cwd = permission_mode
+                != aqbot_agent::permission::PermissionMode::FullAccess
+                && !cwd.is_empty();
+            if skill_runtime.is_some() || enforce_cwd {
+                if let Some(deny) = check_path_safety_with_runtime(
+                    &tool_name,
+                    &input,
+                    &cwd,
+                    skill_runtime.as_deref(),
+                    enforce_cwd,
+                ) {
                     return deny;
                 }
             }
 
-            // 2. Check conversation-level always_allowed cache
-            {
-                let map = always_allowed_map.lock().await;
-                if let Some(set) = map.get(&conv_id_allowed) {
-                    if set.contains(&tool_name) {
-                        return PermissionDecision::Allow;
-                    }
-                }
-            }
-
-            // 3. Decision matrix
+            // 2. Decision matrix. Execute tools never honor a cached always-allow.
             let risk = classify_tool_risk(&tool_name);
-            match decide_permission(permission_mode, risk, false) {
+            let display_tool_name =
+                super::agent_mcp::display_agent_tool_name(&mcp_display_names, &tool_name)
+                    .to_string();
+            let is_always_allowed = if allows_persistent_approval(risk) {
+                let map = always_allowed_map.lock().await;
+                map.get(&conv_id_allowed)
+                    .is_some_and(|set| set.contains(&tool_name))
+            } else {
+                false
+            };
+            match decide_permission(permission_mode, risk, is_always_allowed) {
                 PermissionAction::AutoAllow => PermissionDecision::Allow,
                 PermissionAction::RequireApproval => {
                     // Create oneshot channel
@@ -751,7 +1267,7 @@ pub async fn agent_query(
                         &conv_id,
                         assistant_id.read().await.as_deref(),
                         "__agent_sdk__",
-                        &tool_name,
+                        &display_tool_name,
                         Some(&input_str),
                         Some("pending"),
                     )
@@ -763,7 +1279,8 @@ pub async fn agent_query(
                     let risk_str = match risk {
                         aqbot_agent::permission::RiskLevel::ReadOnly => "read_only",
                         aqbot_agent::permission::RiskLevel::Write => "write",
-                        aqbot_agent::permission::RiskLevel::Execute => "execute",
+                        aqbot_agent::permission::RiskLevel::Mcp
+                        | aqbot_agent::permission::RiskLevel::Execute => "execute",
                     };
                     let _ = app.emit(
                         "agent-permission-request",
@@ -774,10 +1291,15 @@ pub async fn agent_query(
                                 .await
                                 .clone()
                                 .unwrap_or_default(),
-                            tool_use_id: perm_id.clone(),
-                            tool_name: tool_name.clone(),
-                            input,
+                            tool_use_id: filter_complete_agent_event_text(&perm_id),
+                            tool_name: filter_complete_agent_event_text(&display_tool_name),
+                            input: filter_agent_event_json(&input),
                             risk_level: risk_str.to_string(),
+                            working_directory: if cwd.is_empty() {
+                                None
+                            } else {
+                                Some(cwd.clone())
+                            },
                         },
                     );
 
@@ -786,13 +1308,17 @@ pub async fn agent_query(
                         result = rx => match result {
                             Ok(decision_str) => match decision_str.as_str() {
                                 "allow_once" => PermissionDecision::Allow,
-                                "allow_always" => {
+                                "allow_always" if allows_persistent_approval(risk) => {
                                     always_allowed_map.lock().await
                                         .entry(conv_id_allowed.clone())
                                         .or_default()
                                         .insert(tool_name.clone());
                                     PermissionDecision::Allow
                                 }
+                                "allow_always" => PermissionDecision::Deny(
+                                    "Persistent allow is not permitted for execute tools"
+                                        .to_string(),
+                                ),
                                 "deny" => PermissionDecision::Deny(
                                     "User denied permission".to_string(),
                                 ),
@@ -836,29 +1362,21 @@ pub async fn agent_query(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Load enabled skills, build context summary, and create SkillTool
-    let home = dirs::home_dir().unwrap_or_default();
-    let all_skills = open_agent_sdk::skills::load_all_global(&home);
-    let disabled = aqbot_core::repo::skill::get_disabled_skills(&state.sea_db)
-        .await
-        .unwrap_or_default();
-    let mut registry = open_agent_sdk::skills::SkillRegistry::new();
-    for skill in all_skills {
-        registry.register(skill);
+    let skills_summary = prepared_skills.summary;
+    let mut custom_tools = mcp_tools;
+    if inject_skills_summary {
+        let skill_registry = Arc::new(tokio::sync::RwLock::new(prepared_skills.registry));
+        let skill_tool: Arc<dyn open_agent_sdk::types::Tool> = Arc::new(
+            open_agent_sdk::tools::skill_tool::SkillTool::new(skill_registry),
+        );
+        custom_tools.push(skill_tool);
     }
-    registry.set_disabled(disabled);
-    let skills_summary = {
-        let summary = registry.generate_context_summary();
-        if summary.is_empty() {
-            None
-        } else {
-            Some(summary)
-        }
-    };
-    let skill_registry = Arc::new(tokio::sync::RwLock::new(registry));
-    let skill_tool: Arc<dyn open_agent_sdk::types::Tool> = Arc::new(
-        open_agent_sdk::tools::skill_tool::SkillTool::new(skill_registry),
-    );
+    let memory_tool_scope_bound = memory_tool_scope.is_some();
+    if let Some(scope) = memory_tool_scope {
+        custom_tools.push(std::sync::Arc::new(
+            super::agent_memory_tool::AgentMemoryTool::new(state.sea_db.clone(), scope),
+        ));
+    }
 
     // Build ask_fn for AskUserQuestion tool
     let ask_senders = state.agent_ask_senders.clone();
@@ -888,8 +1406,13 @@ pub async fn agent_query(
                         conversation_id: conv_id,
                         assistant_message_id: assistant_id.read().await.clone().unwrap_or_default(),
                         ask_id: ask_id.clone(),
-                        question,
-                        options,
+                        question: filter_complete_agent_event_text(&question),
+                        options: options.map(|values| {
+                            values
+                                .into_iter()
+                                .map(|value| filter_complete_agent_event_text(&value))
+                                .collect()
+                        }),
                     },
                 );
 
@@ -904,16 +1427,38 @@ pub async fn agent_query(
         },
     );
 
+    let mut allowed_tools = resolve_agent_allowed_tools(
+        global_settings.agent_allowed_tools_enabled,
+        &global_settings.agent_allowed_tools,
+        &mcp_aliases,
+    );
+    if memory_tool_scope_bound {
+        if let Some(allowed) = allowed_tools.as_mut() {
+            let name = aqbot_core::context_engine::MEMORY_TOOL_NAME.to_string();
+            if !allowed.iter().any(|item| item == &name) {
+                allowed.push(name);
+            }
+        }
+    }
     let agent_options = AgentOptions {
         model: Some(model_id.clone()),
         provider: Some(Arc::new(bridge)),
         cwd: session.cwd.clone(),
         system_prompt: conv.system_prompt.clone(),
+        append_system_prompt,
         skills_summary,
         ask_fn: Some(ask_fn),
         can_use_tool: Some(can_use_tool),
-        custom_tools: vec![skill_tool],
+        custom_tools,
+        allowed_tools,
+        disallowed_tools: Some(
+            AGENT_HIDDEN_SDK_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ),
         abort_signal: Some(cancel_token.clone()),
+        shell_binary: global_settings.agent_bash_path.clone(),
         ..Default::default()
     };
 
@@ -941,20 +1486,18 @@ pub async fn agent_query(
         model_id
     );
 
-    // 10. Spawn background task — mark as running in-memory
-    let run_id = aqbot_core::utils::gen_id();
-    {
-        let mut running = RUNNING_AGENTS.lock().unwrap();
-        running.insert(conversation_id.clone(), run_id.clone());
+    // 10. All fallible initialization is complete. Mark the persisted and
+    // in-memory runtime state immediately before spawning the background task.
+    if cancel_token.is_cancelled() {
+        return Err("Agent cancelled during initialization".to_string());
     }
-    state
-        .agent_cancel_tokens
-        .lock()
+    agent_session::update_agent_session_status(&state.sea_db, &session.id, "running")
         .await
-        .insert(conversation_id.clone(), cancel_token);
+        .map_err(|e| e.to_string())?;
 
     let db = state.sea_db.clone();
     let session_id = session.id.clone();
+    let session_cwd = session.cwd.clone();
     let conv_id = conversation_id.clone();
     let user_msg_id = user_message.id.clone();
     let master_key = state.master_key;
@@ -962,22 +1505,20 @@ pub async fn agent_query(
     let title_model_id = model_id.clone();
     let title_settings = global_settings.clone();
     let title_prompt = prompt.clone();
-    let cancel_tokens = state.agent_cancel_tokens.clone();
+    let mcp_display_names_for_events = mcp_display_names;
+    let run_id_for_task = run_id.clone();
+    status_clear_guard.disarm();
 
     tokio::spawn(async move {
         // RAII guard: ensures conv_id is removed from RUNNING_AGENTS on exit (even panic)
-        let _running_guard = RunningAgentGuard {
-            conversation_id: conv_id.clone(),
-            run_id,
-        };
-        let _cancel_guard = AgentCancelTokenGuard {
-            conversation_id: conv_id.clone(),
-            tokens: cancel_tokens,
-        };
+        let _running_guard = running_guard;
+        let _cancel_guard = cancel_guard;
+        let run_id = run_id_for_task;
 
         tracing::info!(
-            "[agent] Background task started for conversation {}",
-            conv_id
+            "[agent] Background task started for conversation {} run {}",
+            conv_id,
+            run_id
         );
         let (mut rx, handle) = agent.query(&agent_prompt).await;
 
@@ -986,16 +1527,34 @@ pub async fn agent_query(
         let mut num_turns = 0u32;
         let mut cost_usd = 0.0f64;
         let mut sdk_messages: Option<Vec<open_agent_sdk::Message>> = None;
-        let mut current_assistant_msg_id: Option<String> = None;
-        let mut accumulated_text = String::new();
-        let mut accumulated_thinking = String::new();
+        let mut current_assistant_msg_id: Option<String> = Some(assistant_message_id.clone());
+        let mut accumulated_text = retrieval_tag.clone();
         let mut in_thinking_block = false;
         let mut has_streamed_deltas = false;
+        let mut has_agent_content = false;
         let mut got_result_or_error = false;
+        let mut text_ipc_filter = InlineDataStreamFilter::default();
+        let mut thinking_ipc_filter = InlineDataStreamFilter::default();
+        let mut inline_data_capture = InlineDataStreamCapture::default();
+        let mut inline_capture_error: Option<String> = None;
+        let mcp_display_names = mcp_display_names_for_events;
         // Map SDK tool_use_id → DB tool_execution.id
         let mut tool_exec_map: HashMap<String, String> = HashMap::new();
 
-        while let Some(msg) = rx.recv().await {
+        macro_rules! append_captured {
+            ($label:lifetime, $text:expr) => {
+                if let Err(error) = append_captured_agent_text(
+                    &mut inline_data_capture,
+                    &mut accumulated_text,
+                    $text,
+                ) {
+                    inline_capture_error = Some(error.to_string());
+                    break $label;
+                }
+            };
+        }
+
+        'agent_messages: while let Some(msg) = rx.recv().await {
             match msg {
                 SDKMessage::Assistant { message: msg, .. } => {
                     // Ordered processing: collect text/thinking in order,
@@ -1009,42 +1568,54 @@ pub async fn agent_query(
                                 ContentBlock::Thinking { thinking, .. } => {
                                     if !in_thinking_block {
                                         if !accumulated_text.is_empty() {
-                                            accumulated_text.push_str("\n\n");
+                                            append_captured!('agent_messages, "\n\n");
                                         }
-                                        accumulated_text.push_str("<think data-aqbot=\"1\">\n");
+                                        append_captured!('agent_messages, "<think data-aqbot=\"1\">\n");
                                         in_thinking_block = true;
                                     }
-                                    accumulated_text.push_str(thinking);
-                                    accumulated_thinking.push_str(thinking);
+                                    append_captured!('agent_messages, thinking);
+                                    has_agent_content = true;
 
-                                    let _ = app.emit(
-                                        "agent-stream-thinking",
-                                        AgentThinkingPayload {
-                                            conversation_id: conv_id.clone(),
-                                            assistant_message_id: current_assistant_msg_id
-                                                .clone()
-                                                .unwrap_or_default(),
-                                            thinking: thinking.clone(),
-                                        },
-                                    );
+                                    if let Some(thinking) = filtered_agent_stream_chunk(
+                                        &mut thinking_ipc_filter,
+                                        thinking,
+                                    ) {
+                                        let _ = app.emit(
+                                            "agent-stream-thinking",
+                                            AgentThinkingPayload {
+                                                conversation_id: conv_id.clone(),
+                                                run_id: Some(run_id.clone()),
+                                                assistant_message_id: current_assistant_msg_id
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                thinking,
+                                            },
+                                        );
+                                    }
                                 }
                                 ContentBlock::Text { text } => {
                                     if in_thinking_block {
-                                        accumulated_text.push_str("\n</think>\n\n");
+                                        append_captured!('agent_messages, "\n</think>\n\n");
                                         in_thinking_block = false;
                                     }
-                                    accumulated_text.push_str(text);
+                                    append_captured!('agent_messages, text);
+                                    has_agent_content = true;
 
-                                    let _ = app.emit(
-                                        "agent-stream-text",
-                                        AgentTextPayload {
-                                            conversation_id: conv_id.clone(),
-                                            assistant_message_id: current_assistant_msg_id
-                                                .clone()
-                                                .unwrap_or_default(),
-                                            text: text.clone(),
-                                        },
-                                    );
+                                    if let Some(text) =
+                                        filtered_agent_stream_chunk(&mut text_ipc_filter, text)
+                                    {
+                                        let _ = app.emit(
+                                            "agent-stream-text",
+                                            AgentTextPayload {
+                                                conversation_id: conv_id.clone(),
+                                                run_id: Some(run_id.clone()),
+                                                assistant_message_id: current_assistant_msg_id
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                text,
+                                            },
+                                        );
+                                    }
                                 }
                                 ContentBlock::ToolUse { id, name, input } => {
                                     pending_tool_uses.push((
@@ -1080,21 +1651,25 @@ pub async fn agent_query(
                         )
                         .await;
                     } else if let Some(ref mid) = current_assistant_msg_id {
-                        let _ = message::update_message_content(&db, mid, &accumulated_text).await;
+                        persist_agent_stream_snapshot(&db, mid, &accumulated_text).await;
                     }
 
                     // Process tool_use blocks: create DB records, insert inline markers
                     if !pending_tool_uses.is_empty() {
                         // Close any open thinking block before tool markers
                         if in_thinking_block {
-                            accumulated_text.push_str("\n</think>\n\n");
+                            append_captured!('agent_messages, "\n</think>\n\n");
                             in_thinking_block = false;
                         }
 
                         for (sdk_id, name, input) in &pending_tool_uses {
+                            let display_name =
+                                super::agent_mcp::display_agent_tool_name(&mcp_display_names, name);
+                            let (safe_sdk_id, safe_name) =
+                                filter_agent_tool_identity(sdk_id, display_name);
                             tracing::info!(
                                 "[agent] ToolUse in assistant message: {} ({}), assistantMsgId={:?}",
-                                name, sdk_id, current_assistant_msg_id
+                                safe_name, safe_sdk_id, current_assistant_msg_id
                             );
 
                             // Create tool_execution record in DB
@@ -1107,7 +1682,7 @@ pub async fn agent_query(
                                 &conv_id,
                                 current_assistant_msg_id.as_deref(),
                                 "__agent_sdk__",
-                                &name,
+                                display_name,
                                 Some(&input_str),
                                 None,
                             )
@@ -1121,25 +1696,33 @@ pub async fn agent_query(
                             };
 
                             // Build inline <tool-call> marker with DB execution ID
-                            let summary = get_tool_input_summary(&name, input);
-                            let tag_id = exec_id.as_deref().unwrap_or(sdk_id);
+                            let summary = filter_complete_agent_event_text(
+                                &get_tool_input_summary(display_name, input),
+                            );
+                            let tag_id = exec_id.as_deref().unwrap_or(&safe_sdk_id);
+                            let marker_name = escape_tool_call_attribute(&safe_name);
                             let marker = format!(
                                 "\n\n<tool-call data-aqbot=\"1\" id=\"{}\" name=\"{}\">{}</tool-call>\n\n",
-                                tag_id, name, summary
+                                tag_id, marker_name, summary
                             );
-                            accumulated_text.push_str(&marker);
+                            append_captured!('agent_messages, &marker);
 
                             // Emit agent-stream-text so frontend content updates in real-time
-                            let _ = app.emit(
-                                "agent-stream-text",
-                                AgentTextPayload {
-                                    conversation_id: conv_id.clone(),
-                                    assistant_message_id: current_assistant_msg_id
-                                        .clone()
-                                        .unwrap_or_default(),
-                                    text: marker,
-                                },
-                            );
+                            if let Some(marker) =
+                                filtered_agent_stream_chunk(&mut text_ipc_filter, &marker)
+                            {
+                                let _ = app.emit(
+                                    "agent-stream-text",
+                                    AgentTextPayload {
+                                        conversation_id: conv_id.clone(),
+                                        run_id: Some(run_id.clone()),
+                                        assistant_message_id: current_assistant_msg_id
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        text: marker,
+                                    },
+                                );
+                            }
 
                             // Emit agent-tool-use event for agentStore
                             let _ = app.emit(
@@ -1149,9 +1732,9 @@ pub async fn agent_query(
                                     assistant_message_id: current_assistant_msg_id
                                         .clone()
                                         .unwrap_or_default(),
-                                    tool_use_id: sdk_id.clone(),
-                                    tool_name: name.clone(),
-                                    input: input.clone(),
+                                    tool_use_id: safe_sdk_id,
+                                    tool_name: safe_name,
+                                    input: filter_agent_event_json(input),
                                     execution_id: exec_id,
                                 },
                             );
@@ -1159,8 +1742,7 @@ pub async fn agent_query(
 
                         // Update message content with tool-call markers
                         if let Some(ref mid) = current_assistant_msg_id {
-                            let _ =
-                                message::update_message_content(&db, mid, &accumulated_text).await;
+                            persist_agent_stream_snapshot(&db, mid, &accumulated_text).await;
                         }
                     }
                 }
@@ -1169,7 +1751,11 @@ pub async fn agent_query(
                     tool_name,
                     input,
                 } => {
-                    tracing::info!("[agent] ToolStart: {} ({})", tool_name, tool_use_id);
+                    let display_name =
+                        super::agent_mcp::display_agent_tool_name(&mcp_display_names, &tool_name);
+                    tracing::info!("[agent] ToolStart: {} ({})", display_name, tool_use_id);
+                    let (safe_tool_use_id, safe_tool_name) =
+                        filter_agent_tool_identity(&tool_use_id, display_name);
                     // Emit agent-tool-start
                     let _ = app.emit(
                         "agent-tool-start",
@@ -1178,9 +1764,9 @@ pub async fn agent_query(
                             assistant_message_id: current_assistant_msg_id
                                 .clone()
                                 .unwrap_or_default(),
-                            tool_use_id: tool_use_id.clone(),
-                            tool_name: tool_name.clone(),
-                            input,
+                            tool_use_id: safe_tool_use_id,
+                            tool_name: safe_tool_name,
+                            input: filter_agent_event_json(&input),
                         },
                     );
 
@@ -1198,6 +1784,10 @@ pub async fn agent_query(
                     content,
                     is_error,
                 } => {
+                    let display_name =
+                        super::agent_mcp::display_agent_tool_name(&mcp_display_names, &tool_name);
+                    let (safe_tool_use_id, safe_tool_name) =
+                        filter_agent_tool_identity(&tool_use_id, display_name);
                     // Emit agent-tool-result
                     let _ = app.emit(
                         "agent-tool-result",
@@ -1206,9 +1796,9 @@ pub async fn agent_query(
                             assistant_message_id: current_assistant_msg_id
                                 .clone()
                                 .unwrap_or_default(),
-                            tool_use_id: tool_use_id.clone(),
-                            tool_name: tool_name.clone(),
-                            content: content.clone(),
+                            tool_use_id: safe_tool_use_id,
+                            tool_name: safe_tool_name,
+                            content: filter_complete_agent_event_text(&content),
                             is_error,
                         },
                     );
@@ -1238,6 +1828,16 @@ pub async fn agent_query(
                     input,
                     ..
                 } => {
+                    let display_name =
+                        super::agent_mcp::display_agent_tool_name(&mcp_display_names, &tool_name);
+                    let (safe_tool_use_id, safe_tool_name) =
+                        filter_agent_tool_identity(&tool_use_id, display_name);
+                    let risk_str = match classify_tool_risk(&tool_name) {
+                        aqbot_agent::permission::RiskLevel::ReadOnly => "read_only",
+                        aqbot_agent::permission::RiskLevel::Write => "write",
+                        aqbot_agent::permission::RiskLevel::Mcp
+                        | aqbot_agent::permission::RiskLevel::Execute => "execute",
+                    };
                     // Emit agent-permission-request
                     let _ = app.emit(
                         "agent-permission-request",
@@ -1246,10 +1846,11 @@ pub async fn agent_query(
                             assistant_message_id: current_assistant_msg_id
                                 .clone()
                                 .unwrap_or_default(),
-                            tool_use_id: tool_use_id.clone(),
-                            tool_name: tool_name.clone(),
-                            input,
-                            risk_level: "execute".to_string(),
+                            tool_use_id: safe_tool_use_id,
+                            tool_name: safe_tool_name,
+                            input: filter_agent_event_json(&input),
+                            risk_level: risk_str.to_string(),
+                            working_directory: session_cwd.clone(),
                         },
                     );
 
@@ -1267,13 +1868,43 @@ pub async fn agent_query(
                 | SDKMessage::Progress {
                     message: status_msg,
                 } => {
-                    let _ = app.emit(
-                        "agent-status",
-                        AgentStatusPayload {
-                            conversation_id: conv_id.clone(),
-                            message: status_msg,
-                        },
+                    super::agent_status::emit_agent_status_message(
+                        &app,
+                        &conv_id,
+                        &run_id,
+                        &filter_complete_agent_event_text(&status_msg),
                     );
+                }
+                SDKMessage::Stage {
+                    stage,
+                    retry_attempt,
+                    retry_wait_ms,
+                } => {
+                    if let (Some(attempt), Some(wait_ms)) = (retry_attempt, retry_wait_ms) {
+                        super::agent_status::emit_agent_retry(
+                            &app, &conv_id, &run_id, attempt, wait_ms,
+                        );
+                    } else if !stage.is_empty() {
+                        let parsed = match stage.as_str() {
+                            "preparing_context" => {
+                                Some(super::agent_status::AgentWaitStage::PreparingContext)
+                            }
+                            "waiting_model" => {
+                                Some(super::agent_status::AgentWaitStage::WaitingModel)
+                            }
+                            "streaming" => Some(super::agent_status::AgentWaitStage::Streaming),
+                            "preparing_resources" => {
+                                Some(super::agent_status::AgentWaitStage::PreparingResources)
+                            }
+                            "preparing_skills" => {
+                                Some(super::agent_status::AgentWaitStage::PreparingSkills)
+                            }
+                            _ => None,
+                        };
+                        if let Some(stage) = parsed {
+                            super::agent_status::emit_agent_stage(&app, &conv_id, &run_id, stage);
+                        }
+                    }
                 }
                 SDKMessage::RateLimit {
                     retry_after_ms,
@@ -1284,7 +1915,7 @@ pub async fn agent_query(
                         AgentRateLimitPayload {
                             conversation_id: conv_id.clone(),
                             retry_after_ms,
-                            message: limit_msg,
+                            message: filter_complete_agent_event_text(&limit_msg),
                         },
                     );
                 }
@@ -1298,7 +1929,11 @@ pub async fn agent_query(
                 } => {
                     tracing::info!("[agent] Result: {} turns, cost ${:.4}", t, c);
                     got_result_or_error = true;
-                    result_text = text;
+                    result_text = filter_complete_agent_event_text(&text);
+                    if !has_agent_content && !text.is_empty() {
+                        append_captured!('agent_messages, &text);
+                        has_agent_content = true;
+                    }
                     final_usage = Some(usage);
                     num_turns = t;
                     cost_usd = c;
@@ -1306,14 +1941,32 @@ pub async fn agent_query(
                 }
                 SDKMessage::Error { message: err_msg } => {
                     tracing::error!("[agent] Error: {}", err_msg);
+                    flush_agent_stream_filters(
+                        &app,
+                        &conv_id,
+                        &run_id,
+                        current_assistant_msg_id.as_deref(),
+                        &mut text_ipc_filter,
+                        &mut thinking_ipc_filter,
+                    );
                     let _ = app.emit(
                         "agent-error",
                         AgentErrorPayload {
                             conversation_id: conv_id.clone(),
+                            run_id: Some(run_id.clone()),
                             assistant_message_id: current_assistant_msg_id.clone(),
-                            message: err_msg,
+                            message: filter_complete_agent_event_text(&err_msg),
                         },
                     );
+                    if let Some(message_id) = current_assistant_msg_id.as_deref() {
+                        let failed_content =
+                            aqbot_core::inline_media::replace_pending_inline_media_tokens(
+                                &accumulated_text,
+                                "[图片接收失败]",
+                            );
+                        persist_agent_stream_snapshot(&db, message_id, &failed_content).await;
+                        let _ = message::update_message_status(&db, message_id, "error").await;
+                    }
                     let _ =
                         agent_session::update_agent_session_status(&db, &session_id, "idle").await;
                     return;
@@ -1323,13 +1976,13 @@ pub async fn agent_query(
                     has_streamed_deltas = true;
                     if !in_thinking_block {
                         if !accumulated_text.is_empty() {
-                            accumulated_text.push_str("\n\n");
+                            append_captured!('agent_messages, "\n\n");
                         }
-                        accumulated_text.push_str("<think data-aqbot=\"1\">\n");
+                        append_captured!('agent_messages, "<think data-aqbot=\"1\">\n");
                         in_thinking_block = true;
                     }
-                    accumulated_text.push_str(&thinking);
-                    accumulated_thinking.push_str(&thinking);
+                    append_captured!('agent_messages, &thinking);
+                    has_agent_content = true;
                     let assistant_message_id = persist_agent_partial_content(
                         &db,
                         &app,
@@ -1342,23 +1995,29 @@ pub async fn agent_query(
                     .await
                     .unwrap_or_default();
 
-                    let _ = app.emit(
-                        "agent-stream-thinking",
-                        AgentThinkingPayload {
-                            conversation_id: conv_id.clone(),
-                            assistant_message_id,
-                            thinking,
-                        },
-                    );
+                    if let Some(thinking) =
+                        filtered_agent_stream_chunk(&mut thinking_ipc_filter, &thinking)
+                    {
+                        let _ = app.emit(
+                            "agent-stream-thinking",
+                            AgentThinkingPayload {
+                                conversation_id: conv_id.clone(),
+                                run_id: Some(run_id.clone()),
+                                assistant_message_id,
+                                thinking,
+                            },
+                        );
+                    }
                 }
                 SDKMessage::TextDelta { text } => {
                     // Real-time text token from API stream
                     has_streamed_deltas = true;
                     if in_thinking_block {
-                        accumulated_text.push_str("\n</think>\n\n");
+                        append_captured!('agent_messages, "\n</think>\n\n");
                         in_thinking_block = false;
                     }
-                    accumulated_text.push_str(&text);
+                    append_captured!('agent_messages, &text);
+                    has_agent_content = true;
                     let assistant_message_id = persist_agent_partial_content(
                         &db,
                         &app,
@@ -1371,14 +2030,46 @@ pub async fn agent_query(
                     .await
                     .unwrap_or_default();
 
-                    let _ = app.emit(
-                        "agent-stream-text",
-                        AgentTextPayload {
+                    if let Some(text) = filtered_agent_stream_chunk(&mut text_ipc_filter, &text) {
+                        let _ = app.emit(
+                            "agent-stream-text",
+                            AgentTextPayload {
+                                conversation_id: conv_id.clone(),
+                                run_id: Some(run_id.clone()),
+                                assistant_message_id,
+                                text,
+                            },
+                        );
+                    }
+                }
+                SDKMessage::ToolOutput {
+                    tool_use_id,
+                    tool_name,
+                    content,
+                } => {
+                    let display_name =
+                        super::agent_mcp::display_agent_tool_name(&mcp_display_names, &tool_name);
+                    let (safe_tool_use_id, safe_tool_name) =
+                        filter_agent_tool_identity(&tool_use_id, display_name);
+                    if let Err(error) = app.emit(
+                        "agent-tool-output",
+                        AgentToolOutputPayload {
                             conversation_id: conv_id.clone(),
-                            assistant_message_id,
-                            text,
+                            assistant_message_id: current_assistant_msg_id
+                                .clone()
+                                .unwrap_or_default(),
+                            tool_use_id: safe_tool_use_id.clone(),
+                            tool_name: safe_tool_name,
+                            content: filter_complete_agent_event_text(&content),
                         },
-                    );
+                    ) {
+                        tracing::warn!(
+                            conversation_id = %conv_id,
+                            tool_use_id = %safe_tool_use_id,
+                            %error,
+                            "failed to emit agent tool output"
+                        );
+                    }
                 }
                 _ => {
                     tracing::debug!("[agent] unhandled SDKMessage: {:?}", msg);
@@ -1392,10 +2083,19 @@ pub async fn agent_query(
             Err(join_err) => {
                 tracing::error!("[agent] Agent inner task failed: {}", join_err);
                 if !got_result_or_error {
+                    flush_agent_stream_filters(
+                        &app,
+                        &conv_id,
+                        &run_id,
+                        current_assistant_msg_id.as_deref(),
+                        &mut text_ipc_filter,
+                        &mut thinking_ipc_filter,
+                    );
                     let _ = app.emit(
                         "agent-error",
                         AgentErrorPayload {
                             conversation_id: conv_id.clone(),
+                            run_id: Some(run_id.clone()),
                             assistant_message_id: current_assistant_msg_id.clone(),
                             message: "Agent task crashed unexpectedly".to_string(),
                         },
@@ -1407,13 +2107,44 @@ pub async fn agent_query(
             }
         }
 
-        // If channel closed without Result or Error, emit a fallback error
-        if !got_result_or_error {
-            tracing::error!("[agent] Channel closed without Result or Error");
+        if let Some(error) = inline_capture_error {
+            let failed_content = aqbot_core::inline_media::replace_pending_inline_media_tokens(
+                &accumulated_text,
+                "[图片接收失败]",
+            );
+            if let Some(message_id) = current_assistant_msg_id.as_deref() {
+                persist_agent_stream_snapshot(&db, message_id, &failed_content).await;
+                let _ = message::update_message_status(&db, message_id, "error").await;
+            }
             let _ = app.emit(
                 "agent-error",
                 AgentErrorPayload {
                     conversation_id: conv_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    assistant_message_id: current_assistant_msg_id.clone(),
+                    message: format!("Failed to stage generated image: {error}"),
+                },
+            );
+            let _ = agent_session::update_agent_session_status(&db, &session_id, "idle").await;
+            return;
+        }
+
+        // If channel closed without Result or Error, emit a fallback error
+        if !got_result_or_error {
+            tracing::error!("[agent] Channel closed without Result or Error");
+            flush_agent_stream_filters(
+                &app,
+                &conv_id,
+                &run_id,
+                current_assistant_msg_id.as_deref(),
+                &mut text_ipc_filter,
+                &mut thinking_ipc_filter,
+            );
+            let _ = app.emit(
+                "agent-error",
+                AgentErrorPayload {
+                    conversation_id: conv_id.clone(),
+                    run_id: Some(run_id.clone()),
                     assistant_message_id: current_assistant_msg_id.clone(),
                     message: "Agent ended unexpectedly without producing a result".to_string(),
                 },
@@ -1422,39 +2153,159 @@ pub async fn agent_query(
             return;
         }
 
-        // Build final content with thinking embedded as <think> tags
-        let mut final_content = accumulated_text.clone();
-        // Close any unclosed thinking block
+        flush_agent_stream_filters(
+            &app,
+            &conv_id,
+            &run_id,
+            current_assistant_msg_id.as_deref(),
+            &mut text_ipc_filter,
+            &mut thinking_ipc_filter,
+        );
+
+        let mut final_media_error: Option<String> = None;
         if in_thinking_block {
-            final_content.push_str("\n</think>\n\n");
-        }
-        // Append result_text if it has content not yet in accumulated_text
-        if !result_text.is_empty() && !accumulated_text.contains(&result_text) {
-            if in_thinking_block {
-                // thinking was just closed above
+            if let Err(error) = append_captured_agent_text(
+                &mut inline_data_capture,
+                &mut accumulated_text,
+                "\n</think>\n\n",
+            ) {
+                final_media_error = Some(format!(
+                    "Failed to stage generated image for message {}: {error}",
+                    current_assistant_msg_id.as_deref().unwrap_or("unknown")
+                ));
             }
-            final_content.push_str(&result_text);
         }
+        let streamed_inline_images = if final_media_error.is_none() {
+            match inline_data_capture.finish() {
+                Ok(trailing) => {
+                    accumulated_text.push_str(&trailing.content);
+                    inline_data_capture.take_images()
+                }
+                Err(error) => {
+                    final_media_error = Some(format!(
+                        "Failed to finish generated image for message {}: {error}",
+                        current_assistant_msg_id.as_deref().unwrap_or("unknown")
+                    ));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if final_media_error.is_some() {
+            accumulated_text = aqbot_core::inline_media::replace_pending_inline_media_tokens(
+                &accumulated_text,
+                "[图片接收失败]",
+            );
+        }
+        let final_content = accumulated_text.clone();
+        let mut final_event_content = filter_complete_agent_event_text(&final_content);
 
         // Update assistant message with final content (including <think> blocks)
         if !final_content.is_empty() {
             if let Some(ref mid) = current_assistant_msg_id {
-                let _ = message::update_message_content(&db, mid, &final_content).await;
+                let file_store = aqbot_core::file_store::FileStore::new();
+                let media_result = if streamed_inline_images.is_empty() {
+                    aqbot_core::inline_media::materialize_message_inline_images(
+                        &db,
+                        &file_store,
+                        mid,
+                        &final_content,
+                    )
+                    .await
+                } else {
+                    aqbot_core::inline_media::materialize_streamed_inline_images(
+                        &db,
+                        &file_store,
+                        mid,
+                        &final_content,
+                        &streamed_inline_images,
+                    )
+                    .await
+                };
+                match media_result {
+                    Ok(message) => final_event_content = message.content,
+                    Err(error) => {
+                        final_media_error = Some(format!(
+                            "Failed to store generated image for message {mid}: {error}"
+                        ));
+                        tracing::error!(
+                            message_id = %mid,
+                            error = %error,
+                            "Failed to materialize final agent inline media"
+                        );
+                    }
+                }
             } else {
                 // No assistant message was created during streaming — create one now
-                if let Ok(assist_msg) = message::create_message(
+                match message::create_message(
                     &db,
                     &conv_id,
                     MessageRole::Assistant,
-                    &final_content,
+                    agent_persistable_snapshot(&final_content),
                     &[],
                     Some(&user_msg_id),
                     0,
                 )
                 .await
                 {
-                    current_assistant_msg_id = Some(assist_msg.id.clone());
-                    let _ = conversation::increment_message_count(&db, &conv_id).await;
+                    Ok(assist_msg) => {
+                        current_assistant_msg_id = Some(assist_msg.id.clone());
+                        let file_store = aqbot_core::file_store::FileStore::new();
+                        let media_result = if streamed_inline_images.is_empty() {
+                            aqbot_core::inline_media::materialize_message_inline_images(
+                                &db,
+                                &file_store,
+                                &assist_msg.id,
+                                &final_content,
+                            )
+                            .await
+                        } else {
+                            aqbot_core::inline_media::materialize_streamed_inline_images(
+                                &db,
+                                &file_store,
+                                &assist_msg.id,
+                                &final_content,
+                                &streamed_inline_images,
+                            )
+                            .await
+                        };
+                        match media_result {
+                            Ok(message) => final_event_content = message.content,
+                            Err(error) => {
+                                final_media_error = Some(format!(
+                                    "Failed to store generated image for message {}: {error}",
+                                    assist_msg.id
+                                ));
+                                tracing::error!(
+                                    message_id = %assist_msg.id,
+                                    error = %error,
+                                    "Failed to materialize final agent inline media"
+                                );
+                            }
+                        }
+                        let _ = conversation::increment_message_count(&db, &conv_id).await;
+                    }
+                    Err(error) => {
+                        final_media_error =
+                            Some(format!("Failed to create final agent message: {error}"));
+                        tracing::error!(
+                            error = %error,
+                            "Failed to create final agent message"
+                        );
+                    }
+                }
+            }
+        }
+
+        if final_media_error.is_some() {
+            if let Some(message_id) = current_assistant_msg_id.as_deref() {
+                if let Err(error) = message::update_message_status(&db, message_id, "error").await {
+                    tracing::error!(
+                        message_id,
+                        error = %error,
+                        "Failed to mark agent message after media persistence error"
+                    );
                 }
             }
         }
@@ -1475,17 +2326,30 @@ pub async fn agent_query(
             .await;
         }
 
-        let _ = app.emit(
-            "agent-done",
-            AgentDonePayload {
-                conversation_id: conv_id.clone(),
-                assistant_message_id: current_assistant_msg_id.clone().unwrap_or_default(),
-                text: final_content.clone(),
-                usage: usage_payload,
-                num_turns: Some(num_turns),
-                cost_usd: Some(cost_usd),
-            },
-        );
+        if let Some(error) = final_media_error {
+            let _ = app.emit(
+                "agent-error",
+                AgentErrorPayload {
+                    conversation_id: conv_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    assistant_message_id: current_assistant_msg_id.clone(),
+                    message: filter_complete_agent_event_text(&error),
+                },
+            );
+        } else {
+            let _ = app.emit(
+                "agent-done",
+                AgentDonePayload {
+                    conversation_id: conv_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    assistant_message_id: current_assistant_msg_id.clone().unwrap_or_default(),
+                    text: final_event_content,
+                    usage: usage_payload,
+                    num_turns: Some(num_turns),
+                    cost_usd: Some(cost_usd),
+                },
+            );
+        }
 
         // Auto-title: generate AI title after agent completes (first message only)
         if is_first_message {
@@ -1635,6 +2499,7 @@ pub async fn agent_respond_ask(
 pub async fn agent_cancel(
     state: State<'_, AppState>,
     conversation_id: String,
+    stream_id: Option<String>,
 ) -> Result<(), String> {
     let session =
         agent_session::get_agent_session_by_conversation_id(&state.sea_db, &conversation_id)
@@ -1647,18 +2512,19 @@ pub async fn agent_cancel(
         .await
         .map_err(|e| e.to_string())?;
 
-    if let Some(token) = state
-        .agent_cancel_tokens
-        .lock()
-        .await
-        .remove(&conversation_id)
-    {
-        token.cancel();
-    }
-
-    // Remove from in-memory running set
-    if let Ok(mut running) = RUNNING_AGENTS.lock() {
-        running.remove(&conversation_id);
+    let tokens = state.agent_cancel_tokens.lock().await;
+    if let Some(entry) = tokens.get(&conversation_id) {
+        let matches_run = match stream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            None => true,
+            Some(id) => id == entry.run_id,
+        };
+        if matches_run {
+            entry.token.cancel();
+        }
     }
 
     Ok(())
@@ -1671,14 +2537,15 @@ pub async fn agent_update_session(
     cwd: Option<String>,
     permission_mode: Option<String>,
 ) -> Result<AgentSession, String> {
-    agent_session::upsert_agent_session(
+    let session = agent_session::upsert_agent_session(
         &state.sea_db,
         &conversation_id,
         cwd.as_deref(),
         permission_mode.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    Ok(agent_session_for_ipc(session))
 }
 
 #[tauri::command]
@@ -1686,9 +2553,19 @@ pub async fn agent_get_session(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<AgentSession>, String> {
-    agent_session::get_agent_session_by_conversation_id(&state.sea_db, &conversation_id)
-        .await
-        .map_err(|e| e.to_string())
+    let session =
+        agent_session::get_agent_session_by_conversation_id(&state.sea_db, &conversation_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    Ok(session.map(agent_session_for_ipc))
+}
+
+fn agent_session_for_ipc(mut session: AgentSession) -> AgentSession {
+    // SDK context is backend resume state and may contain full tool/image
+    // payloads. It is never required by the renderer.
+    session.sdk_context_json = None;
+    session.sdk_context_backup_json = None;
+    session
 }
 
 /// Create default workspace directory under config home and return its path.
@@ -1747,6 +2624,97 @@ mod tests {
     use std::fs;
     use std::io::{Cursor, Write};
 
+    #[test]
+    fn complete_agent_events_never_include_inline_image_payloads() {
+        let filtered = filter_complete_agent_event_text(
+            "before <img src=\"data:image/png;base64,iVBORw0KGgo=\"> after",
+        );
+
+        assert_eq!(filtered, "before <img src=\"[图片接收中]\"> after");
+        assert!(!filtered.contains("data:image"));
+        assert!(!filtered.contains("iVBOR"));
+    }
+
+    #[test]
+    fn agent_prompt_rejects_inline_data_before_persistence_without_echoing_payload() {
+        let error = ensure_agent_prompt_safe_for_persistence(
+            "before data:image/png;base64,PROMPT_SECRET after",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("attach the image as a file"));
+        assert!(!error.contains("PROMPT_SECRET"));
+    }
+
+    #[test]
+    fn nested_agent_event_json_is_sanitized() {
+        let input = serde_json::json!({
+            "image": "data:image/png;base64,iVBORw0KGgo=",
+            "key-data:image/png;base64,KEY": "safe",
+            "nested": ["safe", "data:image/gif;base64,R0lGODlh"]
+        });
+
+        let filtered = filter_agent_event_json(&input).to_string();
+
+        assert!(!filtered.contains("data:image"));
+        assert!(!filtered.contains("iVBOR"));
+        assert!(!filtered.contains("R0lGODlh"));
+        assert!(!filtered.contains("KEY"));
+    }
+
+    #[test]
+    fn agent_tool_event_identity_fields_are_safe_when_serialized() {
+        let (tool_use_id, tool_name) = filter_agent_tool_identity(
+            "call-data:image/png;base64,ID",
+            "tool-data:image/png;base64,NAME",
+        );
+        let payloads = [
+            serde_json::to_string(&AgentToolStartPayload {
+                conversation_id: "conversation".to_string(),
+                assistant_message_id: "message".to_string(),
+                tool_use_id: tool_use_id.clone(),
+                tool_name: tool_name.clone(),
+                input: filter_agent_event_json(
+                    &serde_json::json!({"data:image/png;base64,KEY": "safe"}),
+                ),
+            })
+            .unwrap(),
+            serde_json::to_string(&AgentToolResultPayload {
+                conversation_id: "conversation".to_string(),
+                assistant_message_id: "message".to_string(),
+                tool_use_id,
+                tool_name,
+                content: filter_complete_agent_event_text("data:image/png;base64,CONTENT"),
+                is_error: false,
+            })
+            .unwrap(),
+        ];
+
+        for payload in payloads {
+            assert!(!payload.contains("data:image"));
+            assert!(!payload.contains("base64"));
+        }
+    }
+
+    #[test]
+    fn mcp_display_name_is_escaped_only_inside_tool_call_attribute() {
+        let display_name = "MCP · server \"<unsafe>&'\" · tool";
+
+        assert_eq!(
+            escape_tool_call_attribute(display_name),
+            "MCP · server &quot;&lt;unsafe&gt;&amp;&#39;&quot; · tool"
+        );
+        assert_eq!(filter_complete_agent_event_text(display_name), display_name);
+    }
+
+    #[test]
+    fn disconnected_sdk_mcp_resource_tools_are_hidden() {
+        assert_eq!(
+            AGENT_HIDDEN_SDK_TOOLS,
+            &["ListMcpResources", "ReadMcpResource"]
+        );
+    }
+
     fn test_conversation(id: &str, created_at: i64) -> aqbot_core::types::Conversation {
         aqbot_core::types::Conversation {
             id: id.to_string(),
@@ -1769,9 +2737,17 @@ mod tests {
             is_pinned: false,
             is_archived: false,
             context_compression: false,
+            context_strategy_override: None,
+            context_message_limit: None,
+            compression_keep_last_n: None,
+            multi_model_display_mode_override: None,
+            multi_model_targets: Vec::new(),
+            multi_model_continuation_mode: aqbot_core::types::MultiModelContinuationMode::Selected,
             category_id: None,
             parent_conversation_id: None,
+            sort_order: 0,
             mode: "agent".to_string(),
+            tab_pin_order: None,
             created_at,
             updated_at: created_at,
         }
@@ -1918,5 +2894,27 @@ mod tests {
             workspace.file_name().and_then(|name| name.to_str()),
             Some("1700000000-abcdef12-2")
         );
+    }
+
+    #[test]
+    fn agent_session_ipc_omits_backend_sdk_context() {
+        let session = agent_session_for_ipc(AgentSession {
+            id: "session-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            cwd: None,
+            permission_mode: "ask".to_string(),
+            runtime_status: "idle".to_string(),
+            sdk_context_json: Some("data:image/png;base64,SECRET".to_string()),
+            sdk_context_backup_json: Some("DATA:IMAGE/PNG;base64,BACKUP".to_string()),
+            total_tokens: 0,
+            total_cost_usd: 0.0,
+            created_at: "2026-07-15 00:00:00".to_string(),
+            updated_at: "2026-07-15 00:00:00".to_string(),
+        });
+        let ipc_json = serde_json::to_string(&session).unwrap();
+
+        assert!(!ipc_json.to_ascii_lowercase().contains("data:image/"));
+        assert!(session.sdk_context_json.is_none());
+        assert!(session.sdk_context_backup_json.is_none());
     }
 }

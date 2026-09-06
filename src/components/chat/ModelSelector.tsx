@@ -8,8 +8,10 @@ import { SmartProviderIcon } from '@/lib/providerIcons';
 import { getShortcutBinding, formatShortcutForDisplay } from '@/lib/shortcuts';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { getVisibleModelCapabilities } from '@/lib/modelCapabilities';
+import { sortModelsByVersionDesc } from '@/lib/modelVersionSort';
 import type { ModelCapability, Model } from '@/types';
 import { ConversationModelIcon } from './ConversationModelIcon';
+import { usePageSuspendCleanup } from '@/components/layout/PageLifecycle';
 
 const PINNED_MODELS_KEY = 'aqbot_pinned_models';
 
@@ -91,15 +93,20 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
   const setSettingsSection = useUIStore((s) => s.setSettingsSection);
   const setSelectedProviderId = useUIStore((s) => s.setSelectedProviderId);
 
-  // Multi-select state
-  const [multiSelectedKeys, setMultiSelectedKeys] = useState<Set<string>>(new Set());
+  // Multi-select state keeps insertion order so the array is the answer order.
+  const [multiSelectedKeys, setMultiSelectedKeys] = useState<string[]>([]);
+
+  usePageSuspendCleanup(() => {
+    setOpen(false);
+    setSearch('');
+    setHoveredKey(null);
+    setActiveIndex(-1);
+  });
 
   // Reset multi-select state when modal opens with default selections
   useEffect(() => {
     if (open && multiSelect) {
-      const initial = new Set(
-        (defaultSelectedModels ?? []).map((m) => `${m.providerId}::${m.modelId}`),
-      );
+      const initial = (defaultSelectedModels ?? []).map((m) => `${m.providerId}::${m.modelId}`);
       setMultiSelectedKeys(initial);
     }
   }, [open, multiSelect, defaultSelectedModels]);
@@ -164,21 +171,24 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
       );
   }, [pinnedModels, allEnabledModels, search]);
 
-  // Filtered providers and models (excluding search)
+  // Filtered providers and models (excluding search); newer model versions first
   const filteredProviders = useMemo(() => {
     const q = search.toLowerCase().trim();
     return providers
       .filter((p) => p.enabled)
       .map((p) => ({
         ...p,
-        models: p.models.filter(
-          (m) => {
-            if (!m.enabled) return false;
-            if (!isSelectableConversationModel(m, showImageModels)) return false;
-            if (excludeModelKeys?.includes(`${p.id}::${m.model_id}`)) return false;
-            if (!q) return true;
-            return m.name.toLowerCase().includes(q) || m.model_id.toLowerCase().includes(q) || p.name.toLowerCase().includes(q);
-          },
+        models: sortModelsByVersionDesc(
+          p.models.filter(
+            (m) => {
+              if (!m.enabled) return false;
+              if (!isSelectableConversationModel(m, showImageModels)) return false;
+              if (excludeModelKeys?.includes(`${p.id}::${m.model_id}`)) return false;
+              if (!q) return true;
+              return m.name.toLowerCase().includes(q) || m.model_id.toLowerCase().includes(q) || p.name.toLowerCase().includes(q);
+            },
+          ),
+          (m) => m.model_id,
         ),
       }))
       .filter((p) => p.models.length > 0);
@@ -190,10 +200,8 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
         // In multi-select mode, toggle the selection
         const key = `${providerId}::${modelId}`;
         setMultiSelectedKeys((prev) => {
-          const next = new Set(prev);
-          if (next.has(key)) next.delete(key);
-          else next.add(key);
-          return next;
+          if (prev.includes(key)) return prev.filter((item) => item !== key);
+          return [...prev, key];
         });
         return;
       }
@@ -215,7 +223,7 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
 
   const handleMultiConfirm = useCallback(() => {
     if (!onMultiSelect) return;
-    const models = Array.from(multiSelectedKeys).map((key) => {
+    const models = multiSelectedKeys.map((key) => {
       const [providerId, modelId] = key.split('::');
       return { providerId, modelId };
     });
@@ -374,7 +382,8 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
     isKeyboardActive?: boolean,
   ) => {
     const key = `${providerId}::${modelId}`;
-    const isActive = multiSelect ? multiSelectedKeys.has(key) : currentValue === key;
+    const isActive = multiSelect ? multiSelectedKeys.includes(key) : currentValue === key;
+    const selectedOrder = multiSelect ? multiSelectedKeys.indexOf(key) + 1 : 0;
     const isHovered = hoveredKey === key || isKeyboardActive;
     const visibleCaps = model ? getVisibleModelCapabilities(model) : [];
     return (
@@ -392,10 +401,28 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
         onMouseLeave={() => setHoveredKey(null)}
       >
         {multiSelect && (
-          <Checkbox
-            checked={isActive}
-            style={{ pointerEvents: 'none' }}
-          />
+          <span className="inline-flex items-center gap-1" style={{ flexShrink: 0 }}>
+            <Checkbox
+              checked={isActive}
+              style={{ pointerEvents: 'none' }}
+            />
+            {selectedOrder > 0 && (
+              <span
+                style={{
+                  minWidth: 16,
+                  height: 16,
+                  borderRadius: 8,
+                  fontSize: 10,
+                  lineHeight: '16px',
+                  textAlign: 'center',
+                  color: token.colorPrimary,
+                  backgroundColor: token.colorPrimaryBg,
+                }}
+              >
+                {selectedOrder}
+              </span>
+            )}
+          </span>
         )}
         <ModelIcon model={modelId} size={20} type="avatar" />
         <div className="flex-1 min-w-0">
@@ -411,9 +438,9 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
                 </Tag>
               </Tooltip>
             ))}
-            {model?.max_tokens != null && model.max_tokens > 0 && (
+            {model?.context_window != null && model.context_window > 0 && (
               <Tag bordered={false} color="default" style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', margin: 0 }}>
-                {formatTokenCount(model.max_tokens)}
+                {formatTokenCount(model.context_window)}
               </Tag>
             )}
           </div>
@@ -474,7 +501,7 @@ export function ModelSelector({ style, onSelect, overrideCurrentModel, children,
         footer={multiSelect ? (
           <div className="flex items-center justify-between" style={{ padding: '8px 12px' }}>
             <span style={{ fontSize: 12, color: token.colorTextSecondary }}>
-              {t('chat.multiModel.selectedCount').replace('{{count}}', String(multiSelectedKeys.size))}
+              {t('chat.multiModel.selectedCount').replace('{{count}}', String(multiSelectedKeys.length))}
             </span>
             <Button type="primary" size="small" onClick={handleMultiConfirm}>
               {t('common.confirm')}

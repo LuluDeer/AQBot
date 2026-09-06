@@ -30,9 +30,14 @@ dist-ssr
 # Build outputs
 dist/
 target/
+test-results/
+playwright-report/
+.playwright-cli/
 
 # Secrets
 *.key
+*.p8
+*.p12
 
 # Planning files
 task_plan.md

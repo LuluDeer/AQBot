@@ -2,6 +2,7 @@ import { Dropdown, Input, theme } from 'antd';
 import { Check, ChevronsUpDown, Search } from 'lucide-react';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface SettingsSelectOption {
   label: ReactNode;
@@ -15,9 +16,21 @@ interface SettingsSelectProps {
   style?: CSSProperties;
   disabled?: boolean;
   searchable?: boolean;
+  ariaLabel?: string;
+  labelMaxWidth?: number;
 }
 
-export function SettingsSelect({ value, onChange, options, style, disabled, searchable }: SettingsSelectProps) {
+export function SettingsSelect({
+  value,
+  onChange,
+  options,
+  style,
+  disabled,
+  searchable,
+  ariaLabel,
+  labelMaxWidth = 180,
+}: SettingsSelectProps) {
+  const { t } = useTranslation();
   const { token } = theme.useToken();
   const [hovered, setHovered] = useState(false);
   const [open, setOpen] = useState(false);
@@ -44,6 +57,7 @@ export function SettingsSelect({ value, onChange, options, style, disabled, sear
     <div
       role="button"
       tabIndex={0}
+      aria-label={ariaLabel}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       style={{
@@ -62,7 +76,7 @@ export function SettingsSelect({ value, onChange, options, style, disabled, sear
         ...style,
       }}
     >
-      <span style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentLabel}</span>
+      <span style={{ maxWidth: labelMaxWidth, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{currentLabel}</span>
       <ChevronsUpDown size={12} style={{ opacity: 0.4 }} />
     </div>
   );
@@ -90,7 +104,7 @@ export function SettingsSelect({ value, onChange, options, style, disabled, sear
                 ref={searchRef}
                 size="small"
                 prefix={<Search size={12} style={{ opacity: 0.4 }} />}
-                placeholder="Search..."
+                placeholder={t('common.searchPlaceholder')}
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 allowClear
@@ -125,7 +139,7 @@ export function SettingsSelect({ value, onChange, options, style, disabled, sear
               ))}
               {filteredOptions.length === 0 && (
                 <div style={{ padding: '8px 12px', color: token.colorTextDescription, fontSize: 12, textAlign: 'center' }}>
-                  No results
+                  {t('common.noResults')}
                 </div>
               )}
             </div>

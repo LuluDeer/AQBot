@@ -31,9 +31,26 @@ pub struct Model {
     pub active_artifact_id: Option<String>,
     pub research_mode: i32,
     pub context_compression: i32,
+    /// Nullable snake_case `ContextStrategy`; `None` follows the global default.
+    pub context_strategy_override: Option<String>,
+    /// Max provider history messages for this conversation. `None` falls back
+    /// to the global `default_context_count` setting. Values ≥ 50 mean unlimited.
+    pub context_message_limit: Option<i32>,
+    /// When compressing context, keep the last N compressible messages in clear
+    /// text (not included in the summary). `None` means default (3). `0` keeps none.
+    pub compression_keep_last_n: Option<i32>,
+    /// Nullable kebab-case multi-model display mode; `None` follows the global setting.
+    pub multi_model_display_mode_override: Option<String>,
+    /// JSON array of `{ providerId, modelId }` companion targets, preserving user order.
+    pub multi_model_targets_json: String,
+    /// `selected` or `per_model`.
+    pub multi_model_continuation_mode: String,
     pub category_id: Option<String>,
     pub parent_conversation_id: Option<String>,
+    pub sort_order: i32,
     pub mode: String,
+    /// Null means the conversation is not pinned to the top tab bar.
+    pub tab_pin_order: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

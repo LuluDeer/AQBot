@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Message, MessagePage, MessageWindow } from '@/types';
+import type { Message, MessagePage } from '@/types';
 import { parseSearchContent } from '@/lib/searchUtils';
+import {
+  deferred,
+  flushPromises,
+  makeConversation,
+  makeMessage,
+  makePage,
+  makeWindow,
+} from './conversationStore.testUtils';
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
@@ -12,94 +20,11 @@ vi.mock('@/lib/invoke', () => ({
   isTauri: () => tauriAvailable,
 }));
 
-function makeMessage(index: number, conversationId = 'conv-1'): Message {
-  return {
-    id: `msg-${index}`,
-    conversation_id: conversationId,
-    role: index % 2 === 0 ? 'assistant' : 'user',
-    content: `message-${index}`,
-    provider_id: null,
-    model_id: null,
-    token_count: null,
-    attachments: [],
-    thinking: null,
-    tool_calls_json: null,
-    tool_call_id: null,
-    created_at: index,
-    parent_message_id: null,
-    version_index: 0,
-    is_active: true,
-    status: 'complete',
-  };
-}
-
-function makePage(messages: Message[], hasOlder: boolean): MessagePage {
-  return {
-    messages,
-    has_older: hasOlder,
-    oldest_message_id: messages[0]?.id ?? null,
-    total_active_count: messages.length,
-  };
-}
-
-function makeWindow(messages: Message[], hasOlder: boolean, hasNewer: boolean): MessageWindow {
-  return {
-    messages,
-    has_older: hasOlder,
-    has_newer: hasNewer,
-    oldest_message_id: messages[0]?.id ?? null,
-    newest_message_id: messages[messages.length - 1]?.id ?? null,
-    total_active_count: messages.length,
-  };
-}
-
-function makeConversation(id: string, overrides: Record<string, unknown> = {}) {
-  return {
-    id,
-    title: `conversation-${id}`,
-    model_id: 'model-1',
-    provider_id: 'provider-1',
-    system_prompt: null,
-    temperature: null,
-    max_tokens: null,
-    top_p: null,
-    frequency_penalty: null,
-    search_enabled: false,
-    search_provider_id: null,
-    thinking_budget: null,
-    thinking_level: null,
-    enabled_mcp_server_ids: [],
-    enabled_knowledge_base_ids: [],
-    enabled_memory_namespace_ids: [],
-    is_pinned: false,
-    is_archived: false,
-    message_count: 0,
-    created_at: 1,
-    updated_at: 1,
-    ...overrides,
-  };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-async function flushPromises() {
-  for (let index = 0; index < 16; index += 1) {
-    await Promise.resolve();
-  }
-}
-
 describe('conversationStore pagination', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     vi.resetModules();
+    localStorage.clear();
     tauriAvailable = false;
     listenMock.mockResolvedValue(() => {});
     const { useConversationStore } = await import('../conversationStore');
@@ -169,6 +94,112 @@ describe('conversationStore pagination', () => {
     expect(invokeMock.mock.calls.filter(([command]) => command === 'list_messages_page')).toHaveLength(0);
     expect(useConversationStore.getState().messages).toEqual(messages);
     expect(useConversationStore.getState().loading).toBe(false);
+  });
+
+  it('restores an unchanged conversation from the bounded message cache without another IPC load', async () => {
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_conversation_snapshot') {
+        const id = String(args?.id);
+        return Promise.resolve(makeConversation(id, {
+          message_count: 1,
+          updated_at: id === 'conv-a' ? 10 : 20,
+        }));
+      }
+      if (cmd !== 'list_messages_page') throw new Error(`unexpected command: ${cmd}`);
+      const conversationId = String(args?.conversationId);
+      return Promise.resolve(makePage([
+        makeMessage(conversationId === 'conv-a' ? 1 : 2, conversationId),
+      ], false));
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1, updated_at: 10 }),
+        makeConversation('conv-b', { message_count: 1, updated_at: 20 }),
+      ] as never[],
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-a');
+    await flushPromises();
+    useConversationStore.getState().setActiveConversation('conv-b');
+    await flushPromises();
+    useConversationStore.getState().setActiveConversation('conv-a');
+
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-1']);
+    expect(useConversationStore.getState().loading).toBe(false);
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'list_messages_page')).toHaveLength(2);
+    await flushPromises();
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'get_conversation_snapshot')).toHaveLength(1);
+  });
+
+  it('shows cached messages immediately and refreshes them when the backend revision changed', async () => {
+    let conversationAPage = 0;
+    invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_conversation_snapshot') {
+        return Promise.resolve(makeConversation('conv-a', { message_count: 2, updated_at: 11 }));
+      }
+      if (command !== 'list_messages_page') throw new Error(`unexpected command: ${command}`);
+      const conversationId = String(args?.conversationId);
+      if (conversationId === 'conv-a') {
+        conversationAPage += 1;
+        return Promise.resolve(makePage([
+          makeMessage(conversationAPage === 1 ? 1 : 3, conversationId),
+        ], false));
+      }
+      return Promise.resolve(makePage([makeMessage(2, conversationId)], false));
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1, updated_at: 10 }),
+        makeConversation('conv-b', { message_count: 1, updated_at: 20 }),
+      ] as never[],
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-a');
+    await flushPromises();
+    useConversationStore.getState().setActiveConversation('conv-b');
+    await flushPromises();
+    useConversationStore.getState().setActiveConversation('conv-a');
+
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-1']);
+    expect(useConversationStore.getState().loading).toBe(false);
+
+    await flushPromises();
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-3']);
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'list_messages_page')).toHaveLength(3);
+  });
+
+  it('does not cache an in-flight empty page as a fresh conversation result', async () => {
+    const firstA = deferred<MessagePage>();
+    const pageB = deferred<MessagePage>();
+    const secondA = deferred<MessagePage>();
+    invokeMock
+      .mockReturnValueOnce(firstA.promise)
+      .mockReturnValueOnce(pageB.promise)
+      .mockReturnValueOnce(secondA.promise);
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1, updated_at: 10 }),
+        makeConversation('conv-b', { message_count: 1, updated_at: 20 }),
+      ] as never[],
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-a');
+    useConversationStore.getState().setActiveConversation('conv-b');
+    useConversationStore.getState().setActiveConversation('conv-a');
+    await flushPromises();
+
+    const messagePageCallCount = invokeMock.mock.calls
+      .filter(([command]) => command === 'list_messages_page').length;
+    secondA.resolve(makePage([makeMessage(1, 'conv-a')], false));
+    firstA.resolve(makePage([], false));
+    pageB.resolve(makePage([], false));
+    await flushPromises();
+
+    expect(messagePageCallCount).toBe(3);
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-1']);
   });
 
   it('does not request a message page when selecting an empty conversation', async () => {
@@ -898,6 +929,57 @@ describe('conversationStore pagination', () => {
     vi.useRealTimers();
   });
 
+  it('restores the complete stream buffer after switching away and back on a fresh cache hit', async () => {
+    vi.useFakeTimers();
+    const listeners = new Map<string, (event: any) => void>();
+    listenMock.mockImplementation(async (eventName: string, handler: (event: any) => void) => {
+      listeners.set(eventName, handler);
+      return () => {};
+    });
+    const { getLiveStreamContent, useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1, updated_at: 10 }),
+        makeConversation('conv-b', { message_count: 0, updated_at: 20 }),
+      ] as never[],
+      activeConversationId: 'conv-a',
+      streaming: true,
+      streamingMessageId: 'assistant-a',
+      streamingConversationId: 'conv-a',
+      messages: [{
+        ...makeMessage(2, 'conv-a'),
+        id: 'assistant-a',
+        role: 'assistant',
+        content: '',
+        status: 'partial',
+      }],
+    });
+    await useConversationStore.getState().startStreamListening();
+    const onChunk = listeners.get('chat-stream-chunk');
+    onChunk?.({
+      payload: {
+        conversation_id: 'conv-a',
+        message_id: 'assistant-a',
+        chunk: { content: 'Hello', done: false },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(35);
+
+    useConversationStore.getState().setActiveConversation('conv-b');
+    onChunk?.({
+      payload: {
+        conversation_id: 'conv-a',
+        message_id: 'assistant-a',
+        chunk: { content: ' away', done: false },
+      },
+    });
+    useConversationStore.getState().setActiveConversation('conv-a');
+
+    expect(getLiveStreamContent('assistant-a')).toBe('Hello away');
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toContain('assistant-a');
+    vi.useRealTimers();
+  });
+
   it('migrates live stream content when a temporary assistant id resolves', async () => {
     vi.useFakeTimers();
     const listeners = new Map<string, (event: unknown) => void>();
@@ -1195,6 +1277,40 @@ describe('conversationStore pagination', () => {
     expect(state.messages.map((message) => message.id)).toEqual(['user-active', 'assistant-active']);
     expect(state.messages[1]?.content).toBe('still streaming');
     vi.useRealTimers();
+  });
+
+  it('keeps a first-turn single-model stream live when the idle multi-model snapshot arrives', async () => {
+    tauriAvailable = true;
+    listenMock.mockResolvedValue(() => {});
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === 'get_multi_model_run_snapshot') {
+        return Promise.resolve({ conversationId: 'conv-1', revision: 0, activeRun: null });
+      }
+      if (cmd === 'send_message') {
+        return new Promise(() => {});
+      }
+      throw new Error(`unexpected command: ${cmd}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      conversations: [makeConversation('conv-1')] as never[],
+      messages: [],
+      streaming: false,
+      streamingMessageId: null,
+      multiModelRun: null,
+      multiModelRunRevision: 0,
+    });
+
+    void useConversationStore.getState().sendMessage('请翻译\n这段话');
+    await flushPromises();
+
+    const state = useConversationStore.getState();
+    expect(state.streaming).toBe(true);
+    expect(state.streamingMessageId).toMatch(/^temp-assistant-/);
+    expect(state.messages.some((message) => (
+      message.role === 'assistant' && message.status === 'partial'
+    ))).toBe(true);
   });
 
   it('cancels stale backend stream state when an overlapping stream rejection happens while locally idle', async () => {
@@ -1842,6 +1958,165 @@ describe('conversationStore pagination', () => {
     expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-2']);
   });
 
+  it('retains the previous message window behind loading UI until a cache miss resolves', async () => {
+    const pageB = deferred<MessagePage>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'list_messages_page') return pageB.promise;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    const previousMessages = [makeMessage(1, 'conv-a')];
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1 }),
+        makeConversation('conv-b', { message_count: 1 }),
+      ] as never[],
+      activeConversationId: 'conv-a',
+      messages: previousMessages,
+      loading: false,
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-b');
+
+    expect(useConversationStore.getState().loading).toBe(true);
+    expect(useConversationStore.getState().messages).toEqual(previousMessages);
+    await expect(useConversationStore.getState().sendMessage('must wait')).rejects.toThrow(
+      'Conversation messages are still loading',
+    );
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    pageB.resolve(makePage([makeMessage(2, 'conv-b')], false));
+    await flushPromises();
+
+    expect(useConversationStore.getState().loading).toBe(false);
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-2']);
+  });
+
+  it('does not expose retained messages if a cache-miss load fails', async () => {
+    invokeMock.mockRejectedValue(new Error('load failed'));
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [
+        makeConversation('conv-a', { message_count: 1 }),
+        makeConversation('conv-b', { message_count: 1 }),
+      ] as never[],
+      activeConversationId: 'conv-a',
+      messages: [makeMessage(1, 'conv-a')],
+      loading: false,
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-b');
+    await flushPromises();
+
+    expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+    expect(useConversationStore.getState().loading).toBe(false);
+    expect(useConversationStore.getState().messages).toEqual([]);
+    expect(useConversationStore.getState().error).toContain('load failed');
+  });
+
+  it('does not clear a newly selected conversation when an older clear request resolves', async () => {
+    const clearRequest = deferred<void>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'clear_conversation_messages') return clearRequest.promise;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [makeConversation('conv-a'), makeConversation('conv-b')] as never[],
+      activeConversationId: 'conv-a',
+      messages: [makeMessage(1, 'conv-a')],
+    });
+
+    const pending = useConversationStore.getState().clearAllMessages();
+    useConversationStore.getState().setActiveConversation('conv-b');
+    useConversationStore.setState({ messages: [makeMessage(2, 'conv-b')] });
+    clearRequest.resolve();
+    await pending;
+
+    expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-2']);
+  });
+
+  it('broadcasts a message sync after clearing the active conversation', async () => {
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'clear_conversation_messages') return Promise.resolve();
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const [{ useConversationStore }, { listenConversationSync }] = await Promise.all([
+      import('../conversationStore'),
+      import('@/lib/conversationSync'),
+    ]);
+    const events: Array<{ conversationId: string; kind: string }> = [];
+    const unlisten = await listenConversationSync((payload) => {
+      events.push(payload);
+    });
+    useConversationStore.setState({
+      conversations: [makeConversation('conv-a')] as never[],
+      activeConversationId: 'conv-a',
+      messages: [makeMessage(1, 'conv-a')],
+    });
+
+    await useConversationStore.getState().clearAllMessages();
+    await flushPromises();
+    unlisten();
+
+    expect(events).toEqual([
+      expect.objectContaining({ conversationId: 'conv-a', kind: 'messages-changed' }),
+    ]);
+  });
+
+  it('does not append a context marker into a conversation selected during the request', async () => {
+    const markerRequest = deferred<Message>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'send_system_message') return markerRequest.promise;
+      if (command === 'agent_backup_and_clear_sdk_context') return Promise.resolve();
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [makeConversation('conv-a'), makeConversation('conv-b')] as never[],
+      activeConversationId: 'conv-a',
+      messages: [makeMessage(1, 'conv-a')],
+    });
+
+    const pending = useConversationStore.getState().insertContextClear();
+    useConversationStore.getState().setActiveConversation('conv-b');
+    useConversationStore.setState({ messages: [makeMessage(2, 'conv-b')] });
+    markerRequest.resolve({
+      ...makeMessage(3, 'conv-a'),
+      role: 'system',
+      content: '<!-- context-clear -->',
+    });
+    await pending;
+
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-2']);
+  });
+
+  it('adds a completed branch without overriding a conversation selected in the meantime', async () => {
+    const branchRequest = deferred<ReturnType<typeof makeConversation>>();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'branch_conversation') return branchRequest.promise;
+      throw new Error(`unexpected command: ${command}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [makeConversation('conv-a'), makeConversation('conv-b')] as never[],
+      activeConversationId: 'conv-a',
+      messages: [makeMessage(1, 'conv-a')],
+    });
+
+    const pending = useConversationStore.getState().branchConversation('conv-a', 'msg-1', false);
+    useConversationStore.getState().setActiveConversation('conv-b');
+    useConversationStore.setState({ messages: [makeMessage(2, 'conv-b')] });
+    branchRequest.resolve(makeConversation('conv-branch', { message_count: 1 }));
+    await pending;
+
+    expect(useConversationStore.getState().activeConversationId).toBe('conv-b');
+    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual(['msg-2']);
+    expect(useConversationStore.getState().conversations[0]?.id).toBe('conv-branch');
+    expect(invokeMock).not.toHaveBeenCalledWith('list_messages', expect.anything());
+  });
+
   it('prepends older pages without replacing already loaded messages', async () => {
     invokeMock
       .mockResolvedValueOnce(makePage([makeMessage(11), makeMessage(12)], true))
@@ -1865,6 +2140,33 @@ describe('conversationStore pagination', () => {
     ]);
     expect(useConversationStore.getState().hasOlderMessages).toBe(false);
     expect(useConversationStore.getState().loadingOlder).toBe(false);
+  });
+
+  it('keeps a 40-message window when loading older history and exposes the trimmed newer side', async () => {
+    invokeMock.mockResolvedValue(makePage(
+      Array.from({ length: 10 }, (_, index) => makeMessage(index + 1)),
+      false,
+    ));
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: Array.from({ length: 40 }, (_, index) => makeMessage(index + 11)),
+      hasOlderMessages: true,
+      hasNewerMessages: false,
+      oldestLoadedMessageId: 'msg-11',
+      newestLoadedMessageId: 'msg-50',
+    });
+
+    await useConversationStore.getState().loadOlderMessages();
+
+    const state = useConversationStore.getState();
+    expect(state.messages).toHaveLength(40);
+    expect(state.messages[0]?.id).toBe('msg-1');
+    expect(state.messages[39]?.id).toBe('msg-40');
+    expect(state.hasOlderMessages).toBe(false);
+    expect(state.hasNewerMessages).toBe(true);
+    expect(state.oldestLoadedMessageId).toBe('msg-1');
+    expect(state.newestLoadedMessageId).toBe('msg-40');
   });
 
   it('loads a bounded window around a minimap target', async () => {
@@ -1928,6 +2230,95 @@ describe('conversationStore pagination', () => {
     ]);
     expect(useConversationStore.getState().hasNewerMessages).toBe(false);
     expect(useConversationStore.getState().newestLoadedMessageId).toBe('msg-44');
+  });
+
+  it('keeps a 40-message window when loading newer history and exposes the trimmed older side', async () => {
+    invokeMock.mockResolvedValue(makeWindow(
+      Array.from({ length: 10 }, (_, index) => makeMessage(index + 41)),
+      true,
+      false,
+    ));
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: Array.from({ length: 40 }, (_, index) => makeMessage(index + 1)),
+      hasOlderMessages: false,
+      hasNewerMessages: true,
+      oldestLoadedMessageId: 'msg-1',
+      newestLoadedMessageId: 'msg-40',
+    });
+
+    await useConversationStore.getState().loadNewerMessages();
+
+    const state = useConversationStore.getState();
+    expect(state.messages).toHaveLength(40);
+    expect(state.messages[0]?.id).toBe('msg-11');
+    expect(state.messages[39]?.id).toBe('msg-50');
+    expect(state.hasOlderMessages).toBe(true);
+    expect(state.hasNewerMessages).toBe(false);
+    expect(state.oldestLoadedMessageId).toBe('msg-11');
+    expect(state.newestLoadedMessageId).toBe('msg-50');
+  });
+
+  it('bounds active messages without letting inactive versions replace pagination cursors', async () => {
+    invokeMock.mockResolvedValue(makeWindow(
+      Array.from({ length: 10 }, (_, index) => makeMessage(index + 41)),
+      true,
+      false,
+    ));
+    const { useConversationStore } = await import('../conversationStore');
+    const inactiveVersion = {
+      ...makeMessage(100),
+      id: 'inactive-version',
+      role: 'assistant' as const,
+      parent_message_id: 'msg-39',
+      is_active: false,
+      created_at: 1_000,
+    };
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: [
+        ...Array.from({ length: 40 }, (_, index) => makeMessage(index + 1)),
+        inactiveVersion,
+      ],
+      hasOlderMessages: false,
+      hasNewerMessages: true,
+      oldestLoadedMessageId: 'msg-1',
+      newestLoadedMessageId: 'msg-40',
+    });
+
+    await useConversationStore.getState().loadNewerMessages();
+
+    const state = useConversationStore.getState();
+    expect(state.messages.filter((message) => message.is_active !== false)).toHaveLength(40);
+    expect(state.messages.some((message) => message.id === 'inactive-version')).toBe(true);
+    expect(state.oldestLoadedMessageId).toBe('msg-11');
+    expect(state.newestLoadedMessageId).toBe('msg-50');
+  });
+
+  it('trims a whole ten-message page when a preserved message pushes the window over 40', async () => {
+    invokeMock.mockResolvedValue(makePage(
+      Array.from({ length: 10 }, (_, index) => makeMessage(index + 1)),
+      false,
+    ));
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      messages: Array.from({ length: 32 }, (_, index) => makeMessage(index + 11)),
+      hasOlderMessages: true,
+      hasNewerMessages: false,
+      oldestLoadedMessageId: 'msg-11',
+      newestLoadedMessageId: 'msg-42',
+    });
+
+    await useConversationStore.getState().loadOlderMessages();
+
+    const activeMessages = useConversationStore.getState().messages
+      .filter((message) => message.is_active !== false);
+    expect(activeMessages).toHaveLength(32);
+    expect(activeMessages[0]?.id).toBe('msg-1');
+    expect(activeMessages[31]?.id).toBe('msg-32');
+    expect(useConversationStore.getState().hasNewerMessages).toBe(true);
   });
 
   it('hydrates persisted conversation preferences when switching active conversations', async () => {
@@ -2001,6 +2392,38 @@ describe('conversationStore pagination', () => {
     });
   });
 
+  it('broadcasts the selected multi-model order to other windows', async () => {
+    const selectedModels = [
+      { providerId: 'provider-b', modelId: 'model-b' },
+      { providerId: 'provider-a', modelId: 'model-a' },
+    ];
+    invokeMock.mockResolvedValue(makeConversation('conv-1', {
+      multi_model_targets: selectedModels,
+    }));
+    const [{ useConversationStore }, { listenConversationSync }] = await Promise.all([
+      import('../conversationStore'),
+      import('@/lib/conversationSync'),
+    ]);
+    const received: unknown[] = [];
+    const unlisten = await listenConversationSync((payload) => {
+      received.push(payload);
+    });
+    useConversationStore.setState({
+      activeConversationId: 'conv-1',
+      conversations: [makeConversation('conv-1')] as never[],
+    });
+
+    useConversationStore.getState().setMultiModelTargets(selectedModels);
+    await flushPromises();
+
+    expect(received).toContainEqual(expect.objectContaining({
+      conversationId: 'conv-1',
+      kind: 'conversation-meta',
+      multiModelTargets: selectedModels,
+    }));
+    unlisten();
+  });
+
   it('inherits current capability preferences for newly created conversations by default', async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === 'create_conversation') {
@@ -2016,6 +2439,8 @@ describe('conversationStore pagination', () => {
           enabled_mcp_server_ids: ['mcp-old'],
           enabled_knowledge_base_ids: ['kb-old'],
           enabled_memory_namespace_ids: ['mem-old'],
+          multi_model_targets: [{ providerId: 'provider-a', modelId: 'model-a' }],
+          multi_model_continuation_mode: 'per_model',
         }));
       }
 
@@ -2037,6 +2462,8 @@ describe('conversationStore pagination', () => {
       enabledMcpServerIds: ['mcp-old'],
       enabledKnowledgeBaseIds: ['kb-old'],
       enabledMemoryNamespaceIds: ['mem-old'],
+      multiModelTargets: [{ providerId: 'provider-a', modelId: 'model-a' }],
+      multiModelContinuationMode: 'per_model',
     });
 
     await useConversationStore.getState().createConversation(
@@ -2055,6 +2482,8 @@ describe('conversationStore pagination', () => {
         enabled_mcp_server_ids: ['mcp-old'],
         enabled_knowledge_base_ids: ['kb-old'],
         enabled_memory_namespace_ids: ['mem-old'],
+        multi_model_targets: [{ providerId: 'provider-a', modelId: 'model-a' }],
+        multi_model_continuation_mode: 'per_model',
       },
     });
     expect(useConversationStore.getState().searchEnabled).toBe(true);
@@ -2064,6 +2493,10 @@ describe('conversationStore pagination', () => {
     expect(useConversationStore.getState().enabledMcpServerIds).toEqual(['mcp-old']);
     expect(useConversationStore.getState().enabledKnowledgeBaseIds).toEqual(['kb-old']);
     expect(useConversationStore.getState().enabledMemoryNamespaceIds).toEqual(['mem-old']);
+    expect(useConversationStore.getState().multiModelTargets).toEqual([
+      { providerId: 'provider-a', modelId: 'model-a' },
+    ]);
+    expect(useConversationStore.getState().multiModelContinuationMode).toBe('per_model');
   });
 
   it('starts newly created conversations with empty capability preferences when inheritance is disabled', async () => {
@@ -2101,6 +2534,8 @@ describe('conversationStore pagination', () => {
       enabledMcpServerIds: ['mcp-old'],
       enabledKnowledgeBaseIds: ['kb-old'],
       enabledMemoryNamespaceIds: ['mem-old'],
+      multiModelTargets: [{ providerId: 'provider-a', modelId: 'model-a' }],
+      multiModelContinuationMode: 'per_model',
     });
 
     await useConversationStore.getState().createConversation(
@@ -2119,6 +2554,8 @@ describe('conversationStore pagination', () => {
         enabled_mcp_server_ids: [],
         enabled_knowledge_base_ids: [],
         enabled_memory_namespace_ids: [],
+        multi_model_targets: [],
+        multi_model_continuation_mode: 'selected',
       },
     });
     expect(useConversationStore.getState().searchEnabled).toBe(false);
@@ -2128,6 +2565,51 @@ describe('conversationStore pagination', () => {
     expect(useConversationStore.getState().enabledMcpServerIds).toEqual([]);
     expect(useConversationStore.getState().enabledKnowledgeBaseIds).toEqual([]);
     expect(useConversationStore.getState().enabledMemoryNamespaceIds).toEqual([]);
+    expect(useConversationStore.getState().multiModelTargets).toEqual([]);
+    expect(useConversationStore.getState().multiModelContinuationMode).toBe('selected');
+  });
+
+  it('migrates legacy multi-model localStorage preferences into the conversation database', async () => {
+    localStorage.setItem('aqbot:companion-models:conv-1', JSON.stringify([
+      { providerId: 'provider-a', modelId: 'model-a' },
+      { providerId: 'provider-b', modelId: 'model-b' },
+    ]));
+    localStorage.setItem('aqbot:multi-model-continuation-mode:conv-1', 'per_model');
+    invokeMock.mockImplementation((cmd: string, args: Record<string, unknown>) => {
+      if (cmd === 'update_conversation') {
+        return Promise.resolve(makeConversation('conv-1', args.input as Record<string, unknown>));
+      }
+      throw new Error(`unexpected command: ${cmd}`);
+    });
+    const { useConversationStore } = await import('../conversationStore');
+    useConversationStore.setState({
+      conversations: [makeConversation('conv-1')] as never[],
+      archivedConversations: [],
+      activeConversationId: null,
+      multiModelTargets: [],
+      multiModelContinuationMode: 'selected',
+    });
+
+    useConversationStore.getState().setActiveConversation('conv-1');
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith('update_conversation', {
+      id: 'conv-1',
+      input: {
+        multi_model_targets: [
+          { providerId: 'provider-a', modelId: 'model-a' },
+          { providerId: 'provider-b', modelId: 'model-b' },
+        ],
+        multi_model_continuation_mode: 'per_model',
+      },
+    });
+    expect(useConversationStore.getState().multiModelTargets).toEqual([
+      { providerId: 'provider-a', modelId: 'model-a' },
+      { providerId: 'provider-b', modelId: 'model-b' },
+    ]);
+    expect(useConversationStore.getState().multiModelContinuationMode).toBe('per_model');
+    expect(localStorage.getItem('aqbot:companion-models:conv-1')).toBeNull();
+    expect(localStorage.getItem('aqbot:multi-model-continuation-mode:conv-1')).toBeNull();
   });
 
   it('tracks context compression loading by conversation id', async () => {
@@ -2369,952 +2851,4 @@ describe('conversationStore pagination', () => {
     vi.useRealTimers();
   });
 
-  it('hydrates inactive assistant versions into the store for multi-model rendering', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      content: 'question',
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const activeError = {
-      ...makeMessage(2),
-      id: 'active-error',
-      content: 'boom',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'error' as const,
-      version_index: 0,
-    };
-    const inactiveSuccess = {
-      ...makeMessage(4),
-      id: 'inactive-success',
-      content: 'ok',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-      version_index: 1,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, activeError],
-    });
-
-    useConversationStore.getState().hydrateMessageVersions(
-      user.id,
-      [activeError, inactiveSuccess],
-      activeError.id,
-    );
-
-    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual([
-      'user-1',
-      'active-error',
-      'inactive-success',
-    ]);
-    expect(useConversationStore.getState().messages.find((message) => message.id === 'active-error')?.is_active).toBe(true);
-    expect(useConversationStore.getState().messages.find((message) => message.id === 'inactive-success')?.is_active).toBe(false);
-  });
-
-  it('resolves a temp streaming id when hydrating the matching database version', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const tempAssistant = {
-      ...makeMessage(2),
-      id: 'temp-assistant-1',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'partial' as const,
-    };
-    const dbAssistant = {
-      ...tempAssistant,
-      id: 'db-assistant-1',
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      streaming: true,
-      streamingMessageId: tempAssistant.id,
-      messages: [user, tempAssistant],
-    });
-
-    useConversationStore.getState().hydrateMessageVersions(user.id, [dbAssistant], dbAssistant.id);
-
-    expect(useConversationStore.getState().streamingMessageId).toBe('db-assistant-1');
-    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual([
-      'user-1',
-      'db-assistant-1',
-    ]);
-  });
-
-  it('adds a new model response as an inactive card when the parent already has multi-model versions', async () => {
-    invokeMock.mockResolvedValue(undefined);
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-a',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-    const inactive = {
-      ...makeMessage(4),
-      id: 'assistant-b',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active, inactive],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    await useConversationStore.getState().regenerateWithModel(active.id, 'provider-c', 'model-c');
-
-    expect(invokeMock).toHaveBeenCalledWith('regenerate_with_model', expect.objectContaining({
-      conversationId: 'conv-1',
-      userMessageId: user.id,
-      targetProviderId: 'provider-c',
-      targetModelId: 'model-c',
-      isCompanion: true,
-    }));
-
-    const messages = useConversationStore.getState().messages;
-    expect(messages.find((message) => message.id === active.id)?.is_active).toBe(true);
-    const placeholder = messages.find((message) => message.model_id === 'model-c');
-    expect(placeholder).toMatchObject({
-      provider_id: 'provider-c',
-      is_active: false,
-      status: 'partial',
-      parent_message_id: user.id,
-    });
-  });
-
-  it('can regenerate a selected inactive model version without activating the new response', async () => {
-    invokeMock.mockResolvedValue(undefined);
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-a',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-    const inactive = {
-      ...makeMessage(4),
-      id: 'assistant-b',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-      version_index: 1,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active, inactive],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    const returned = await useConversationStore.getState().regenerateWithModel(inactive.id, 'provider-b', 'model-b', { activate: false });
-
-    expect(invokeMock).toHaveBeenCalledWith('regenerate_with_model', expect.objectContaining({
-      conversationId: 'conv-1',
-      userMessageId: user.id,
-      targetProviderId: 'provider-b',
-      targetModelId: 'model-b',
-      isCompanion: true,
-    }));
-
-    const placeholder = useConversationStore.getState().messages.find(
-      (message) => message.id.startsWith('temp-assistant-') && message.model_id === 'model-b',
-    );
-    expect(returned).toBeDefined();
-    expect(returned.id).toBe(placeholder?.id);
-    expect(placeholder).toMatchObject({
-      provider_id: 'provider-b',
-      is_active: false,
-      status: 'partial',
-    });
-  });
-
-  it('can regenerate a selected active model version as the active response', async () => {
-    invokeMock.mockResolvedValue(undefined);
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-a',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-    const inactive = {
-      ...makeMessage(4),
-      id: 'assistant-b',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-      version_index: 1,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active, inactive],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    await useConversationStore.getState().regenerateWithModel(active.id, 'provider-a', 'model-a', { activate: true });
-
-    expect(invokeMock).toHaveBeenCalledWith('regenerate_with_model', expect.objectContaining({
-      conversationId: 'conv-1',
-      userMessageId: user.id,
-      targetProviderId: 'provider-a',
-      targetModelId: 'model-a',
-      isCompanion: undefined,
-    }));
-
-    const placeholder = useConversationStore.getState().messages.find(
-      (message) => message.id.startsWith('temp-assistant-') && message.model_id === 'model-a',
-    );
-    expect(placeholder).toMatchObject({
-      provider_id: 'provider-a',
-      is_active: true,
-      status: 'partial',
-    });
-  });
-
-  it('keeps the same-model regenerate placeholder active while the new answer streams', async () => {
-    vi.useFakeTimers();
-    const regenerate = deferred<void>();
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      content: 'question',
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-a',
-      content: 'old answer',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === 'regenerate_message') return regenerate.promise;
-      if (cmd === 'list_messages_page') return Promise.resolve(makePage([user, active], false));
-      throw new Error(`unexpected command: ${cmd}`);
-    });
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    const pending = useConversationStore.getState().regenerateMessage(active.id);
-    await flushPromises();
-
-    expect(invokeMock).toHaveBeenCalledWith('regenerate_message', expect.objectContaining({
-      conversationId: 'conv-1',
-      userMessageId: user.id,
-    }));
-
-    const messages = useConversationStore.getState().messages;
-    const placeholder = messages.find((message) => message.id.startsWith('temp-assistant-'));
-    expect(messages.find((message) => message.id === active.id)?.is_active).toBe(false);
-    expect(placeholder).toMatchObject({
-      content: '',
-      is_active: true,
-      parent_message_id: user.id,
-      provider_id: active.provider_id,
-      model_id: active.model_id,
-      status: 'partial',
-    });
-    expect(useConversationStore.getState().streamingMessageId).toBe(placeholder?.id);
-
-    regenerate.resolve();
-    await flushPromises();
-    await vi.advanceTimersByTimeAsync(600);
-    await expect(pending).resolves.toMatchObject({
-      id: placeholder?.id,
-      parent_message_id: user.id,
-      model_id: active.model_id,
-      is_active: true,
-      status: 'partial',
-    });
-    vi.useRealTimers();
-  });
-
-  it('does not send temp user ids to regenerate_message', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'temp-user-1',
-      role: 'user' as const,
-      content: 'question still saving',
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const assistant = {
-      ...makeMessage(2),
-      id: 'temp-assistant-1',
-      content: '',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'partial' as const,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, assistant],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    await expect(useConversationStore.getState().regenerateMessage(assistant.id))
-      .rejects
-      .toThrow('消息仍在保存');
-
-    expect(invokeMock).not.toHaveBeenCalledWith('regenerate_message', expect.anything());
-    expect(useConversationStore.getState().messages).toHaveLength(2);
-  });
-
-  it('resolves a same-model regenerated temp placeholder to the active partial database version', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const oldVersion = {
-      ...makeMessage(2),
-      id: 'assistant-old',
-      content: 'old answer',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-      version_index: 0,
-    };
-    const tempPlaceholder = {
-      ...makeMessage(6),
-      id: 'temp-assistant-1',
-      content: '',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'partial' as const,
-      version_index: 1,
-    };
-    const dbPlaceholder = {
-      ...tempPlaceholder,
-      id: 'assistant-new',
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      streaming: true,
-      streamingMessageId: tempPlaceholder.id,
-      streamingConversationId: 'conv-1',
-      messages: [user, oldVersion, tempPlaceholder],
-    });
-
-    useConversationStore.getState().hydrateMessageVersions(user.id, [oldVersion, dbPlaceholder]);
-
-    const messages = useConversationStore.getState().messages;
-    expect(useConversationStore.getState().streamingMessageId).toBe(dbPlaceholder.id);
-    expect(messages.map((message) => message.id)).toEqual(['user-1', 'assistant-old', 'assistant-new']);
-    expect(messages.find((message) => message.id === dbPlaceholder.id)).toMatchObject({
-      is_active: true,
-      status: 'partial',
-    });
-  });
-
-  it('preserves the local temp placeholder when hydration only returns old same-model versions', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const oldVersion = {
-      ...makeMessage(2),
-      id: 'assistant-old',
-      content: 'old answer',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'complete' as const,
-      version_index: 0,
-    };
-    const tempPlaceholder = {
-      ...makeMessage(6),
-      id: 'temp-assistant-1',
-      content: '',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'partial' as const,
-      version_index: 1,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      streaming: true,
-      streamingMessageId: tempPlaceholder.id,
-      streamingConversationId: 'conv-1',
-      messages: [user, oldVersion, tempPlaceholder],
-    });
-
-    useConversationStore.getState().hydrateMessageVersions(user.id, [oldVersion]);
-
-    const messages = useConversationStore.getState().messages;
-    expect(useConversationStore.getState().streamingMessageId).toBe(tempPlaceholder.id);
-    expect(messages.map((message) => message.id)).toEqual(['user-1', 'assistant-old', 'temp-assistant-1']);
-    expect(messages.find((message) => message.id === tempPlaceholder.id)).toMatchObject({
-      is_active: true,
-      status: 'partial',
-    });
-  });
-
-  it('switches to a temporary assistant version locally without calling the backend', async () => {
-    invokeMock.mockResolvedValue([]);
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-active',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-      version_index: 0,
-    };
-    const temp = {
-      ...makeMessage(6),
-      id: 'temp-assistant-1',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'partial' as const,
-      version_index: 1,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active, temp],
-    });
-
-    await useConversationStore.getState().switchMessageVersion('conv-1', user.id, temp.id);
-
-    expect(invokeMock).not.toHaveBeenCalledWith('switch_message_version', expect.anything());
-    const messages = useConversationStore.getState().messages;
-    expect(messages.find((message) => message.id === active.id)?.is_active).toBe(false);
-    expect(messages.find((message) => message.id === temp.id)?.is_active).toBe(true);
-  });
-
-  it('syncs a locally selected temporary version after hydration resolves its real id', async () => {
-    invokeMock.mockResolvedValue([]);
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-active',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-      version_index: 0,
-    };
-    const temp = {
-      ...makeMessage(6),
-      id: 'temp-assistant-1',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'partial' as const,
-      version_index: 1,
-    };
-    const resolved = {
-      ...temp,
-      id: 'assistant-resolved',
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, active, temp],
-    });
-
-    await useConversationStore.getState().switchMessageVersion('conv-1', user.id, temp.id);
-    invokeMock.mockClear();
-
-    useConversationStore.getState().hydrateMessageVersions(user.id, [active, resolved]);
-    await flushPromises();
-
-    const messages = useConversationStore.getState().messages;
-    expect(messages.map((message) => message.id)).toEqual(['user-1', 'assistant-active', 'assistant-resolved']);
-    expect(messages.find((message) => message.id === active.id)?.is_active).toBe(false);
-    expect(messages.find((message) => message.id === resolved.id)?.is_active).toBe(true);
-    expect(invokeMock).toHaveBeenCalledWith('switch_message_version', {
-      conversationId: 'conv-1',
-      parentMessageId: user.id,
-      messageId: resolved.id,
-    });
-    expect(invokeMock).not.toHaveBeenCalledWith('switch_message_version', {
-      conversationId: 'conv-1',
-      parentMessageId: user.id,
-      messageId: temp.id,
-    });
-  });
-
-  it('keeps the locally active real version when hydration still marks the first version active', async () => {
-    const { useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const firstLocal = {
-      ...makeMessage(2),
-      id: 'assistant-first',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'partial' as const,
-      version_index: 0,
-    };
-    const secondLocal = {
-      ...makeMessage(6),
-      id: 'assistant-second',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'partial' as const,
-      version_index: 1,
-    };
-    const firstFromDb = {
-      ...firstLocal,
-      is_active: true,
-    };
-    const secondFromDb = {
-      ...secondLocal,
-      is_active: false,
-    };
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [user, firstLocal, secondLocal],
-    });
-
-    useConversationStore.getState().hydrateMessageVersions(user.id, [firstFromDb, secondFromDb]);
-
-    const messages = useConversationStore.getState().messages;
-    expect(messages.find((message) => message.id === firstLocal.id)?.is_active).toBe(false);
-    expect(messages.find((message) => message.id === secondLocal.id)?.is_active).toBe(true);
-  });
-
-  it('regenerates the specified user message instead of falling back to the last user message', async () => {
-    vi.useFakeTimers();
-    const regenerate = deferred<void>();
-    const { useConversationStore } = await import('../conversationStore');
-    const firstUser = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      content: 'first question',
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const firstAssistant = {
-      ...makeMessage(2),
-      id: 'assistant-1',
-      content: 'first answer',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: firstUser.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-    const lastUser = {
-      ...makeMessage(3),
-      id: 'user-2',
-      role: 'user' as const,
-      content: 'last question',
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const lastAssistant = {
-      ...makeMessage(4),
-      id: 'assistant-2',
-      content: 'last answer',
-      provider_id: 'provider-b',
-      model_id: 'model-b',
-      parent_message_id: lastUser.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === 'regenerate_message') return regenerate.promise;
-      if (cmd === 'list_messages_page') {
-        return Promise.resolve(makePage([firstUser, firstAssistant, lastUser, lastAssistant], false));
-      }
-      throw new Error(`unexpected command: ${cmd}`);
-    });
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      messages: [firstUser, firstAssistant, lastUser, lastAssistant],
-      enabledMcpServerIds: [],
-      enabledKnowledgeBaseIds: [],
-      enabledMemoryNamespaceIds: [],
-      thinkingBudget: null,
-    });
-
-    const pending = useConversationStore.getState().regenerateMessage(firstUser.id);
-    await flushPromises();
-
-    expect(invokeMock).toHaveBeenCalledWith('regenerate_message', expect.objectContaining({
-      userMessageId: firstUser.id,
-    }));
-
-    const messages = useConversationStore.getState().messages;
-    const placeholder = messages.find((message) => message.id.startsWith('temp-assistant-'));
-    expect(messages.find((message) => message.id === firstAssistant.id)?.is_active).toBe(false);
-    expect(messages.find((message) => message.id === lastAssistant.id)?.is_active).toBe(true);
-    expect(placeholder).toMatchObject({
-      is_active: true,
-      parent_message_id: firstUser.id,
-      provider_id: firstAssistant.provider_id,
-      model_id: firstAssistant.model_id,
-      status: 'partial',
-    });
-
-    regenerate.resolve();
-    await flushPromises();
-    await vi.advanceTimersByTimeAsync(600);
-    await pending;
-    vi.useRealTimers();
-  });
-
-  it('keeps an inactive companion model visible while streaming chunks arrive and after final refresh', async () => {
-    vi.useFakeTimers();
-    const listeners = new Map<string, (event: unknown) => void>();
-    listenMock.mockImplementation(async (eventName: string, handler: (event: unknown) => void) => {
-      listeners.set(eventName, handler);
-      return () => {};
-    });
-    const { getLiveStreamContent, useConversationStore } = await import('../conversationStore');
-    const user = {
-      ...makeMessage(1),
-      id: 'user-1',
-      role: 'user' as const,
-      provider_id: null,
-      model_id: null,
-      parent_message_id: null,
-    };
-    const active = {
-      ...makeMessage(2),
-      id: 'assistant-a',
-      content: 'old answer',
-      provider_id: 'provider-a',
-      model_id: 'model-a',
-      parent_message_id: user.id,
-      is_active: true,
-      status: 'complete' as const,
-    };
-    const companionPlaceholder = {
-      ...makeMessage(4),
-      id: 'temp-assistant-c',
-      content: '',
-      provider_id: 'provider-c',
-      model_id: 'model-c',
-      parent_message_id: user.id,
-      is_active: false,
-      status: 'partial' as const,
-    };
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === 'list_messages_page') {
-        return Promise.resolve(makePage([user, active], false));
-      }
-      return Promise.resolve(undefined);
-    });
-
-    useConversationStore.setState({
-      activeConversationId: 'conv-1',
-      streaming: true,
-      streamingMessageId: companionPlaceholder.id,
-      streamingConversationId: 'conv-1',
-      messages: [user, active, companionPlaceholder],
-    });
-
-    await useConversationStore.getState().startStreamListening();
-    const onChunk = listeners.get('chat-stream-chunk');
-    expect(onChunk).toBeTypeOf('function');
-
-    onChunk?.({
-      payload: {
-        conversation_id: 'conv-1',
-        message_id: 'assistant-c',
-        model_id: 'model-c',
-        provider_id: 'provider-c',
-        chunk: {
-          content: 'streamed',
-          thinking: null,
-          tool_calls: null,
-          done: false,
-          usage: null,
-        },
-      },
-    });
-    vi.advanceTimersByTime(20);
-
-    expect(getLiveStreamContent('assistant-c')).toBe('streamed');
-    expect(useConversationStore.getState().messages.find((message) => message.id === 'assistant-c')).toMatchObject({
-      content: '',
-      is_active: false,
-      parent_message_id: user.id,
-      status: 'partial',
-    });
-    expect(useConversationStore.getState().messages.find((message) => message.id === active.id)?.is_active).toBe(true);
-
-    onChunk?.({
-      payload: {
-        conversation_id: 'conv-1',
-        message_id: 'assistant-c',
-        model_id: 'model-c',
-        provider_id: 'provider-c',
-        chunk: {
-          content: null,
-          thinking: null,
-          tool_calls: null,
-          done: true,
-          is_final: true,
-          usage: null,
-        },
-      },
-    });
-    vi.advanceTimersByTime(130);
-    await flushPromises();
-
-    expect(useConversationStore.getState().messages.map((message) => message.id)).toEqual([
-      'user-1',
-      'assistant-a',
-      'assistant-c',
-    ]);
-    expect(useConversationStore.getState().messages.find((message) => message.id === 'assistant-c')).toMatchObject({
-      content: 'streamed',
-      is_active: false,
-      status: 'complete',
-    });
-
-    vi.useRealTimers();
-  });
-
-  it('creates a new conversation from a category template when a category id is supplied', async () => {
-    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === 'create_conversation') {
-        expect(args).toEqual({
-          title: 'template-conversation',
-          modelId: 'template-model',
-          providerId: 'template-provider',
-          systemPrompt: 'Category prompt',
-        });
-        return Promise.resolve(makeConversation('conv-template', {
-          provider_id: 'template-provider',
-          model_id: 'template-model',
-          system_prompt: 'Category prompt',
-        }));
-      }
-
-      if (cmd === 'update_conversation') {
-        expect(args).toEqual({
-          id: 'conv-template',
-          input: {
-            category_id: 'cat-template',
-            system_prompt: 'Category prompt',
-            temperature: 0.2,
-            max_tokens: 8192,
-            top_p: 0.95,
-            frequency_penalty: 0.4,
-            search_enabled: false,
-            search_provider_id: null,
-            thinking_budget: null,
-            thinking_level: null,
-            enabled_mcp_server_ids: [],
-            enabled_knowledge_base_ids: [],
-            enabled_memory_namespace_ids: [],
-          },
-        });
-
-        return Promise.resolve(makeConversation('conv-template', {
-          provider_id: 'template-provider',
-          model_id: 'template-model',
-          category_id: 'cat-template',
-          system_prompt: 'Category prompt',
-          temperature: 0.2,
-          max_tokens: 8192,
-          top_p: 0.95,
-          frequency_penalty: 0.4,
-        }));
-      }
-
-      if (cmd === 'list_messages_page') {
-        return Promise.resolve(makePage([], false));
-      }
-
-      throw new Error(`unexpected command: ${cmd}`);
-    });
-
-    const { useConversationStore } = await import('../conversationStore');
-    const { useCategoryStore } = await import('../categoryStore');
-
-    useCategoryStore.setState({
-      categories: [{
-        id: 'cat-template',
-        name: 'Template',
-        icon_type: null,
-        icon_value: null,
-        system_prompt: 'Category prompt',
-        default_provider_id: 'template-provider',
-        default_model_id: 'template-model',
-        default_temperature: 0.2,
-        default_max_tokens: 8192,
-        default_top_p: 0.95,
-        default_frequency_penalty: 0.4,
-        sort_order: 0,
-        is_collapsed: false,
-        created_at: 1,
-        updated_at: 1,
-      }] as never[],
-      loading: false,
-    });
-
-    const conversation = await useConversationStore.getState().createConversation(
-      'template-conversation',
-      'fallback-model',
-      'fallback-provider',
-      { categoryId: 'cat-template' },
-    );
-
-    expect(conversation.category_id).toBe('cat-template');
-    expect(conversation.provider_id).toBe('template-provider');
-    expect(conversation.model_id).toBe('template-model');
-    expect(conversation.temperature).toBe(0.2);
-    expect(conversation.max_tokens).toBe(8192);
-  });
 });

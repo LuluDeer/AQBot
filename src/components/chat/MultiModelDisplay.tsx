@@ -1,21 +1,34 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
-import { Alert, Button, Dropdown, Popconfirm, Tag, Tooltip, Typography, theme } from 'antd';
-import { ArrowLeftRight, Check, ChevronLeft, ChevronRight, Columns2, GitBranch, LayoutList, Pencil, RotateCcw, Rows3, Trash2 } from 'lucide-react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { flushSync } from 'react-dom';
+import { Alert, App, Button, Dropdown, Popconfirm, Spin, Tag, Tooltip, Typography, theme } from 'antd';
+import { AppWindow, ArrowLeftRight, Brain, Check, ChevronLeft, ChevronRight, Columns2, GitBranch, LayoutList, Maximize2, Pencil, RotateCcw, Rows3, Trash2 } from 'lucide-react';
 import { ModelIcon } from '@lobehub/icons';
 import { useTranslation } from 'react-i18next';
 import { OverlayScrollbars } from 'overlayscrollbars';
-import type { Message } from '@/types';
+import type { Message, MultiModelDisplayMode } from '@/types';
 import { CopyButton } from '@/components/common/CopyButton';
 import { stripAqbotTags } from '@/lib/chatMarkdown';
+import { useChatChrome } from '@/lib/chatChrome';
 import { getMessageVersionGroupKey, selectDisplayVersionsByModel } from '@/lib/chatMultiModel';
+import { openConversationPopout } from '@/lib/conversationPopout';
+import type { MultiModelContinuationMode } from '@/lib/multiModelContinuation';
+import { shouldHideMultiModelLayoutSwitcher } from '@/lib/multiModelLanes';
+import { useMultiModelColumnWidth } from '@/hooks/useMultiModelColumnWidth';
+import {
+  MULTI_MODEL_COLUMN_GAP_PX,
+  sideBySideColumnLayout,
+  sideBySideTrackStyle,
+} from '@/lib/multiModelColumnLayout';
 import {
   getLiveStreamContent,
   subscribeLiveStreamContent,
   useConversationStore,
 } from '@/stores';
+import { MultiModelColumnResizeHandle } from './MultiModelColumnResizeHandle';
+import { MultiModelColumnWidthControl } from './MultiModelColumnWidthControl';
 import { ModelSelector } from './ModelSelector';
-
-export type MultiModelDisplayMode = 'tabs' | 'side-by-side' | 'stacked';
+import { OverflowIconToolbar } from './OverflowIconToolbar';
+import { SaveToMemoryPopover } from './SaveToMemoryPopover';
 
 function useLiveStreamContent(messageId: string | null | undefined, enabled: boolean): string | undefined {
   const subscribedMessageId = enabled ? messageId : null;
@@ -32,7 +45,7 @@ function useLiveStreamContent(messageId: string | null | undefined, enabled: boo
   );
 }
 
-function MultiModelVersionContent({
+export function MultiModelVersionContent({
   message,
   isVersionStreaming,
   renderContent,
@@ -48,10 +61,10 @@ function MultiModelVersionContent({
 
 /** Error boundary to prevent white-screen crashes in multi-model display */
 class MultiModelErrorBoundary extends React.Component<
-  { children: React.ReactNode; fallback?: React.ReactNode },
+  { children: React.ReactNode; fallback: React.ReactNode },
   { hasError: boolean }
 > {
-  constructor(props: { children: React.ReactNode; fallback?: React.ReactNode }) {
+  constructor(props: { children: React.ReactNode; fallback: React.ReactNode }) {
     super(props);
     this.state = { hasError: false };
   }
@@ -60,9 +73,7 @@ class MultiModelErrorBoundary extends React.Component<
   }
   render() {
     if (this.state.hasError) {
-      return this.props.fallback ?? (
-        <Alert type="warning" message="Multi-model display error" showIcon />
-      );
+      return this.props.fallback;
     }
     return this.props.children;
   }
@@ -89,6 +100,7 @@ export interface MultiModelDisplayProps {
   ) => { modelName: string; providerName: string };
   streamingMessageId?: string | null;
   multiModelDoneMessageIds: string[];
+  onFocusVersion?: (message: Message) => void;
 }
 
 /**
@@ -112,6 +124,7 @@ export const MultiModelDisplay = React.memo(function MultiModelDisplay({
   renderContent,
   getModelDisplayInfo,
   streamingMessageId,
+  onFocusVersion,
 }: MultiModelDisplayProps) {
   const { token } = theme.useToken();
   const { t } = useTranslation();
@@ -120,7 +133,9 @@ export const MultiModelDisplay = React.memo(function MultiModelDisplay({
   if (!versions || versions.length === 0) return null;
 
   return (
-    <MultiModelErrorBoundary>
+    <MultiModelErrorBoundary
+      fallback={<Alert type="warning" message={t('chat.multiModel.displayError')} showIcon />}
+    >
       <MultiModelDisplayInner
         versions={versions}
         activeMessageId={activeMessageId}
@@ -138,6 +153,7 @@ export const MultiModelDisplay = React.memo(function MultiModelDisplay({
         renderContent={renderContent}
         getModelDisplayInfo={getModelDisplayInfo}
         streamingMessageId={streamingMessageId}
+        onFocusVersion={onFocusVersion}
         token={token}
         t={t}
       />
@@ -167,25 +183,51 @@ function MultiModelDisplayInner({
   renderContent,
   getModelDisplayInfo,
   streamingMessageId,
+  onFocusVersion,
   token,
   t,
 }: MultiModelDisplayInnerProps) {
   const parentMessageId = versions[0]?.parent_message_id;
   const storeMessages = useConversationStore((state) => state.messages);
-  const storeStreaming = useConversationStore((state) => state.streaming);
-  const streamingConversationId = useConversationStore((state) => state.streamingConversationId);
+  const storeStreaming = useConversationStore((state) => (
+    state.streaming
+    || Boolean(state.observedStream?.streaming && state.observedStream.conversationId === conversationId)
+  ));
+  const streamingConversationId = useConversationStore((state) => (
+    state.streaming
+      ? state.streamingConversationId
+      : (state.observedStream?.streaming && state.observedStream.conversationId === conversationId
+        ? conversationId
+        : state.streamingConversationId)
+  ));
+  const multiModelHistoryMode = useConversationStore((state) => state.multiModelContinuationMode);
   const liveVersions = useMemo(() => {
     if (!parentMessageId) return [];
     return storeMessages.filter((message) =>
       message.parent_message_id === parentMessageId && message.role === 'assistant'
     );
   }, [parentMessageId, storeMessages]);
-  const renderVersions = liveVersions.length > 0 ? liveVersions : versions;
+  const renderVersions = useMemo(() => {
+    if (liveVersions.length === 0) return versions;
+    const liveVersionsById = new Map(liveVersions.map((version) => [version.id, version]));
+    return versions.map((version) => liveVersionsById.get(version.id) ?? version);
+  }, [liveVersions, versions]);
   const displayVersions = useMemo(
     () => selectDisplayVersionsByModel(renderVersions, activeMessageId, displayVersionIdsByModelKey),
     [activeMessageId, displayVersionIdsByModelKey, renderVersions],
   );
   const isDisplayStreaming = storeStreaming && streamingConversationId === conversationId;
+  const { message } = App.useApp();
+  const {
+    layoutMode,
+    resolvedWidthPx,
+    previewWidth,
+    clearPreview,
+    commitWidth,
+  } = useMultiModelColumnWidth('main');
+  const [containerWidth, setContainerWidth] = useState(0);
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const enableSideBySideScroll = mode === 'side-by-side' && layoutMode === 'scroll';
 
   // For side-by-side mode, force the .ant-bubble ancestor to take full width
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -220,26 +262,34 @@ function MultiModelDisplayInner({
     };
   }, [mode]);
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return undefined;
+    const update = () => setContainerWidth(el.clientWidth);
+    update();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mode, displayVersions.length, layoutMode]);
+
   // Initialize OverlayScrollbars for persistent horizontal scrollbar
   useEffect(() => {
-    if (mode !== 'side-by-side') return;
+    if (!enableSideBySideScroll) return;
     const el = scrollRef.current;
     if (!el) return;
 
-    const inst = OverlayScrollbars(
-      { target: el, elements: { viewport: el } },
-      {
-        scrollbars: {
-          theme: 'os-theme-aqbot',
-          autoHide: 'never',
-          clickScroll: true,
-        },
-        overflow: { x: 'scroll', y: 'hidden' },
+    const inst = OverlayScrollbars(el, {
+      scrollbars: {
+        theme: 'os-theme-aqbot',
+        autoHide: 'never',
+        clickScroll: true,
       },
-    );
+      overflow: { x: 'scroll', y: 'hidden' },
+    });
 
     return () => inst.destroy();
-  }, [mode]);
+  }, [enableSideBySideScroll]);
 
   if (displayVersions.length <= 1) {
     const msg = displayVersions[0];
@@ -257,42 +307,37 @@ function MultiModelDisplayInner({
   const containerStyle: React.CSSProperties =
     mode === 'side-by-side'
       ? {
-          display: 'flex',
-          gap: 12,
-          overflowX: 'auto',
-          paddingBottom: 8,
+          overflowX: enableSideBySideScroll ? 'auto' : 'hidden',
+          paddingBottom: enableSideBySideScroll ? 8 : 0,
           width: '100%',
           boxSizing: 'border-box',
-          alignItems: 'stretch',
         }
       : {
           display: 'flex',
           flexDirection: 'column',
-          gap: 12,
+          gap: MULTI_MODEL_COLUMN_GAP_PX,
         };
-
-  const cardStyle: React.CSSProperties =
-    mode === 'side-by-side'
-      ? {
-          minWidth: 300,
-          flex: '0 0 auto',
-          width: `calc((100% - ${(displayVersions.length - 1) * 12}px) / ${displayVersions.length})`,
-          border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: token.borderRadiusLG,
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-        }
-      : {
-          border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: token.borderRadiusLG,
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-        };
+  const saveColumnWidth = async (
+    providerId: string | null | undefined,
+    modelId: string | null | undefined,
+    widthPx: number | null,
+  ) => {
+    if (!providerId || !modelId) return;
+    try {
+      await commitWidth(providerId, modelId, widthPx);
+    } catch {
+      message.error(t('chat.multiModel.columnWidthSaveFailed'));
+    }
+  };
 
   return (
     <div ref={scrollRef} style={containerStyle} className={mode === 'side-by-side' ? 'aqbot-multi-model-scroll' : undefined}>
+      <div
+        className={mode === 'side-by-side' && enableSideBySideScroll ? 'aqbot-multi-model-track' : undefined}
+        style={mode === 'side-by-side'
+          ? sideBySideTrackStyle(layoutMode)
+          : { display: 'flex', flexDirection: 'column', gap: MULTI_MODEL_COLUMN_GAP_PX }}
+      >
       {displayVersions.map((vMsg) => {
         const isActive = vMsg.id === activeMessageId;
         const isVersionStreaming = isDisplayStreaming && (
@@ -302,14 +347,29 @@ function MultiModelDisplayInner({
           vMsg.model_id,
           vMsg.provider_id,
         );
+        const customWidthPx = mode === 'side-by-side'
+          ? resolvedWidthPx(vMsg.provider_id, vMsg.model_id, containerWidth)
+          : undefined;
+        const columnLayout = mode === 'side-by-side'
+          ? sideBySideColumnLayout(displayVersions.length, layoutMode, customWidthPx)
+          : { className: undefined, style: {} as React.CSSProperties };
 
         return (
           <div
             key={vMsg.id}
+            ref={(node) => {
+              cardRefs.current[vMsg.id] = node;
+            }}
             data-testid={`multi-model-card-${vMsg.id}`}
+            className={columnLayout.className}
             style={{
-              ...cardStyle,
-              borderColor: isActive ? token.colorPrimary : token.colorBorderSecondary,
+              ...columnLayout.style,
+              border: `1px solid ${isActive ? token.colorPrimary : token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              position: 'relative',
             }}
           >
             {/* Card header */}
@@ -349,10 +409,33 @@ function MultiModelDisplayInner({
                 )}
               </div>
               <div className="multi-model-card-header-actions" style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                {mode === 'side-by-side' && vMsg.provider_id && vMsg.model_id ? (
+                  <MultiModelColumnWidthControl
+                    currentWidthPx={customWidthPx ?? Math.max(containerWidth / Math.max(displayVersions.length, 1), 320)}
+                    onCommit={(widthPx) => {
+                      void saveColumnWidth(vMsg.provider_id, vMsg.model_id, widthPx);
+                    }}
+                    onReset={() => {
+                      void saveColumnWidth(vMsg.provider_id, vMsg.model_id, null);
+                    }}
+                  />
+                ) : null}
+                {onFocusVersion ? (
+                  <Tooltip title={t('chat.multiModel.focusAnswer')}>
+                    <Button
+                      type="text"
+                      size="small"
+                      aria-label={t('chat.multiModel.focusAnswer')}
+                      icon={<Maximize2 size={14} />}
+                      onClick={() => onFocusVersion(vMsg)}
+                    />
+                  </Tooltip>
+                ) : null}
                 <MultiModelContextButton
                   message={vMsg}
                   isActive={isActive}
                   parentMessageId={parentMessageId}
+                  historyMode={multiModelHistoryMode}
                   token={token}
                   t={t}
                   onSwitchVersion={onSwitchVersion}
@@ -376,6 +459,18 @@ function MultiModelDisplayInner({
                 renderContent={renderContent}
               />
             </div>
+            {mode === 'side-by-side' && vMsg.provider_id && vMsg.model_id ? (
+              <MultiModelColumnResizeHandle
+                ariaLabel={t('chat.multiModel.resizeColumn')}
+                columnEl={cardRefs.current[vMsg.id] ?? null}
+                maxWidthPx={containerWidth || 10000}
+                onPreview={(widthPx) => previewWidth(vMsg.provider_id!, vMsg.model_id!, widthPx)}
+                onCommit={(widthPx) => {
+                  void saveColumnWidth(vMsg.provider_id, vMsg.model_id, widthPx);
+                }}
+                onCancel={() => clearPreview(vMsg.provider_id!, vMsg.model_id!)}
+              />
+            ) : null}
             <MultiModelCardActions
               message={vMsg}
               renderVersions={renderVersions}
@@ -394,6 +489,7 @@ function MultiModelDisplayInner({
           </div>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -402,6 +498,7 @@ function MultiModelContextButton({
   message,
   isActive,
   parentMessageId,
+  historyMode,
   token,
   t,
   onSwitchVersion,
@@ -410,11 +507,15 @@ function MultiModelContextButton({
   message: Message;
   isActive: boolean;
   parentMessageId?: string | null;
+  historyMode: MultiModelContinuationMode;
   token: ReturnType<typeof theme.useToken>['token'];
   t: ReturnType<typeof useTranslation>['t'];
   onSwitchVersion: (parentMessageId: string, messageId: string) => void;
   onSetContextVersion?: (message: Message) => void;
 }) {
+  const tooltipKey = historyMode === 'per_model'
+    ? (isActive ? 'chat.multiModel.currentFallbackContext' : 'chat.multiModel.useAsFallbackContext')
+    : (isActive ? 'chat.multiModel.currentSharedContext' : 'chat.multiModel.useAsSharedContext');
   const setContext = () => {
     if (isActive || !parentMessageId) return;
     if (onSetContextVersion) {
@@ -425,7 +526,7 @@ function MultiModelContextButton({
   };
 
   return (
-    <Tooltip title={isActive ? t('chat.multiModelCurrentContext') : t('chat.multiModelUseAsContext')}>
+    <Tooltip title={t(tooltipKey)}>
       <button
         type="button"
         data-testid={`multi-model-set-context-${message.id}`}
@@ -495,6 +596,8 @@ function MultiModelCardActions({
   const currentVersionIndex = sameModelVersions.findIndex((version) => version.id === message.id);
   const canUseVersionPagination = Boolean(parentMessageId && sameModelVersions.length > 1 && onDisplayVersionChange);
   const actionsDisabled = isVersionStreaming || message.status === 'partial';
+  const memoryContent = stripAqbotTags(message.content ?? '');
+  const memoryActionDisabled = actionsDisabled || !memoryContent.trim();
   const currentModelOverride = message.provider_id && message.model_id
     ? { providerId: message.provider_id, modelId: message.model_id }
     : null;
@@ -506,53 +609,22 @@ function MultiModelCardActions({
     onDisplayVersionChange?.(parentMessageId, modelKey, next.id);
   };
 
-  return (
-    <div
-      className="multi-model-card-footer-actions"
-      style={{
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'space-between',
-        gap: 8,
-        padding: '6px 10px',
-        borderTop: `1px solid ${token.colorBorderSecondary}`,
-        backgroundColor: token.colorBgContainer,
-        flexShrink: 0,
-      }}
-    >
-      <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, minWidth: 58 }}>
-        {sameModelVersions.length > 1 && (
-          <>
-            <Button
-              type="text"
-              size="small"
-              icon={<ChevronLeft size={14} />}
-              disabled={!canUseVersionPagination || currentVersionIndex <= 0}
-              data-testid={`multi-model-version-prev-${message.id}`}
-              onClick={() => switchDisplayedVersion(currentVersionIndex - 1)}
-              style={{ minWidth: 20, padding: '0 2px' }}
-            />
-            <Typography.Text style={{ fontSize: 11, color: token.colorTextSecondary }}>
-              {Math.max(currentVersionIndex, 0) + 1}/{sameModelVersions.length}
-            </Typography.Text>
-            <Button
-              type="text"
-              size="small"
-              icon={<ChevronRight size={14} />}
-              disabled={!canUseVersionPagination || currentVersionIndex >= sameModelVersions.length - 1}
-              data-testid={`multi-model-version-next-${message.id}`}
-              onClick={() => switchDisplayedVersion(currentVersionIndex + 1)}
-              style={{ minWidth: 20, padding: '0 2px' }}
-            />
-          </>
-        )}
-      </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+  const actionItems = [
+    {
+      key: 'copy',
+      overflowLabel: t('chat.copy'),
+      node: (
         <CopyButton
           text={() => stripAqbotTags(message.content ?? '')}
           size={13}
           timeout={3000}
         />
+      ),
+    },
+    {
+      key: 'regenerate',
+      overflowLabel: t('chat.regenerate'),
+      node: (
         <Tooltip title={t('chat.regenerate')}>
           <Button
             type="text"
@@ -563,6 +635,12 @@ function MultiModelCardActions({
             onClick={() => onRegenerateVersion?.(message)}
           />
         </Tooltip>
+      ),
+    },
+    {
+      key: 'edit',
+      overflowLabel: t('chat.editMessage'),
+      node: (
         <Tooltip title={t('chat.editMessage')}>
           <Button
             type="text"
@@ -573,6 +651,12 @@ function MultiModelCardActions({
             onClick={() => onEditVersion?.(message)}
           />
         </Tooltip>
+      ),
+    },
+    {
+      key: 'switch-model',
+      overflowLabel: t('chat.switchModel'),
+      node: (
         <ModelSelector
           onSelect={(providerId, modelId) => onSwitchModelVersion?.(message, providerId, modelId)}
           overrideCurrentModel={currentModelOverride}
@@ -587,6 +671,12 @@ function MultiModelCardActions({
             />
           </Tooltip>
         </ModelSelector>
+      ),
+    },
+    {
+      key: 'branch',
+      overflowLabel: t('chat.branchConversation'),
+      node: (
         <Dropdown
           disabled={actionsDisabled || !onBranchVersion}
           menu={{
@@ -616,24 +706,91 @@ function MultiModelCardActions({
             />
           </Tooltip>
         </Dropdown>
-        {onDeleteVersion && displayVersions.length > 1 && (
-          <Popconfirm
-            title={t('chat.deleteConfirm')}
-            onConfirm={() => onDeleteVersion(message.id)}
-            okText={t('common.confirm')}
-            cancelText={t('common.cancel')}
-          >
+      ),
+    },
+    {
+      key: 'memory',
+      overflowLabel: t('chat.memory.save'),
+      node: (
+        <SaveToMemoryPopover content={memoryContent} disabled={memoryActionDisabled}>
+          <Tooltip title={t('chat.memory.save')}>
             <Button
-              type="text"
+              aria-label={t('chat.memory.save')}
+              data-testid={`multi-model-save-memory-${message.id}`}
+              disabled={memoryActionDisabled}
+              icon={<Brain size={13} />}
               size="small"
-              danger
-              disabled={actionsDisabled}
-              icon={<Trash2 size={13} />}
-              data-testid={`multi-model-delete-${message.id}`}
+              type="text"
             />
-          </Popconfirm>
-        )}
-      </div>
+          </Tooltip>
+        </SaveToMemoryPopover>
+      ),
+    },
+    ...(onDeleteVersion && displayVersions.length > 1
+      ? [{
+          key: 'delete',
+          overflowLabel: t('chat.delete'),
+          node: (
+            <Popconfirm
+              title={t('chat.deleteConfirm')}
+              onConfirm={() => onDeleteVersion(message.id)}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+            >
+              <Button
+                type="text"
+                size="small"
+                danger
+                disabled={actionsDisabled}
+                icon={<Trash2 size={13} />}
+                data-testid={`multi-model-delete-${message.id}`}
+              />
+            </Popconfirm>
+          ),
+        }]
+      : []),
+  ];
+
+  return (
+    <div
+      className="multi-model-card-footer-actions"
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '6px 10px',
+        borderTop: `1px solid ${token.colorBorderSecondary}`,
+        backgroundColor: token.colorBgContainer,
+        flexShrink: 0,
+        minWidth: 0,
+      }}
+    >
+      {sameModelVersions.length > 1 ? (
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2, flexShrink: 0 }}>
+          <Button
+            type="text"
+            size="small"
+            icon={<ChevronLeft size={14} />}
+            disabled={!canUseVersionPagination || currentVersionIndex <= 0}
+            data-testid={`multi-model-version-prev-${message.id}`}
+            onClick={() => switchDisplayedVersion(currentVersionIndex - 1)}
+            style={{ minWidth: 20, padding: '0 2px' }}
+          />
+          <Typography.Text style={{ fontSize: 11, color: token.colorTextSecondary }}>
+            {Math.max(currentVersionIndex, 0) + 1}/{sameModelVersions.length}
+          </Typography.Text>
+          <Button
+            type="text"
+            size="small"
+            icon={<ChevronRight size={14} />}
+            disabled={!canUseVersionPagination || currentVersionIndex >= sameModelVersions.length - 1}
+            data-testid={`multi-model-version-next-${message.id}`}
+            onClick={() => switchDisplayedVersion(currentVersionIndex + 1)}
+            style={{ minWidth: 20, padding: '0 2px' }}
+          />
+        </div>
+      ) : null}
+      <OverflowIconToolbar moreLabel={t('chat.multiModel.moreActions')} items={actionItems} />
     </div>
   );
 }
@@ -646,31 +803,87 @@ function MultiModelCardActions({
 export function LayoutSwitcher({
   currentMode,
   onModeChange,
+  parentMessageId,
 }: {
   currentMode: MultiModelDisplayMode;
   onModeChange: (mode: MultiModelDisplayMode) => void;
+  parentMessageId?: string;
 }) {
   const { token } = theme.useToken();
   const { t } = useTranslation();
+  const { message: messageApi } = App.useApp();
+  const conversationId = useConversationStore((state) => state.activeConversationId);
+  const chatChrome = useChatChrome();
+  const independentWindowActive = chatChrome.kind === 'popout';
+  const [independentWindowOpening, setIndependentWindowOpening] = useState(false);
+
+  if (shouldHideMultiModelLayoutSwitcher(chatChrome.kind)) {
+    return null;
+  }
 
   const modes: { key: MultiModelDisplayMode; icon: React.ReactNode; label: string }[] = [
     { key: 'tabs', icon: <LayoutList size={14} />, label: t('settings.multiModelDisplayModeTabs') },
     { key: 'side-by-side', icon: <Columns2 size={14} />, label: t('settings.multiModelDisplayModeSideBySide') },
     { key: 'stacked', icon: <Rows3 size={14} />, label: t('settings.multiModelDisplayModeStacked') },
   ];
+  const scopeLabel = t('chat.multiModel.answerAndFutureDisplayMode');
+  const handleModeChange = (mode: MultiModelDisplayMode) => {
+    onModeChange(mode);
+    if (!parentMessageId) return;
+    window.requestAnimationFrame(() => {
+      const matchingButton = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[data-aqbot-layout-parent]'),
+      ).find((button) => (
+        button.dataset.aqbotLayoutParent === parentMessageId
+        && button.dataset.aqbotLayoutMode === mode
+      ));
+      matchingButton?.focus();
+    });
+  };
+  const handleIndependentWindow = () => {
+    if (independentWindowActive || independentWindowOpening) return;
+    if (!conversationId) {
+      messageApi.error(t('chat.multiModel.popoutMissingConversation'));
+      return;
+    }
+    flushSync(() => {
+      setIndependentWindowOpening(true);
+    });
+    void openConversationPopout(conversationId)
+      .catch(() => {
+        messageApi.error(t('chat.multiModel.independentWindowOpenFailed'));
+      })
+      .finally(() => {
+        setIndependentWindowOpening(false);
+      });
+  };
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
-      {modes.map(({ key, icon, label }) => (
-        <Tooltip key={key} title={label} mouseEnterDelay={0.3}>
-          <div
-            onClick={() => onModeChange(key)}
+    <div
+      role="group"
+      aria-label={scopeLabel}
+      style={{ display: 'inline-flex', alignItems: 'center', flexWrap: 'wrap', maxWidth: '100%', gap: 2 }}
+    >
+      {modes.map(({ key, icon, label }) => {
+        const accessibleLabel = t('chat.multiModel.setAnswerAndFutureDisplayMode', { mode: label });
+        return (
+        <Tooltip key={key} title={accessibleLabel} mouseEnterDelay={0.3}>
+          <button
+            type="button"
+            className="aqbot-layout-mode-button"
+            data-aqbot-layout-parent={parentMessageId}
+            data-aqbot-layout-mode={key}
+            aria-label={accessibleLabel}
+            aria-pressed={currentMode === key}
+            onClick={() => handleModeChange(key)}
             style={{
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'center',
-              width: 24,
-              height: 24,
+              width: 32,
+              height: 32,
+              padding: 0,
+              border: 0,
               borderRadius: token.borderRadiusSM,
               cursor: currentMode === key ? 'default' : 'pointer',
               backgroundColor: currentMode === key ? token.colorPrimaryBg : 'transparent',
@@ -679,9 +892,59 @@ export function LayoutSwitcher({
             }}
           >
             {icon}
-          </div>
+          </button>
         </Tooltip>
-      ))}
+        );
+      })}
+      <Tooltip
+        title={independentWindowOpening
+          ? t('chat.multiModel.independentWindowOpening')
+          : independentWindowActive
+            ? t('chat.multiModel.independentWindowActive')
+            : t('chat.multiModel.openIndependentWindow')}
+        mouseEnterDelay={0.3}
+      >
+        <button
+          type="button"
+          className="aqbot-layout-mode-button"
+          data-testid="layout-independent-window"
+          data-aqbot-layout-parent={parentMessageId}
+          data-aqbot-layout-mode="independent-window"
+          aria-label={independentWindowOpening
+            ? t('chat.multiModel.independentWindowOpening')
+            : t('chat.multiModel.openIndependentWindow')}
+          aria-pressed={independentWindowActive}
+          aria-busy={independentWindowOpening}
+          disabled={independentWindowOpening || independentWindowActive}
+          onClick={handleIndependentWindow}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: 32,
+            height: 32,
+            padding: 0,
+            border: 0,
+            borderRadius: token.borderRadiusSM,
+            cursor: independentWindowOpening
+              ? 'wait'
+              : independentWindowActive
+                ? 'default'
+                : 'pointer',
+            backgroundColor: independentWindowActive || independentWindowOpening
+              ? token.colorPrimaryBg
+              : 'transparent',
+            color: independentWindowActive || independentWindowOpening
+              ? token.colorPrimary
+              : token.colorTextQuaternary,
+            transition: 'all 0.2s',
+          }}
+        >
+          {independentWindowOpening
+            ? <Spin size="small" aria-hidden="true" />
+            : <AppWindow size={14} aria-hidden="true" />}
+        </button>
+      </Tooltip>
     </div>
   );
 }

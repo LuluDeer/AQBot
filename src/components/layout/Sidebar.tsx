@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Tooltip, Avatar, theme } from 'antd';
-import { MessageSquare, BookOpen, Brain, Router, FolderOpen, User, Sparkles, ImagePlus, Users } from 'lucide-react';
+import { MessageSquare, BookOpen, Brain, Router, FolderOpen, User, Sparkles, ImagePlus, Users, Bot } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useUIStore, useSettingsStore } from '@/stores';
 import { useUserProfileStore } from '@/stores/userProfileStore';
@@ -12,6 +12,7 @@ import type { PageKey } from '@/types';
 
 const mainNavItems: { key: PageKey; icon: React.ReactNode; labelKey: string }[] = [
   { key: 'chat', icon: <MessageSquare size={18} />, labelKey: 'nav.chat' },
+  { key: 'agent', icon: <Bot size={18} />, labelKey: 'nav.agent' },
   { key: 'drawing', icon: <ImagePlus size={18} />, labelKey: 'nav.drawing' },
   { key: 'roles', icon: <Users size={18} />, labelKey: 'nav.roles' },
   { key: 'skills', icon: <Sparkles size={18} />, labelKey: 'nav.skills' },
@@ -95,7 +96,15 @@ export function Sidebar() {
       );
     }
     if ((profile.avatarType === 'url' || profile.avatarType === 'file') && profile.avatarValue) {
-      const src = profile.avatarType === 'file' ? resolvedAvatarSrc : profile.avatarValue;
+      // Relative paths (images/...) cannot be used as img src; wait for resolved data URI.
+      const value = profile.avatarValue;
+      const isDirect = value.slice(0, 64).toLowerCase().startsWith('data:image/')
+        || value.startsWith('http://')
+        || value.startsWith('https://')
+        || value.startsWith('aqbot-media://');
+      const src = profile.avatarType === 'file'
+        ? (resolvedAvatarSrc ?? (isDirect ? value : undefined))
+        : value;
       return <Avatar size={size} src={src} style={{ cursor: 'pointer' }} />;
     }
     return (

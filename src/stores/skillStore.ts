@@ -1,6 +1,27 @@
 import { create } from 'zustand';
 import { invoke } from '@/lib/invoke';
-import type { Skill, SkillDetail, MarketplaceSkill, SkillUpdateInfo } from '@/types';
+import { isResourceFresh } from '@/lib/resourceState';
+import type { EnsureLoadedOptions, ResourceInvalidationReason, ResourceMeta } from '@/lib/resourceState';
+import type { Skill, SkillDetail, MarketplaceSkill, SkillUpdateInfo, SkillInspectReport } from '@/types';
+
+const SKILLS_RESOURCE_KEY = 'skills';
+let skillsRequest: { revision: number; promise: Promise<void> } | null = null;
+
+function marketplaceInstallRef(skill: MarketplaceSkill): string {
+  if (skill.installRef) return skill.installRef;
+  if (skill.skillId) return `${skill.repo}@${skill.skillId}`;
+  return skill.repo;
+}
+
+function mutateSkillsMeta(meta: ResourceMeta): ResourceMeta {
+  const remainsComplete = meta.status === 'ready' && meta.key === SKILLS_RESOURCE_KEY;
+  return {
+    status: remainsComplete ? 'ready' : 'idle',
+    key: remainsComplete ? SKILLS_RESOURCE_KEY : null,
+    loadedAt: remainsComplete ? Date.now() : null,
+    revision: meta.revision + 1,
+  };
+}
 
 interface SkillState {
   skills: Skill[];
@@ -8,7 +29,12 @@ interface SkillState {
   loading: boolean;
   marketplaceLoading: boolean;
   selectedSkill: SkillDetail | null;
+  inspectReport: SkillInspectReport | null;
+  inspectLoading: boolean;
+  skillsMeta: ResourceMeta;
 
+  ensureSkillsLoaded: (options?: EnsureLoadedOptions) => Promise<void>;
+  invalidateSkills: (reason: ResourceInvalidationReason) => void;
   loadSkills: () => Promise<void>;
   getSkill: (name: string, sourcePath?: string) => Promise<void>;
   toggleSkill: (name: string, enabled: boolean) => Promise<void>;
@@ -19,6 +45,7 @@ interface SkillState {
   openSkillDir: (path: string) => Promise<void>;
   searchMarketplace: (query: string, source?: string) => Promise<void>;
   checkUpdates: () => Promise<SkillUpdateInfo[]>;
+  inspectSkills: () => Promise<SkillInspectReport>;
   clearSelectedSkill: () => void;
 }
 
@@ -28,17 +55,72 @@ export const useSkillStore = create<SkillState>((set, get) => ({
   loading: false,
   marketplaceLoading: false,
   selectedSkill: null,
+  inspectReport: null,
+  inspectLoading: false,
+  skillsMeta: { status: 'idle', key: null, loadedAt: null, revision: 0 },
 
-  loadSkills: async () => {
-    set({ loading: true });
-    try {
-      const skills = await invoke<Skill[]>('list_skills');
-      set({ skills, loading: false });
-    } catch (e) {
-      console.error('Failed to load skills:', e);
-      set({ loading: false });
+  ensureSkillsLoaded: async (options = {}) => {
+    const key = SKILLS_RESOURCE_KEY;
+    const state = get();
+    if (!options.force && isResourceFresh(state.skillsMeta, { ...options, key })) return;
+    if (skillsRequest?.revision === state.skillsMeta.revision && !options.force) {
+      return skillsRequest.promise;
     }
+    if (skillsRequest) {
+      await skillsRequest.promise;
+      return get().ensureSkillsLoaded(options);
+    }
+
+    const revision = state.skillsMeta.revision;
+    set((state) => ({
+      loading: true,
+      skillsMeta: { ...state.skillsMeta, status: 'loading', key },
+    }));
+    let promise!: Promise<void>;
+    promise = (async () => {
+      let reloadAfterCompletion = false;
+      try {
+        const skills = await invoke<Skill[]>('list_skills');
+        if (get().skillsMeta.revision !== revision) {
+          reloadAfterCompletion = true;
+          set({ loading: false });
+        } else {
+          set({
+            skills,
+            loading: false,
+            skillsMeta: { status: 'ready', key, loadedAt: Date.now(), revision },
+          });
+        }
+      } catch (e) {
+        console.error('Failed to load skills:', e);
+        if (get().skillsMeta.revision !== revision) {
+          reloadAfterCompletion = true;
+          set({ loading: false });
+        } else {
+          set((current) => ({
+            loading: false,
+            skillsMeta: { ...current.skillsMeta, status: 'error' },
+          }));
+        }
+      } finally {
+        skillsRequest = null;
+      }
+      if (reloadAfterCompletion) await get().ensureSkillsLoaded();
+    })();
+    skillsRequest = { revision, promise };
+    return promise;
   },
+
+  invalidateSkills: (_reason) => set((state) => ({
+    skillsMeta: {
+      status: 'idle',
+      key: null,
+      loadedAt: null,
+      revision: state.skillsMeta.revision + 1,
+    },
+  })),
+
+  loadSkills: () => get().ensureSkillsLoaded({ force: true }),
 
   getSkill: async (name: string, sourcePath?: string) => {
     try {
@@ -50,20 +132,31 @@ export const useSkillStore = create<SkillState>((set, get) => ({
   },
 
   toggleSkill: async (name: string, enabled: boolean) => {
-    set({
-      skills: get().skills.map(s =>
+    set((state) => ({
+      skills: state.skills.map(s =>
         s.name === name ? { ...s, enabled } : s
       ),
-    });
+      skillsMeta: mutateSkillsMeta(state.skillsMeta),
+    }));
     try {
       await invoke('toggle_skill', { name, enabled });
+      set((state) => ({
+        skills: state.skills.map(s =>
+          s.name === name ? { ...s, enabled } : s
+        ),
+        skillsMeta: mutateSkillsMeta(state.skillsMeta),
+      }));
+      void get().inspectSkills().catch((error) => {
+        console.error('Failed to refresh skill availability after toggle:', error);
+      });
     } catch (e) {
       console.error('Failed to toggle skill:', e);
-      set({
-        skills: get().skills.map(s =>
+      set((state) => ({
+        skills: state.skills.map(s =>
           s.name === name ? { ...s, enabled: !enabled } : s
         ),
-      });
+        skillsMeta: mutateSkillsMeta(state.skillsMeta),
+      }));
     }
   },
 
@@ -73,7 +166,9 @@ export const useSkillStore = create<SkillState>((set, get) => ({
     // Mark matching marketplace skill as installed
     set({
       marketplaceSkills: get().marketplaceSkills.map(s =>
-        s.repo === source ? { ...s, installed: true } : s
+        marketplaceInstallRef(s) === source || s.repo === source
+          ? { ...s, installed: true }
+          : s
       ),
     });
     return name;
@@ -81,12 +176,18 @@ export const useSkillStore = create<SkillState>((set, get) => ({
 
   uninstallSkill: async (name: string, sourcePath?: string) => {
     await invoke('uninstall_skill', { name, sourcePath: sourcePath ?? null });
-    set({ skills: get().skills.filter(s => (sourcePath ? s.sourcePath !== sourcePath : s.name !== name)) });
+    set((state) => ({
+      skills: state.skills.filter(s => (sourcePath ? s.sourcePath !== sourcePath : s.name !== name)),
+      skillsMeta: mutateSkillsMeta(state.skillsMeta),
+    }));
   },
 
   uninstallSkillGroup: async (group: string, source?: string) => {
     await invoke('uninstall_skill_group', { group, source: source ?? null });
-    set({ skills: get().skills.filter(s => s.group !== group || (source && s.source !== source)) });
+    set((state) => ({
+      skills: state.skills.filter(s => s.group !== group || (source && s.source !== source)),
+      skillsMeta: mutateSkillsMeta(state.skillsMeta),
+    }));
   },
 
   openSkillsDir: async () => {
@@ -115,6 +216,19 @@ export const useSkillStore = create<SkillState>((set, get) => ({
     } catch (e) {
       console.error('Failed to check updates:', e);
       return [];
+    }
+  },
+
+  inspectSkills: async () => {
+    set({ inspectLoading: true });
+    try {
+      const inspectReport = await invoke<SkillInspectReport>('inspect_skills');
+      set({ inspectReport, inspectLoading: false });
+      return inspectReport;
+    } catch (error) {
+      set({ inspectLoading: false });
+      console.error('Failed to inspect skills:', error);
+      throw error;
     }
   },
 

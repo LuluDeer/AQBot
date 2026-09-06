@@ -14,18 +14,18 @@ interface CertResult {
 export function GatewaySettings() {
   const { t } = useTranslation();
   const { token } = theme.useToken();
-  const { settings, fetchSettings, saveSettings } = useSettingsStore();
-  const { status, fetchStatus, stopGateway } = useGatewayStore();
+  const { settings, ensureSettingsLoaded, saveSettings } = useSettingsStore();
+  const { status, ensureStatusLoaded, fetchStatus, stopGateway } = useGatewayStore();
 
   useEffect(() => {
-    fetchSettings();
-    fetchStatus();
+    void ensureSettingsLoaded();
+    void ensureStatusLoaded({ maxAgeMs: 5_000 });
     const interval = window.setInterval(() => {
       fetchStatus();
     }, 5000);
 
     return () => window.clearInterval(interval);
-  }, [fetchSettings, fetchStatus]);
+  }, [ensureSettingsLoaded, ensureStatusLoaded, fetchStatus]);
 
   const settingsLocked = status.is_running;
 
@@ -209,6 +209,24 @@ export function GatewaySettings() {
           <Switch
             checked={settings.gateway_auto_start ?? false}
             onChange={(checked) => handleSave({ gateway_auto_start: checked })}
+          />
+        </div>
+        <Divider style={{ margin: '4px 0' }} />
+        <div style={{ padding: '4px 0' }} className="flex items-center justify-between gap-4">
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="flex items-center gap-1">
+              <span>{t('gateway.autoModelRouting')}</span>
+              <Tooltip title={t('gateway.autoModelRoutingTooltip')}>
+                <Info size={12} style={{ color: token.colorTextSecondary, cursor: 'help' }} />
+              </Tooltip>
+            </div>
+            <div style={{ fontSize: 12, color: token.colorTextSecondary, marginTop: 4, lineHeight: 1.5 }}>
+              {t('gateway.autoModelRoutingDesc')}
+            </div>
+          </div>
+          <Switch
+            checked={settings.gateway_auto_model_routing ?? false}
+            onChange={(checked) => handleSave({ gateway_auto_model_routing: checked })}
           />
         </div>
       </Card>

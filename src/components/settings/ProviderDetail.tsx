@@ -6,6 +6,7 @@ import {
   Collapse,
   Divider,
   Dropdown,
+  Empty,
   Form,
   Input,
   InputNumber,
@@ -23,20 +24,62 @@ import {
   App,
   theme,
 } from 'antd';
-import { Maximize2, Mic, Lightbulb, Database, Trash2, Eye, EyeOff, Heart, Key, MessageSquare, Plus, RefreshCw, Search, Settings, Minimize2, Wrench, Undo2, CircleHelp, ChevronRight, ChevronDown, Expand, Shrink, SquarePen, ListChecks, X, Power, PowerOff, Pencil, ImagePlus, ListFilter } from 'lucide-react';
-import { ModelIcon } from '@lobehub/icons';
+import { Maximize2, Mic, Lightbulb, Database, Trash2, Eye, EyeOff, Heart, Key, MessageSquare, Plus, RefreshCw, Search, Settings, Minimize2, Wrench, Undo2, CircleHelp, ChevronRight, ChevronDown, Expand, Shrink, SquarePen, ListChecks, X, Power, PowerOff, Pencil, ImagePlus, ListFilter, ExternalLink } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
 import { useProviderStore, useUIStore } from '@/stores';
-import { SmartProviderIcon } from '@/lib/providerIcons';
+import { SmartModelIcon, SmartProviderIcon } from '@/lib/providerIcons';
+import { encodeProviderIcon, parseProviderIcon } from '@/lib/providerIconCodec';
 import { getEditableCapabilities, getVisibleModelCapabilities, sanitizeModelCapabilities } from '@/lib/modelCapabilities';
 import { IconEditor } from '@/components/shared/IconEditor';
 import { DynamicLobeIcon } from '@/components/shared/DynamicLobeIcon';
-import type { Model, ModelCapability, ModelType, ModelParamOverrides, ProviderType } from '@/types';
+import type {
+  ImageAdapterConfig,
+  Model,
+  ModelCapability,
+  ModelCatalogStatus,
+  ModelSyncCandidate,
+  ModelType,
+  ModelParamOverrides,
+  ProviderType,
+  BedrockCredentialInput,
+} from '@/types';
 import { ModelParamSliders } from '@/components/common/ModelParamSliders';
 import { CopyButton } from '@/components/common/CopyButton';
+import { ImageProtocolEditor } from './ImageProtocolEditor';
+import {
+  ModelMetadataSyncModal,
+  type ModelMetadataField,
+} from './ModelMetadataSyncModal';
+import { ModelSyncPickerModal, type ModelSyncEntry } from './ModelSyncPickerModal';
+import { deriveModelGroupName, formatTokenCount, getModelGroupName } from '@/lib/modelSync';
+import {
+  compareModelGroupThenVersionDesc,
+  sortGroupKeysByVersionDesc,
+  sortModelsByVersionDesc,
+} from '@/lib/modelVersionSort';
+import { getBuiltinProviderWebsite, openExternalUrl } from '@/lib/providerWebsites';
+import {
+  AWS_REGION_OPTIONS,
+  DEFAULT_HOSTS,
+  DEFAULT_PATHS,
+  DEFAULT_VERSIONS,
+  getProviderDefaultHost,
+  EMPTY_BEDROCK_CREDENTIALS,
+  REASONING_PROFILE_OPTIONS,
+  REASONING_PROFILE_POPUP_WIDTH,
+  REASONING_PROFILE_SELECT_WIDTH,
+  formatExtraBody,
+  getDefaultCapabilitiesForType,
+  hasUserMetadata,
+  metadataStateWithAutomaticFields,
+  metadataStateWithUserFields,
+  normalizeReasoningProfile,
+  parseExtraBodyInput,
+  sameCapabilities,
+} from './providerDetailModel';
 
 const { Text, Title } = Typography;
 
@@ -80,202 +123,7 @@ const MODEL_TYPE_CONFIG: Record<ModelType, { color: string; icon: React.ReactNod
   Rerank: { color: 'purple', icon: <ListFilter size={12} /> },
 };
 
-const MODEL_SYNC_STATUS_CONFIG: Record<ModelSyncStatus, { color: string; labelKey: string }> = {
-  synced: { color: 'blue', labelKey: 'settings.modelAlreadyAdded' },
-  'local-only': { color: 'gold', labelKey: 'settings.remoteMissing' },
-  'remote-only': { color: 'green', labelKey: 'settings.remoteAvailable' },
-};
-
-const DEFAULT_PATHS: Record<ProviderType, string> = {
-  openai: '/v1/chat/completions',
-  openai_responses: '/v1/responses',
-  deepseek: '/v1/chat/completions',
-  xai: '/v1/chat/completions',
-  glm: '/v4/chat/completions',
-  siliconflow: '/v1/chat/completions',
-  anthropic: '/v1/messages',
-  gemini: '/v1beta/models',
-  jina: '/v1/rerank',
-  cohere: '/v2/rerank',
-  voyage: '/v1/rerank',
-  custom: '/v1/chat/completions',
-};
-
-const DEFAULT_HOSTS: Record<ProviderType, string> = {
-  openai: 'https://api.openai.com',
-  openai_responses: 'https://api.openai.com',
-  deepseek: 'https://api.deepseek.com',
-  xai: 'https://api.x.ai',
-  glm: 'https://open.bigmodel.cn/api/paas',
-  siliconflow: 'https://api.siliconflow.cn',
-  anthropic: 'https://api.anthropic.com',
-  gemini: 'https://generativelanguage.googleapis.com',
-  jina: 'https://api.jina.ai',
-  cohere: 'https://api.cohere.com',
-  voyage: 'https://api.voyageai.com',
-  custom: '',
-};
-
-const DEFAULT_VERSIONS: Record<ProviderType, string> = {
-  openai: '/v1',
-  openai_responses: '/v1',
-  deepseek: '/v1',
-  xai: '/v1',
-  glm: '/v4',
-  siliconflow: '/v1',
-  anthropic: '/v1',
-  gemini: '/v1beta',
-  jina: '/v1',
-  cohere: '/v2',
-  voyage: '/v1',
-  custom: '/v1',
-};
-
-const REASONING_PROFILE_OPTIONS = [
-  { value: 'reasoning_effort', label: '自动匹配（推荐）' },
-  { value: 'openai_reasoning_effort', label: 'OpenAI Chat' },
-  { value: 'openai_responses_reasoning', label: 'OpenAI Responses' },
-  { value: 'glm_thinking', label: 'GLM thinking' },
-  { value: 'gemini_thinking_level', label: 'Gemini thinkingLevel' },
-  { value: 'gemini_thinking_budget', label: 'Gemini thinkingBudget' },
-  { value: 'anthropic_adaptive', label: 'Claude adaptive' },
-  { value: 'anthropic_budget_tokens', label: 'Claude budget_tokens' },
-  { value: 'enable_thinking', label: 'SiliconFlow enable_thinking' },
-  { value: 'none', label: 'none' },
-];
-
-const REASONING_PROFILE_SELECT_WIDTH = 260;
-const REASONING_PROFILE_POPUP_WIDTH = 320;
-
-function normalizeReasoningProfile(value: string): string | undefined {
-  return value === 'reasoning_effort' ? undefined : value;
-}
-
-const RESERVED_EXTRA_BODY_FIELDS = new Set([
-  'model',
-  'messages',
-  'stream',
-  'stream_options',
-  'tools',
-  'temperature',
-  'top_p',
-  'max_tokens',
-  'max_completion_tokens',
-  'reasoning_effort',
-]);
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function formatExtraBody(extraBody: ModelParamOverrides['extra_body']): string {
-  if (!extraBody || Object.keys(extraBody).length === 0) return '';
-  return JSON.stringify(extraBody, null, 2);
-}
-
-function parseExtraBodyInput(text: string): { value?: Record<string, unknown>; errorKey?: string } {
-  const trimmed = text.trim();
-  if (!trimmed) return {};
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return { errorKey: 'settings.extraBodyJsonError' };
-  }
-
-  if (!isJsonObject(parsed)) {
-    return { errorKey: 'settings.extraBodyObjectError' };
-  }
-
-  const reservedField = Object.keys(parsed).find((key) => RESERVED_EXTRA_BODY_FIELDS.has(key));
-  if (reservedField) {
-    return { errorKey: 'settings.extraBodyReservedError' };
-  }
-
-  return Object.keys(parsed).length > 0 ? { value: parsed } : {};
-}
-
 type KeyModalMode = 'add' | 'edit';
-type ModelSyncStatus = 'synced' | 'local-only' | 'remote-only';
-
-interface ModelSyncEntry {
-  model: Model;
-  localModel: Model | null;
-  remoteModel: Model | null;
-  status: ModelSyncStatus;
-}
-
-function deriveModelGroupName(modelId: string): string {
-  const parts = modelId
-    .trim()
-    .split('-')
-    .filter((part) => part.length > 0);
-
-  if (parts.length >= 2) return parts.slice(0, 2).join('-');
-  if (parts.length === 1) return parts[0];
-  return modelId.trim();
-}
-
-function getModelGroupName(model: Pick<Model, 'model_id' | 'group_name'>): string {
-  const explicitGroup = model.group_name?.trim();
-  return explicitGroup || deriveModelGroupName(model.model_id);
-}
-
-function formatTokenCount(tokens: number): string {
-  if (tokens >= 1000000) {
-    const m = tokens / 1000000;
-    return m % 1 === 0 ? `${m}M` : `${m.toFixed(1)}M`;
-  }
-  if (tokens >= 1000) {
-    const k = tokens / 1000;
-    return k % 1 === 0 ? `${k}K` : `${k.toFixed(1)}K`;
-  }
-  return `${tokens}`;
-}
-
-function getDefaultCapabilitiesForType(modelType: ModelType): ModelCapability[] {
-  switch (modelType) {
-    case 'Voice':
-      return ['RealtimeVoice'];
-    case 'Embedding':
-    case 'Image':
-    case 'Rerank':
-      return [];
-    case 'Chat':
-    default:
-      return ['TextChat'];
-  }
-}
-
-function buildModelSyncEntries(localModels: Model[], remoteModels: Model[]): ModelSyncEntry[] {
-  const localById = new Map(localModels.map((model) => [model.model_id, model]));
-  const remoteById = new Map(remoteModels.map((model) => [model.model_id, model]));
-  const ids = Array.from(new Set([...localById.keys(), ...remoteById.keys()]));
-
-  return ids
-    .map((modelId) => {
-      const localModel = localById.get(modelId) ?? null;
-      const remoteModel = remoteById.get(modelId) ?? null;
-      const model = localModel ?? remoteModel!;
-      const status: ModelSyncStatus = localModel && remoteModel
-        ? 'synced'
-        : localModel
-          ? 'local-only'
-          : 'remote-only';
-
-      return {
-        model,
-        localModel,
-        remoteModel,
-        status,
-      };
-    })
-    .sort((a, b) =>
-      getModelGroupName(a.model).localeCompare(getModelGroupName(b.model))
-      || (a.model.name || a.model.model_id).localeCompare(b.model.name || b.model.model_id),
-    );
-}
 
 interface ProviderDetailProps {
   providerId: string;
@@ -289,25 +137,34 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   const provider = useProviderStore((s) =>
     s.providers.find((p) => p.id === providerId),
   );
+  const isBedrock = provider?.provider_type === 'bedrock';
   const toggleProvider = useProviderStore((s) => s.toggleProvider);
   const updateProvider = useProviderStore((s) => s.updateProvider);
   const deleteProvider = useProviderStore((s) => s.deleteProvider);
   const setSelectedProviderId = useUIStore((s) => s.setSelectedProviderId);
   const addProviderKey = useProviderStore((s) => s.addProviderKey);
   const updateProviderKey = useProviderStore((s) => s.updateProviderKey);
+  const addBedrockCredentials = useProviderStore((s) => s.addBedrockCredentials);
+  const updateBedrockCredentials = useProviderStore((s) => s.updateBedrockCredentials);
   const deleteProviderKey = useProviderStore((s) => s.deleteProviderKey);
   const toggleProviderKey = useProviderStore((s) => s.toggleProviderKey);
   const validateProviderKey = useProviderStore((s) => s.validateProviderKey);
   const toggleModel = useProviderStore((s) => s.toggleModel);
-  const updateModelParams = useProviderStore((s) => s.updateModelParams);
   const fetchRemoteModels = useProviderStore((s) => s.fetchRemoteModels);
   const saveModels = useProviderStore((s) => s.saveModels);
+  const inferModelMetadata = useProviderStore((s) => s.inferModelMetadata);
+  const applyModelSync = useProviderStore((s) => s.applyModelSync);
+  const updateModelMetadata = useProviderStore((s) => s.updateModelMetadata);
+  const resetModelMetadata = useProviderStore((s) => s.resetModelMetadata);
   const testModel = useProviderStore((s) => s.testModel);
 
   const [keyModalOpen, setKeyModalOpen] = useState(false);
   const [keyModalMode, setKeyModalMode] = useState<KeyModalMode>('add');
   const [activeKeyId, setActiveKeyId] = useState<string | null>(null);
   const [keyValue, setKeyValue] = useState('');
+  const [bedrockCredentials, setBedrockCredentials] = useState<BedrockCredentialInput>(
+    EMPTY_BEDROCK_CREDENTIALS,
+  );
   const [keyModalLoading, setKeyModalLoading] = useState(false);
   const [keyModalSubmitting, setKeyModalSubmitting] = useState(false);
   const [revealedKeys, setRevealedKeys] = useState<Record<string, string>>({});
@@ -321,26 +178,43 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   const [addModelName, setAddModelName] = useState('');
   const [addModelGroupName, setAddModelGroupName] = useState('');
   const [addModelType, setAddModelType] = useState<ModelType>('Chat');
+  const [addModelPreview, setAddModelPreview] = useState<ModelSyncCandidate | null>(null);
+  const [addModelInferring, setAddModelInferring] = useState(false);
   const addModelNameDirty = useRef(false);
   const addModelGroupDirty = useRef(false);
+  const addModelTypeDirty = useRef(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<Model | null>(null);
   const [editCapabilities, setEditCapabilities] = useState<ModelCapability[]>([]);
   const [editModelType, setEditModelType] = useState<ModelType>('Chat');
-  const [editMaxTokens, setEditMaxTokens] = useState<number | null>(null);
+  const [editContextWindow, setEditContextWindow] = useState<number | null>(null);
+  const [editMaxOutputTokens, setEditMaxOutputTokens] = useState<number | null>(null);
   const [editTemperature, setEditTemperature] = useState<number | null>(null);
   const [editMaxTokensParam, setEditMaxTokensParam] = useState<number | null>(null);
   const [editTopP, setEditTopP] = useState<number | null>(null);
   const [editFreqPenalty, setEditFreqPenalty] = useState<number | null>(null);
   const [editUseMaxCompletionTokens, setEditUseMaxCompletionTokens] = useState(false);
-  const [editNoSystemRole, setEditNoSystemRole] = useState(false);
+  const [editNoSystemRole, setEditNoSystemRole] = useState<boolean | null>(null);
+  const [editOmitSamplingParams, setEditOmitSamplingParams] = useState<boolean | null>(null);
+  const [editReasoningOptions, setEditReasoningOptions] = useState<string[] | null>(null);
   const [editForceMaxTokens, setEditForceMaxTokens] = useState(false);
   const [editThinkingParamStyle, setEditThinkingParamStyle] = useState<string>('reasoning_effort');
   const [editExtraBody, setEditExtraBody] = useState('');
   const [editExtraBodyError, setEditExtraBodyError] = useState<string | null>(null);
+  const [editImageConfig, setEditImageConfig] = useState<ImageAdapterConfig | null>(null);
+  const [editAliases, setEditAliases] = useState<string[]>([]);
+  const [editAliasInput, setEditAliasInput] = useState('');
+  const [editMetadataDirty, setEditMetadataDirty] = useState<Set<ModelMetadataField>>(new Set());
+
+  const [editMetadataAutomatic, setEditMetadataAutomatic] = useState<Set<ModelMetadataField>>(new Set());
+  const [metadataSyncModalOpen, setMetadataSyncModalOpen] = useState(false);
+  const [metadataSyncLoading, setMetadataSyncLoading] = useState(false);
+  const [metadataSyncCurrent, setMetadataSyncCurrent] = useState<Model | null>(null);
+  const [metadataSyncCandidate, setMetadataSyncCandidate] = useState<ModelSyncCandidate | null>(null);
   const [iconOverrides, setIconOverrides] = useState<Record<string, string>>({});
   const [apiHostLocal, setApiHostLocal] = useState(provider?.api_host ?? '');
   const [apiPathLocal, setApiPathLocal] = useState(provider?.api_path ?? '');
+  const [awsRegionLocal, setAwsRegionLocal] = useState(provider?.aws_region ?? '');
   const [customHeadersLocal, setCustomHeadersLocal] = useState(() => {
     try {
       const obj = JSON.parse(provider?.custom_headers ?? '{}') as Record<string, string>;
@@ -349,6 +223,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   });
   const apiHostTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const apiPathTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const awsRegionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [testingModels, setTestingModels] = useState<Set<string>>(new Set());
   const [testResults, setTestResults] = useState<Map<string, { latencyMs?: number; error?: string }>>(new Map());
   const [singleTestModalOpen, setSingleTestModalOpen] = useState(false);
@@ -357,12 +232,11 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   const [singleTestLoading, setSingleTestLoading] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerModels, setPickerModels] = useState<ModelSyncEntry[]>([]);
-  const [pickerSelected, setPickerSelected] = useState<Set<string>>(new Set());
-  const [pickerSearch, setPickerSearch] = useState('');
-  const [pickerCollapsed, setPickerCollapsed] = useState<Set<string>>(new Set());
+  const [pickerCatalog, setPickerCatalog] = useState<ModelCatalogStatus | null>(null);
   const [providerEditModalOpen, setProviderEditModalOpen] = useState(false);
   const [editProviderName, setEditProviderName] = useState('');
   const [editProviderType, setEditProviderType] = useState<ProviderType>('openai');
+  const [editAwsRegion, setEditAwsRegion] = useState('');
 
   // Batch editing state
   const [batchMode, setBatchMode] = useState(false);
@@ -373,8 +247,8 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   const [batchModelTypeEnabled, setBatchModelTypeEnabled] = useState(false);
   const [batchCapabilities, setBatchCapabilities] = useState<ModelCapability[]>(['TextChat']);
   const [batchCapabilitiesEnabled, setBatchCapabilitiesEnabled] = useState(false);
-  const [batchMaxTokens, setBatchMaxTokens] = useState<number>(128000);
-  const [batchMaxTokensEnabled, setBatchMaxTokensEnabled] = useState(false);
+  const [batchContextWindow, setBatchContextWindow] = useState<number>(128000);
+  const [batchContextWindowEnabled, setBatchContextWindowEnabled] = useState(false);
   const [batchTemperature, setBatchTemperature] = useState<number>(0.7);
   const [batchTemperatureEnabled, setBatchTemperatureEnabled] = useState(false);
   const [batchTopP, setBatchTopP] = useState<number>(1.0);
@@ -392,63 +266,11 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   const [batchThinkingParamStyle, setBatchThinkingParamStyle] = useState<string>('reasoning_effort');
   const [batchThinkingParamStyleEnabled, setBatchThinkingParamStyleEnabled] = useState(false);
 
-  const pickerGroups = useMemo(() => {
-    const filtered = pickerModels.filter(({ model }) =>
-      !pickerSearch || [model.name, model.model_id].some((v) => v.toLowerCase().includes(pickerSearch.toLowerCase())),
-    );
-    const groups: Record<string, ModelSyncEntry[]> = {};
-    for (const entry of filtered) {
-      const key = getModelGroupName(entry.model);
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(entry);
-    }
-    return { filtered, entries: Object.entries(groups) };
-  }, [pickerModels, pickerSearch]);
-
-  // Flatten picker groups into virtual rows
-  type PickerRow =
-    | { type: 'group'; group: string; models: ModelSyncEntry[] }
-    | { type: 'model'; item: ModelSyncEntry }
-    | { type: 'spacer'; beforeGroup: string };
-  const flatPickerRows = useMemo<PickerRow[]>(() => {
-    const rows: PickerRow[] = [];
-    const entries = pickerGroups.entries;
-    for (let i = 0; i < entries.length; i++) {
-      const [group, models] = entries[i];
-      if (i > 0) rows.push({ type: 'spacer', beforeGroup: group });
-      rows.push({ type: 'group', group, models });
-      if (!pickerCollapsed.has(group)) {
-        for (const item of models) {
-          rows.push({ type: 'model', item });
-        }
-      }
-    }
-    return rows;
-  }, [pickerGroups.entries, pickerCollapsed]);
-
-  const pickerListParentRef = useRef<HTMLDivElement>(null);
-  const pickerVirtualizer = useVirtualizer({
-    count: flatPickerRows.length,
-    getScrollElement: () => pickerListParentRef.current,
-    estimateSize: (index) => {
-      const row = flatPickerRows[index];
-      if (row.type === 'spacer') return 8;
-      if (row.type === 'group') return 40;
-      return 40;
-    },
-    getItemKey: (index) => {
-      const row = flatPickerRows[index];
-      if (row.type === 'spacer') return `spacer-${row.beforeGroup}`;
-      if (row.type === 'group') return `group-${row.group}`;
-      return `model-${row.item.model.model_id}`;
-    },
-    overscan: 15,
-  });
-
   // Sync local state when provider changes (e.g. switching providers)
   useEffect(() => {
     setApiHostLocal(provider?.api_host ?? '');
     setApiPathLocal(provider?.api_path ?? '');
+    setAwsRegionLocal(provider?.aws_region ?? '');
     setRevealedKeys({});
     setRevealingKeys(new Set());
     try {
@@ -460,8 +282,14 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   // Resolve actual request URLs for preview
   const resolvedUrls = useMemo(() => {
     const providerType = provider?.provider_type ?? 'custom';
-    const host = apiHostLocal || DEFAULT_HOSTS[providerType] || '';
+    const host = apiHostLocal || getProviderDefaultHost({
+      builtin_id: provider?.builtin_id,
+      provider_type: providerType,
+    });
     const path = apiPathLocal || DEFAULT_PATHS[providerType] || '';
+    if (!host.trim()) {
+      return { resolvedBase: '', chatUrl: '', modelsUrl: '' };
+    }
 
     const defaultVersion = DEFAULT_VERSIONS[providerType];
 
@@ -501,7 +329,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     const modelsUrl = `${resolvedBase.replace(/\/+$/, '')}/models`;
 
     return { resolvedBase, chatUrl, modelsUrl };
-  }, [apiHostLocal, apiPathLocal, provider?.provider_type]);
+  }, [apiHostLocal, apiPathLocal, provider?.builtin_id, provider?.provider_type]);
 
   const filteredModels = useMemo(
     () =>
@@ -518,16 +346,78 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     setAddModelName('');
     setAddModelGroupName(groupName ?? '');
     setAddModelType('Chat');
+    setAddModelPreview(null);
+    setAddModelInferring(false);
     addModelNameDirty.current = false;
     addModelGroupDirty.current = !!groupName;
+    addModelTypeDirty.current = false;
     setAddModelModalOpen(true);
   }, []);
+
+  useEffect(() => {
+    const modelId = addModelId.trim();
+    if (!addModelModalOpen || !modelId) {
+      setAddModelPreview(null);
+      setAddModelInferring(false);
+      return;
+    }
+    if (provider?.provider_type === 'bedrock') {
+      setAddModelType('Chat');
+      setAddModelPreview(null);
+      setAddModelInferring(false);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setAddModelInferring(true);
+      try {
+        const preview = await inferModelMetadata(providerId, {
+          provider_id: providerId,
+          model_id: modelId,
+          name: addModelName.trim() || modelId,
+          group_name: addModelGroupName.trim() || deriveModelGroupName(modelId),
+          model_type: addModelType,
+          capabilities: getDefaultCapabilitiesForType(addModelType),
+          context_window: null,
+          max_output_tokens: null,
+          enabled: true,
+          param_overrides: null,
+          metadata_state: null,
+          aliases: [],
+        });
+        if (!cancelled) {
+          setAddModelPreview(preview);
+          if (!addModelTypeDirty.current) {
+            setAddModelType(preview.proposed_model.model_type);
+          }
+        }
+      } catch {
+        if (!cancelled) setAddModelPreview(null);
+      } finally {
+        if (!cancelled) setAddModelInferring(false);
+      }
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    addModelGroupName,
+    addModelId,
+    addModelModalOpen,
+    addModelName,
+    addModelType,
+    inferModelMetadata,
+    provider?.provider_type,
+    providerId,
+  ]);
 
   const resetKeyModal = useCallback(() => {
     setKeyModalOpen(false);
     setKeyModalMode('add');
     setActiveKeyId(null);
     setKeyValue('');
+    setBedrockCredentials(EMPTY_BEDROCK_CREDENTIALS);
     setKeyModalLoading(false);
     setKeyModalSubmitting(false);
   }, []);
@@ -536,6 +426,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     setKeyModalMode('add');
     setActiveKeyId(null);
     setKeyValue('');
+    setBedrockCredentials(EMPTY_BEDROCK_CREDENTIALS);
     setKeyModalLoading(false);
     setKeyModalOpen(true);
   }, []);
@@ -571,17 +462,47 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     setKeyModalLoading(true);
     setKeyModalOpen(true);
     try {
-      const raw = await invoke<string>('get_decrypted_provider_key', { keyId });
-      setKeyValue(raw);
+      if (isBedrock) {
+        const credentials = await invoke<BedrockCredentialInput>(
+          'get_decrypted_bedrock_credentials',
+          { keyId },
+        );
+        setBedrockCredentials(credentials);
+      } else {
+        const raw = await invoke<string>('get_decrypted_provider_key', { keyId });
+        setKeyValue(raw);
+      }
     } catch (e) {
       resetKeyModal();
       message.error(t('error.loadFailed') + ': ' + String(e));
     } finally {
       setKeyModalLoading(false);
     }
-  }, [message, resetKeyModal, t]);
+  }, [isBedrock, message, resetKeyModal, t]);
 
   const handleSubmitKey = useCallback(async () => {
+    if (isBedrock) {
+      const credentials = {
+        access_key_id: bedrockCredentials.access_key_id.trim(),
+        secret_access_key: bedrockCredentials.secret_access_key.trim(),
+        session_token: bedrockCredentials.session_token?.trim() || null,
+      };
+      if (!credentials.access_key_id || !credentials.secret_access_key || keyModalLoading) return;
+      setKeyModalSubmitting(true);
+      try {
+        if (keyModalMode === 'add') {
+          await addBedrockCredentials(providerId, credentials);
+        } else if (keyModalMode === 'edit' && activeKeyId) {
+          await updateBedrockCredentials(activeKeyId, credentials);
+        }
+        resetKeyModal();
+      } catch {
+        message.error(t('error.saveFailed'));
+      } finally {
+        setKeyModalSubmitting(false);
+      }
+      return;
+    }
     const nextValue = keyValue.trim();
     if (!nextValue || keyModalLoading) return;
     setKeyModalSubmitting(true);
@@ -598,7 +519,22 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     } finally {
       setKeyModalSubmitting(false);
     }
-  }, [activeKeyId, addProviderKey, keyModalLoading, keyModalMode, keyValue, message, providerId, resetKeyModal, t, updateProviderKey]);
+  }, [
+    activeKeyId,
+    addBedrockCredentials,
+    addProviderKey,
+    bedrockCredentials,
+    isBedrock,
+    keyModalLoading,
+    keyModalMode,
+    keyValue,
+    message,
+    providerId,
+    resetKeyModal,
+    t,
+    updateBedrockCredentials,
+    updateProviderKey,
+  ]);
 
   const handleValidateKey = useCallback(
     async (keyId: string) => {
@@ -624,15 +560,23 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   );
 
   const handleRefreshModels = useCallback(async () => {
+    if (!isBedrock && !apiHostLocal.trim()) {
+      message.error(t('settings.noApiHostError'));
+      return;
+    }
     setRefreshing(true);
     try {
-      const remoteModels = await fetchRemoteModels(providerId);
-      const localModels = provider?.models ?? [];
-      const syncEntries = buildModelSyncEntries(localModels, remoteModels);
+      const result = await fetchRemoteModels(providerId);
+      const syncEntries = result.candidates
+        .map((candidate) => ({ ...candidate, model: candidate.proposed_model }))
+        .sort((a, b) =>
+          compareModelGroupThenVersionDesc(
+            { group: getModelGroupName(a.model), id: a.model.model_id },
+            { group: getModelGroupName(b.model), id: b.model.model_id },
+          ),
+        );
       setPickerModels(syncEntries);
-      setPickerSelected(new Set(localModels.map((m) => m.model_id)));
-      setPickerSearch('');
-      setPickerCollapsed(new Set());
+      setPickerCatalog(result.catalog);
       setPickerOpen(true);
     } catch (e) {
       const errMsg = String(e);
@@ -644,24 +588,17 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     } finally {
       setRefreshing(false);
     }
-  }, [providerId, fetchRemoteModels, provider?.models, message, t]);
+  }, [apiHostLocal, isBedrock, providerId, fetchRemoteModels, message, t]);
 
-  const handlePickerConfirm = useCallback(async () => {
-    const selectedModels = pickerModels
-      .filter(({ model }) => pickerSelected.has(model.model_id))
-      .map((entry) => entry.localModel ?? entry.remoteModel ?? entry.model);
-    if (selectedModels.length === 0) {
-      setPickerOpen(false);
-      return;
-    }
+  const handlePickerApply = useCallback(async (models: Model[]) => {
     try {
-      await saveModels(providerId, selectedModels);
+      await applyModelSync(providerId, models);
       message.success(t('settings.modelSyncApplied'));
     } catch {
       message.error(t('error.saveFailed'));
     }
     setPickerOpen(false);
-  }, [pickerModels, pickerSelected, providerId, saveModels, message, t]);
+  }, [providerId, applyModelSync, message, t]);
 
   const handleTestSingleModel = useCallback(async () => {
     if (!singleTestModelId) return;
@@ -731,28 +668,48 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     }
 
     const nextModel: Model = {
+      ...(addModelPreview?.proposed_model ?? {
+        provider_id: providerId,
+        model_id: nextModelId,
+        name: nextModelName || nextModelId,
+        group_name: null,
+        model_type: addModelType,
+        capabilities: getDefaultCapabilitiesForType(addModelType),
+        context_window: null,
+        max_output_tokens: null,
+        enabled: true,
+        param_overrides: null,
+        metadata_state: null,
+        aliases: [],
+      }),
       provider_id: providerId,
       model_id: nextModelId,
       name: nextModelName || nextModelId,
       group_name: manualGroupName || deriveModelGroupName(nextModelId),
       model_type: addModelType,
-      capabilities: getDefaultCapabilitiesForType(addModelType),
-      max_tokens: null,
-      enabled: true,
-      param_overrides: null,
+      capabilities: addModelTypeDirty.current
+        ? getDefaultCapabilitiesForType(addModelType)
+        : (addModelPreview?.proposed_model.capabilities
+          ?? getDefaultCapabilitiesForType(addModelType)),
+      aliases: addModelPreview?.proposed_model.aliases ?? [],
     };
 
     try {
-      await saveModels(providerId, [...(provider?.models ?? []), nextModel]);
+      await updateModelMetadata(
+        providerId,
+        nextModel,
+        addModelTypeDirty.current ? ['model_type', 'capabilities'] : [],
+      );
       setAddModelModalOpen(false);
       setAddModelId('');
       setAddModelName('');
       setAddModelGroupName('');
       setAddModelType('Chat');
+      setAddModelPreview(null);
     } catch {
       message.error(t('error.saveFailed'));
     }
-  }, [addModelGroupName, addModelId, addModelName, addModelType, message, provider?.models, providerId, saveModels, t]);
+  }, [addModelGroupName, addModelId, addModelName, addModelPreview, addModelType, message, provider?.models, providerId, t, updateModelMetadata]);
 
   const handleOpenSettings = useCallback(
     (model: Model) => {
@@ -760,59 +717,212 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       const nextModelType = model.model_type || 'Chat';
       setEditCapabilities(sanitizeModelCapabilities(nextModelType, model.capabilities));
       setEditModelType(nextModelType);
-      setEditMaxTokens(model.max_tokens ?? 128000);
+      setEditContextWindow(model.context_window);
+      setEditMaxOutputTokens(model.max_output_tokens ?? null);
       setEditTemperature(model.param_overrides?.temperature ?? null);
       setEditMaxTokensParam(model.param_overrides?.max_tokens ?? null);
       setEditTopP(model.param_overrides?.top_p ?? null);
       setEditFreqPenalty(model.param_overrides?.frequency_penalty ?? null);
       setEditUseMaxCompletionTokens(model.param_overrides?.use_max_completion_tokens ?? false);
-      setEditNoSystemRole(model.param_overrides?.no_system_role ?? false);
+      setEditNoSystemRole(model.param_overrides?.no_system_role ?? null);
+      setEditOmitSamplingParams(model.param_overrides?.omit_sampling_params ?? null);
+      setEditReasoningOptions(model.param_overrides?.reasoning_options ?? null);
       setEditForceMaxTokens(model.param_overrides?.force_max_tokens ?? false);
       setEditThinkingParamStyle(model.param_overrides?.reasoning_profile ?? model.param_overrides?.thinking_param_style ?? 'reasoning_effort');
       setEditExtraBody(formatExtraBody(model.param_overrides?.extra_body));
       setEditExtraBodyError(null);
+      setEditImageConfig(model.image_config ?? null);
+      setEditAliases(model.aliases ?? []);
+      setEditAliasInput('');
+      setEditMetadataDirty(new Set());
+      setEditMetadataAutomatic(new Set());
+      setMetadataSyncModalOpen(false);
+      setMetadataSyncCurrent(null);
+      setMetadataSyncCandidate(null);
       setSettingsModalOpen(true);
     },
     [],
   );
 
+  const markMetadataManual = useCallback((...fields: ModelMetadataField[]) => {
+    setEditMetadataDirty((current) => {
+      const next = new Set(current);
+      fields.forEach((field) => next.add(field));
+      return next;
+    });
+    setEditMetadataAutomatic((current) => {
+      const next = new Set(current);
+      fields.forEach((field) => next.delete(field));
+      return next;
+    });
+  }, []);
+
+  const buildMetadataDraft = useCallback((): Model | null => {
+    if (!editingModel) return null;
+    const paramOverrides: ModelParamOverrides = {
+      ...(editingModel.param_overrides ?? {}),
+      no_system_role: editNoSystemRole ?? undefined,
+      omit_sampling_params: editOmitSamplingParams ?? undefined,
+      reasoning_options: editReasoningOptions ?? undefined,
+    };
+    return {
+      ...editingModel,
+      model_type: editModelType,
+      capabilities: sanitizeModelCapabilities(editModelType, editCapabilities),
+      context_window: editContextWindow,
+      max_output_tokens: editMaxOutputTokens,
+      param_overrides: paramOverrides,
+      metadata_state: metadataStateWithUserFields(
+        editingModel.metadata_state,
+        editMetadataDirty,
+      ),
+    };
+  }, [
+    editingModel,
+    editModelType,
+    editCapabilities,
+    editContextWindow,
+    editMaxOutputTokens,
+    editNoSystemRole,
+    editOmitSamplingParams,
+    editReasoningOptions,
+    editMetadataDirty,
+  ]);
+
+  const handleOpenMetadataSync = useCallback(async () => {
+    const current = buildMetadataDraft();
+    if (!current) return;
+    setMetadataSyncCurrent(current);
+    setMetadataSyncCandidate(null);
+    setMetadataSyncModalOpen(true);
+    setMetadataSyncLoading(true);
+    try {
+      const candidate = await inferModelMetadata(providerId, current, true);
+      setMetadataSyncCandidate(candidate);
+    } catch {
+      setMetadataSyncModalOpen(false);
+      message.error(t('error.loadFailed'));
+    } finally {
+      setMetadataSyncLoading(false);
+    }
+  }, [buildMetadataDraft, inferModelMetadata, message, providerId, t]);
+
+  const handleApplyMetadataSync = useCallback((fields: ModelMetadataField[]) => {
+    const automatic = metadataSyncCandidate?.proposed_model;
+    if (!editingModel || !automatic || fields.length === 0) return;
+    const selected = new Set(fields);
+    const finalType = selected.has('model_type') ? automatic.model_type : editModelType;
+    const finalCapabilities = selected.has('capabilities')
+      ? sanitizeModelCapabilities(finalType, automatic.capabilities)
+      : sanitizeModelCapabilities(finalType, editCapabilities);
+    const capabilitiesChangedByType = selected.has('model_type')
+      && !selected.has('capabilities')
+      && !sameCapabilities(finalCapabilities, editCapabilities);
+
+    setEditModelType(finalType);
+    setEditCapabilities(finalCapabilities);
+    if (selected.has('context_window')) setEditContextWindow(automatic.context_window);
+    if (selected.has('max_output_tokens')) {
+      setEditMaxOutputTokens(automatic.max_output_tokens ?? null);
+    }
+    if (selected.has('no_system_role')) {
+      setEditNoSystemRole(automatic.param_overrides?.no_system_role ?? null);
+    }
+    if (selected.has('omit_sampling_params')) {
+      setEditOmitSamplingParams(automatic.param_overrides?.omit_sampling_params ?? null);
+    }
+    if (selected.has('reasoning_options')) {
+      setEditReasoningOptions(automatic.param_overrides?.reasoning_options ?? []);
+    }
+
+    setEditingModel((current) => current
+      ? {
+          ...current,
+          metadata_state: metadataStateWithAutomaticFields(
+            current.metadata_state,
+            automatic.metadata_state,
+            fields,
+          ),
+        }
+      : current);
+    setEditMetadataDirty((current) => {
+      const next = new Set(current);
+      fields.forEach((field) => next.delete(field));
+      if (capabilitiesChangedByType) next.add('capabilities');
+      return next;
+    });
+    setEditMetadataAutomatic((current) => {
+      const next = new Set(current);
+      fields.forEach((field) => next.add(field));
+      if (capabilitiesChangedByType) next.delete('capabilities');
+      return next;
+    });
+    setMetadataSyncModalOpen(false);
+  }, [editCapabilities, editModelType, editingModel, metadataSyncCandidate]);
+
   const handleSaveSettings = useCallback(async () => {
     if (!editingModel) return;
-    const parsedExtraBody = parseExtraBodyInput(editExtraBody);
-    if (parsedExtraBody.errorKey) {
-      setEditExtraBodyError(parsedExtraBody.errorKey);
-      return;
+    const isImageModel = editModelType === 'Image';
+    let values = editingModel.param_overrides;
+    if (!isImageModel) {
+      const parsedExtraBody = parseExtraBodyInput(editExtraBody);
+      if (parsedExtraBody.errorKey) {
+        setEditExtraBodyError(parsedExtraBody.errorKey);
+        return;
+      }
+      values = {
+        ...(editingModel.param_overrides ?? {}),
+        temperature: editTemperature ?? undefined,
+        max_tokens: editMaxTokensParam ?? undefined,
+        top_p: editTopP ?? undefined,
+        frequency_penalty: editFreqPenalty ?? undefined,
+        use_max_completion_tokens: editUseMaxCompletionTokens,
+        no_system_role: editNoSystemRole ?? undefined,
+        omit_sampling_params: editOmitSamplingParams ?? undefined,
+        force_max_tokens: editForceMaxTokens,
+        thinking_param_style: editThinkingParamStyle === 'enable_thinking' || editThinkingParamStyle === 'none'
+          ? editThinkingParamStyle
+          : undefined,
+        reasoning_profile: normalizeReasoningProfile(editThinkingParamStyle),
+        reasoning_options: editReasoningOptions ?? undefined,
+        extra_body: parsedExtraBody.value,
+      };
     }
-    const values: ModelParamOverrides = {
-      temperature: editTemperature ?? undefined,
-      max_tokens: editMaxTokensParam ?? undefined,
-      top_p: editTopP ?? undefined,
-      frequency_penalty: editFreqPenalty ?? undefined,
-      use_max_completion_tokens: editUseMaxCompletionTokens,
-      no_system_role: editNoSystemRole,
-      force_max_tokens: editForceMaxTokens,
-      thinking_param_style: editThinkingParamStyle === 'enable_thinking' || editThinkingParamStyle === 'none'
-        ? editThinkingParamStyle
-        : undefined,
-      reasoning_profile: normalizeReasoningProfile(editThinkingParamStyle),
-      extra_body: parsedExtraBody.value,
-    };
     const nextCapabilities = sanitizeModelCapabilities(editModelType, editCapabilities);
+    const pendingAlias = editAliasInput.trim();
+    const normalizedAliases = Array.from(
+      new Set(
+        [...editAliases, ...(pendingAlias ? [pendingAlias] : [])]
+          .map((alias) => alias.trim())
+          .filter((alias) => alias.length > 0 && alias !== editingModel.model_id),
+      ),
+    );
     try {
-      await updateModelParams(providerId, editingModel.model_id, values);
-      // Update capabilities locally via saveModels
-      const updatedModels = (provider?.models ?? []).map((m) =>
-        m.model_id === editingModel.model_id
-          ? { ...m, capabilities: nextCapabilities, model_type: editModelType, param_overrides: values, max_tokens: editMaxTokens }
-          : m,
-      );
-      await saveModels(providerId, updatedModels);
+      const updatedModel: Model = {
+        ...editingModel,
+        capabilities: nextCapabilities,
+        context_window: isImageModel ? editingModel.context_window : editContextWindow,
+        max_output_tokens: isImageModel
+          ? editingModel.max_output_tokens
+          : editMaxOutputTokens,
+        model_type: editModelType,
+        param_overrides: values,
+        image_config: isImageModel ? editImageConfig : editingModel.image_config,
+        aliases: normalizedAliases,
+      };
+      const userFields = Array.from(editMetadataDirty);
+      const automaticFields = Array.from(editMetadataAutomatic);
+      if (automaticFields.length > 0) {
+        await updateModelMetadata(providerId, updatedModel, userFields, automaticFields);
+      } else {
+        await updateModelMetadata(providerId, updatedModel, userFields);
+      }
       setSettingsModalOpen(false);
       setEditingModel(null);
     } catch {
       message.error(t('error.saveFailed'));
     }
-  }, [editingModel, editCapabilities, editModelType, editMaxTokens, editTemperature, editMaxTokensParam, editTopP, editFreqPenalty, editUseMaxCompletionTokens, editNoSystemRole, editForceMaxTokens, editThinkingParamStyle, editExtraBody, providerId, updateModelParams, saveModels, provider?.models, message, t]);
+  }, [editingModel, editCapabilities, editContextWindow, editMaxOutputTokens, editModelType, editTemperature, editMaxTokensParam, editTopP, editFreqPenalty, editUseMaxCompletionTokens, editNoSystemRole, editOmitSamplingParams, editReasoningOptions, editForceMaxTokens, editThinkingParamStyle, editExtraBody, editImageConfig, editAliases, editAliasInput, editMetadataDirty, editMetadataAutomatic, providerId, updateModelMetadata, message, t]);
 
   const handleApiHostChange = useCallback(
     (value: string) => {
@@ -831,6 +941,18 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       if (apiPathTimerRef.current) clearTimeout(apiPathTimerRef.current);
       apiPathTimerRef.current = setTimeout(() => {
         updateProvider(providerId, { api_path: value || null });
+      }, 500);
+    },
+    [providerId, updateProvider],
+  );
+
+  const handleAwsRegionChange = useCallback(
+    (value: string) => {
+      setAwsRegionLocal(value);
+      if (awsRegionTimerRef.current) clearTimeout(awsRegionTimerRef.current);
+      if (!value.trim()) return;
+      awsRegionTimerRef.current = setTimeout(() => {
+        updateProvider(providerId, { aws_region: value.trim() });
       }, 500);
     },
     [providerId, updateProvider],
@@ -868,6 +990,17 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       return next;
     });
   }, []);
+
+  const handleBatchToggleAll = useCallback((checked: boolean) => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev);
+      for (const m of filteredModels) {
+        if (checked) next.add(m.model_id);
+        else next.delete(m.model_id);
+      }
+      return next;
+    });
+  }, [filteredModels]);
 
   const handleBatchEnable = useCallback(async () => {
     if (batchSelected.size === 0) return;
@@ -907,14 +1040,24 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
     }
   }, [batchSelected, provider?.models, providerId, saveModels, message, t]);
 
+  const handleBatchResetMetadata = useCallback(async () => {
+    if (batchSelected.size === 0) return;
+    try {
+      await resetModelMetadata(providerId, Array.from(batchSelected));
+      message.success(t('settings.metadataResetSuccess', { count: batchSelected.size }));
+    } catch {
+      message.error(t('error.loadFailed'));
+    }
+  }, [batchSelected, message, providerId, resetModelMetadata, t]);
+
   const handleOpenBatchEdit = useCallback(() => {
     // Reset all batch edit fields and disable all toggles
     setBatchModelType('Chat');
     setBatchModelTypeEnabled(false);
     setBatchCapabilities(['TextChat']);
     setBatchCapabilitiesEnabled(false);
-    setBatchMaxTokens(128000);
-    setBatchMaxTokensEnabled(false);
+    setBatchContextWindow(128000);
+    setBatchContextWindowEnabled(false);
     setBatchTemperature(0.7);
     setBatchTemperatureEnabled(false);
     setBatchTopP(1.0);
@@ -943,37 +1086,60 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         updated.model_type = batchModelType;
         updated.capabilities = sanitizeModelCapabilities(batchModelType, batchCapabilitiesEnabled ? batchCapabilities : updated.capabilities);
       }
-      if (batchCapabilitiesEnabled && !batchModelTypeEnabled) {
+      const isImageModel = updated.model_type === 'Image';
+      if (batchCapabilitiesEnabled && !batchModelTypeEnabled && !isImageModel) {
         updated.capabilities = sanitizeModelCapabilities(updated.model_type || 'Chat', batchCapabilities);
       }
-      if (batchMaxTokensEnabled) {
-        updated.max_tokens = batchMaxTokens;
+      if (batchContextWindowEnabled && !isImageModel) {
+        updated.context_window = batchContextWindow;
       }
-      const overrides: ModelParamOverrides = { ...(updated.param_overrides ?? {}) };
-      if (batchTemperatureEnabled) overrides.temperature = batchTemperature;
-      if (batchTopPEnabled) overrides.top_p = batchTopP;
-      if (batchMaxTokensParamEnabled) overrides.max_tokens = batchMaxTokensParam;
-      if (batchFreqPenaltyEnabled) overrides.frequency_penalty = batchFreqPenalty;
-      if (batchUseMaxCompletionTokensEnabled) overrides.use_max_completion_tokens = batchUseMaxCompletionTokens;
-      if (batchNoSystemRoleEnabled) overrides.no_system_role = batchNoSystemRole;
-      if (batchForceMaxTokensEnabled) overrides.force_max_tokens = batchForceMaxTokens;
-      if (batchThinkingParamStyleEnabled) {
-        overrides.thinking_param_style = batchThinkingParamStyle === 'enable_thinking' || batchThinkingParamStyle === 'none'
-          ? batchThinkingParamStyle
-          : undefined;
-        overrides.reasoning_profile = normalizeReasoningProfile(batchThinkingParamStyle);
+      if (!isImageModel) {
+        const overrides: ModelParamOverrides = { ...(updated.param_overrides ?? {}) };
+        if (batchTemperatureEnabled) overrides.temperature = batchTemperature;
+        if (batchTopPEnabled) overrides.top_p = batchTopP;
+        if (batchMaxTokensParamEnabled) overrides.max_tokens = batchMaxTokensParam;
+        if (batchFreqPenaltyEnabled) overrides.frequency_penalty = batchFreqPenalty;
+        if (batchUseMaxCompletionTokensEnabled) overrides.use_max_completion_tokens = batchUseMaxCompletionTokens;
+        if (batchNoSystemRoleEnabled) overrides.no_system_role = batchNoSystemRole;
+        if (batchForceMaxTokensEnabled) overrides.force_max_tokens = batchForceMaxTokens;
+        if (batchThinkingParamStyleEnabled) {
+          overrides.thinking_param_style = batchThinkingParamStyle === 'enable_thinking' || batchThinkingParamStyle === 'none'
+            ? batchThinkingParamStyle
+            : undefined;
+          overrides.reasoning_profile = normalizeReasoningProfile(batchThinkingParamStyle);
+        }
+        updated.param_overrides = overrides;
       }
-      updated.param_overrides = overrides;
       return updated;
     });
+    const userFields = [
+      ...(batchModelTypeEnabled ? ['model_type', 'capabilities'] : []),
+      ...(!batchModelTypeEnabled && batchCapabilitiesEnabled ? ['capabilities'] : []),
+      ...(batchContextWindowEnabled ? ['context_window'] : []),
+      ...(batchNoSystemRoleEnabled ? ['no_system_role'] : []),
+    ];
     try {
-      await saveModels(providerId, updatedModels);
+      if (userFields.length === 0) {
+        await saveModels(providerId, updatedModels);
+      } else {
+        for (const model of updatedModels.filter((model) => batchSelected.has(model.model_id))) {
+          await updateModelMetadata(providerId, model, userFields);
+        }
+      }
       message.success(t('settings.batchEditSuccess', { count: batchSelected.size }));
       setBatchEditModalOpen(false);
     } catch {
       message.error(t('error.saveFailed'));
     }
-  }, [batchSelected, provider?.models, providerId, saveModels, message, t, batchModelType, batchModelTypeEnabled, batchCapabilities, batchCapabilitiesEnabled, batchMaxTokens, batchMaxTokensEnabled, batchTemperature, batchTemperatureEnabled, batchTopP, batchTopPEnabled, batchMaxTokensParam, batchMaxTokensParamEnabled, batchFreqPenalty, batchFreqPenaltyEnabled, batchUseMaxCompletionTokens, batchUseMaxCompletionTokensEnabled, batchNoSystemRole, batchNoSystemRoleEnabled, batchForceMaxTokens, batchForceMaxTokensEnabled, batchThinkingParamStyle, batchThinkingParamStyleEnabled]);
+  }, [batchSelected, provider?.models, providerId, saveModels, updateModelMetadata, message, t, batchModelType, batchModelTypeEnabled, batchCapabilities, batchCapabilitiesEnabled, batchContextWindow, batchContextWindowEnabled, batchTemperature, batchTemperatureEnabled, batchTopP, batchTopPEnabled, batchMaxTokensParam, batchMaxTokensParamEnabled, batchFreqPenalty, batchFreqPenaltyEnabled, batchUseMaxCompletionTokens, batchUseMaxCompletionTokensEnabled, batchNoSystemRole, batchNoSystemRoleEnabled, batchForceMaxTokens, batchForceMaxTokensEnabled, batchThinkingParamStyle, batchThinkingParamStyleEnabled]);
+
+  const batchEditIsImageMode = useMemo(() => {
+    if (batchModelTypeEnabled) return batchModelType === 'Image';
+    const selectedModels = (provider?.models ?? []).filter((model) =>
+      batchSelected.has(model.model_id));
+    return selectedModels.length > 0
+      && selectedModels.every((model) => model.model_type === 'Image');
+  }, [batchModelType, batchModelTypeEnabled, batchSelected, provider?.models]);
 
   const groupedModels = useMemo(() => {
     const groups: Record<string, Model[]> = {};
@@ -982,11 +1148,17 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       if (!groups[groupKey]) groups[groupKey] = [];
       groups[groupKey].push(model);
     }
+    for (const groupKey of Object.keys(groups)) {
+      groups[groupKey] = sortModelsByVersionDesc(groups[groupKey], (m) => m.model_id);
+    }
     return groups;
   }, [filteredModels]);
 
   // Track expanded groups for collapse/expand all
-  const groupKeys = useMemo(() => Object.keys(groupedModels), [groupedModels]);
+  const groupKeys = useMemo(
+    () => sortGroupKeysByVersionDesc(Object.keys(groupedModels)),
+    [groupedModels],
+  );
   const modelGroupOptions = useMemo(
     () => groupKeys.map((group) => ({ value: group })),
     [groupKeys],
@@ -1013,9 +1185,9 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
   type ModelListRow = { type: 'group'; group: string; models: Model[] } | { type: 'model'; model: Model; group: string } | { type: 'spacer'; beforeGroup: string };
   const flatModelRows = useMemo<ModelListRow[]>(() => {
     const rows: ModelListRow[] = [];
-    const entries = Object.entries(groupedModels);
-    for (let i = 0; i < entries.length; i++) {
-      const [group, models] = entries[i];
+    for (let i = 0; i < groupKeys.length; i++) {
+      const group = groupKeys[i];
+      const models = groupedModels[group] ?? [];
       if (i > 0) rows.push({ type: 'spacer', beforeGroup: group });
       rows.push({ type: 'group', group, models });
       if (expandedGroups.includes(group)) {
@@ -1025,7 +1197,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       }
     }
     return rows;
-  }, [groupedModels, expandedGroups]);
+  }, [groupedModels, expandedGroups, groupKeys]);
 
   const modelListParentRef = useRef<HTMLDivElement>(null);
   const modelListVirtualizer = useVirtualizer({
@@ -1057,34 +1229,45 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
 
   if (!provider) return null;
 
+  const providerWebsite = getBuiltinProviderWebsite(provider.builtin_id);
+  // UI value: null/missing proxy_type means "follow global"; "none" is explicit disable.
+  const proxyTypeValue = provider.proxy_config?.proxy_type ?? 'follow';
+  const needsProxyAddress = proxyTypeValue === 'http' || proxyTypeValue === 'socks5';
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <IconEditor
-            iconType={provider.icon ? 'model_icon' : null}
-            iconValue={provider.icon ?? null}
+            iconType={parseProviderIcon(provider.icon)?.type ?? null}
+            iconValue={parseProviderIcon(provider.icon)?.value ?? null}
             onChange={(type, value) => {
-              if (type === 'model_icon' && value) {
-                updateProvider(providerId, { icon: value });
-              } else if (type === 'emoji' || type === 'url' || type === 'file') {
-                updateProvider(providerId, { icon: `${type}:${value}` });
-              } else {
-                updateProvider(providerId, { icon: '' });
-              }
+              updateProvider(providerId, { icon: encodeProviderIcon(type, value) });
             }}
             size={40}
             shape="square"
-            defaultIcon={<SmartProviderIcon provider={provider} size={40} type="avatar" shape="square" />}
+            defaultIcon={<SmartProviderIcon provider={{ ...provider, icon: '' }} size={40} type="avatar" shape="square" />}
             showModelIcons
             modelIconsDefaultTab="provider"
           />
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1">
               <Title level={4} className="!mb-0">
                 {provider.name}
               </Title>
+              {providerWebsite && (
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<ExternalLink size={13} />}
+                  onClick={() => openExternalUrl(providerWebsite)}
+                  style={{ paddingInline: 2, height: 'auto', gap: 2 }}
+                  aria-label={t('settings.website')}
+                >
+                  {t('settings.website')}
+                </Button>
+              )}
               {!provider.builtin_id && (
                 <Button
                   type="text"
@@ -1093,6 +1276,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                   onClick={() => {
                     setEditProviderName(provider.name);
                     setEditProviderType(provider.provider_type);
+                    setEditAwsRegion(provider.aws_region ?? '');
                     setProviderEditModalOpen(true);
                   }}
                 />
@@ -1128,7 +1312,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
 
       {/* API Keys */}
       <Card
-        title={t('settings.apiKeys')}
+        title={t(isBedrock ? 'settings.awsCredentials' : 'settings.apiKeys')}
         size="small"
         extra={
           <Button
@@ -1136,7 +1320,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             icon={<Plus size={14} />}
             onClick={handleOpenAddKey}
           >
-            {t('settings.addKey')}
+            {t(isBedrock ? 'settings.addAwsCredentials' : 'settings.addKey')}
           </Button>
         }
       >
@@ -1158,19 +1342,23 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                   />
                   <Key size={14} />
                   <Text code style={{ wordBreak: 'break-all' }}>
-                    {revealedKeys[key.id] ?? `${key.key_prefix}••••••••`}
+                    {isBedrock
+                      ? key.key_prefix
+                      : revealedKeys[key.id] ?? `${key.key_prefix}••••••••`}
                   </Text>
                 </Space>
                 <Space size="small">
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={revealedKeys[key.id] ? <EyeOff size={14} /> : <Eye size={14} />}
-                    aria-label={t(revealedKeys[key.id] ? 'common.hide' : 'settings.viewKey')}
-                    title={t(revealedKeys[key.id] ? 'common.hide' : 'settings.viewKey')}
-                    loading={revealingKeys.has(key.id)}
-                    onClick={() => handleToggleRevealKey(key.id)}
-                  />
+                  {!isBedrock && (
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={revealedKeys[key.id] ? <EyeOff size={14} /> : <Eye size={14} />}
+                      aria-label={t(revealedKeys[key.id] ? 'common.hide' : 'settings.viewKey')}
+                      title={t(revealedKeys[key.id] ? 'common.hide' : 'settings.viewKey')}
+                      loading={revealingKeys.has(key.id)}
+                      onClick={() => handleToggleRevealKey(key.id)}
+                    />
+                  )}
                   <Button
                     type="text"
                     size="small"
@@ -1179,18 +1367,20 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                     title={t('settings.editKey')}
                     onClick={() => handleOpenEditKey(key.id)}
                   />
-                  <CopyButton
-                    text={async () => {
-                      const raw = await invoke<string>('get_decrypted_provider_key', { keyId: key.id });
-                      return raw;
-                    }}
-                    size={14}
-                    successMessage={t('common.copySuccess')}
-                    onError={(e) => {
-                      console.error('copy key failed:', e);
-                      message.error(t('error.unknown'));
-                    }}
-                  />
+                  {!isBedrock && (
+                    <CopyButton
+                      text={async () => {
+                        const raw = await invoke<string>('get_decrypted_provider_key', { keyId: key.id });
+                        return raw;
+                      }}
+                      size={14}
+                      successMessage={t('common.copySuccess')}
+                      onError={(e) => {
+                        console.error('copy key failed:', e);
+                        message.error(t('error.unknown'));
+                      }}
+                    />
+                  )}
                   <Button
                     type="text"
                     size="small"
@@ -1215,13 +1405,35 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         )}
       </Card>
 
-      {/* API Host + Path */}
+      {/* Region or API Host + Path */}
+      {isBedrock ? (
+        <Card title={t('settings.awsRegion')} size="small">
+          <Form layout="vertical">
+            <Form.Item
+              label={t('settings.awsRegion')}
+              required
+              help={t('settings.awsRegionHelp')}
+              style={{ marginBottom: 0 }}
+            >
+              <AutoComplete
+                value={awsRegionLocal}
+                options={AWS_REGION_OPTIONS}
+                onChange={handleAwsRegionChange}
+                placeholder="us-east-1"
+                filterOption={(input, option) =>
+                  String(option?.value ?? '').toLowerCase().includes(input.toLowerCase())
+                }
+              />
+            </Form.Item>
+          </Form>
+        </Card>
+      ) : (
       <Card title={t('settings.apiHost')} size="small">
         <Form layout="horizontal" colon={false} labelCol={{ flex: '110px' }} wrapperCol={{ flex: 1 }}>
           <Form.Item
             label={
               <Space size={4}>
-                <span>Base URL</span>
+                <span>{t('settings.apiHost')}</span>
                 <Tooltip title={t('settings.urlHintExclamation')}>
                   <CircleHelp size={14} style={{ cursor: 'help' }} />
                 </Tooltip>
@@ -1233,12 +1445,16 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
               <Input
                 value={apiHostLocal}
                 onChange={(e) => handleApiHostChange(e.target.value)}
-                placeholder={DEFAULT_HOSTS[provider.provider_type]}
+                placeholder={
+                  provider.builtin_id === 'newapi'
+                    ? t('settings.newApiHostPlaceholder')
+                    : DEFAULT_HOSTS[provider.provider_type]
+                }
               />
               <Button
                 icon={<Undo2 size={16} />}
                 onClick={() => {
-                  const defaultHost = DEFAULT_HOSTS[provider.provider_type];
+                  const defaultHost = getProviderDefaultHost(provider);
                   setApiHostLocal(defaultHost);
                   updateProvider(providerId, { api_host: defaultHost });
                 }}
@@ -1246,6 +1462,11 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 {t('settings.resetDefault')}
               </Button>
             </Space.Compact>
+            {provider.builtin_id === 'newapi' && (
+              <div style={{ marginTop: 4, fontSize: 12, color: token.colorTextSecondary }}>
+                {t('settings.newApiHostHelp')}
+              </div>
+            )}
             <div style={{ marginTop: 4, fontSize: 12, color: token.colorTextQuaternary }}>
               {t('settings.urlPreviewLabel')}{resolvedUrls.resolvedBase}
             </div>
@@ -1275,6 +1496,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
           </Form.Item>
         </Form>
       </Card>
+      )}
 
       {/* Models List */}
       {modelListFullscreen && (
@@ -1288,9 +1510,23 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         title={
           batchMode ? (
             <Space>
-              <Text type="secondary" style={{ fontSize: 13 }}>
-                {t('settings.batchSelected', { count: batchSelected.size })}
-              </Text>
+              <Checkbox
+                aria-label={t('common.selectAll')}
+                checked={
+                  filteredModels.length > 0
+                  && filteredModels.every((m) => batchSelected.has(m.model_id))
+                }
+                indeterminate={
+                  filteredModels.some((m) => batchSelected.has(m.model_id))
+                  && !filteredModels.every((m) => batchSelected.has(m.model_id))
+                }
+                disabled={filteredModels.length === 0}
+                onChange={(e) => handleBatchToggleAll(e.target.checked)}
+              >
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  {t('common.selectAll')} ({batchSelected.size}/{filteredModels.length})
+                </Text>
+              </Checkbox>
             </Space>
           ) : (
             <Space>
@@ -1311,6 +1547,9 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
               </Tooltip>
               <Tooltip title={t('settings.batchEdit')}>
                 <Button type="text" size="small" icon={<Pencil size={14} />} disabled={batchSelected.size === 0} onClick={handleOpenBatchEdit} />
+              </Tooltip>
+              <Tooltip title={t('settings.batchResetMetadata')}>
+                <Button type="text" size="small" icon={<RefreshCw size={14} />} disabled={batchSelected.size === 0} onClick={handleBatchResetMetadata} />
               </Tooltip>
               <Popconfirm
                 title={t('settings.batchDeleteConfirm', { count: batchSelected.size })}
@@ -1430,6 +1669,44 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             autoFocus
           />
         )}
+        {(provider.models?.length ?? 0) === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={
+              <div style={{ maxWidth: 400, margin: '0 auto' }}>
+                <Text type="secondary">
+                  {t(
+                    'settings.emptyModelsHint',
+                  )}
+                </Text>
+              </div>
+            }
+            style={{ padding: '32px 16px' }}
+          >
+            <Space>
+              <Button
+                icon={<Key size={14} />}
+                onClick={handleOpenAddKey}
+              >
+                {t(isBedrock ? 'settings.addAwsCredentials' : 'settings.addKey')}
+              </Button>
+              <Button
+                type="primary"
+                icon={<RefreshCw size={14} />}
+                loading={refreshing}
+                onClick={handleRefreshModels}
+              >
+                {t('settings.syncModels')}
+              </Button>
+            </Space>
+          </Empty>
+        ) : filteredModels.length === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={t('settings.noMatchingModels')}
+            style={{ padding: '24px 16px' }}
+          />
+        ) : (
         <div
           ref={modelListParentRef}
           style={{ maxHeight: modelListFullscreen ? 'calc(100vh - 140px)' : 520, overflow: 'auto' }}
@@ -1482,7 +1759,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                         />
                       )}
                       {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                      <ModelIcon model={models[0]?.model_id ?? group} size={20} type="avatar" />
+                      <SmartModelIcon modelId={models[0]?.model_id ?? group} provider={provider} size={20} type="avatar" />
                       <Text style={{ fontWeight: 600 }}>{group}</Text>
                       <Tag style={{ fontSize: 11, lineHeight: '18px', padding: '0 6px', margin: 0 }}>{models.length}</Tag>
                       <div style={{ flex: 1 }} />
@@ -1564,7 +1841,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                     )}
                     {iconOverrides[model.model_id]
                       ? <DynamicLobeIcon iconId={iconOverrides[model.model_id]} size={20} type="avatar" />
-                      : <ModelIcon model={model.model_id} size={20} type="avatar" />
+                      : <SmartModelIcon modelId={model.model_id} provider={provider} size={20} type="avatar" />
                     }
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1 flex-wrap">
@@ -1587,9 +1864,9 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                             </Tag>
                           </Tooltip>
                         ))}
-                        {model.max_tokens != null && model.max_tokens > 0 && (
+                        {model.context_window != null && model.context_window > 0 && (
                           <Tag bordered={false} color="default" style={{ fontSize: 10, lineHeight: '16px', padding: '0 4px', margin: 0 }}>
-                            {formatTokenCount(model.max_tokens)}
+                            {formatTokenCount(model.context_window)}
                           </Tag>
                         )}
                       </div>
@@ -1624,10 +1901,11 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             })}
           </div>
         </div>
+        )}
       </Card>
 
       {/* Custom Headers */}
-      <Collapse
+      {!isBedrock && <Collapse
         items={[
           {
             key: 'custom-headers',
@@ -1654,7 +1932,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             ),
           },
         ]}
-      />
+      />}
 
       {/* Provider Proxy */}
       <Collapse
@@ -1666,21 +1944,42 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
               <Form layout="vertical" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <Form.Item label={t('settings.proxyType')} style={{ marginBottom: 0 }}>
                   <Select
-                    value={provider.proxy_config?.proxy_type ?? 'none'}
-                    onChange={(val) =>
+                    value={proxyTypeValue}
+                    onChange={(val) => {
+                      if (val === 'follow') {
+                        updateProvider(providerId, {
+                          proxy_config: {
+                            proxy_type: null,
+                            proxy_address: null,
+                            proxy_port: null,
+                          },
+                        });
+                        return;
+                      }
+                      if (val === 'none' || val === 'system') {
+                        updateProvider(providerId, {
+                          proxy_config: {
+                            proxy_type: val,
+                            proxy_address: null,
+                            proxy_port: null,
+                          },
+                        });
+                        return;
+                      }
                       updateProvider(providerId, {
                         proxy_config: {
-                          proxy_type: val === 'none' ? null : val,
+                          proxy_type: val,
                           proxy_address: provider.proxy_config?.proxy_address ?? null,
                           proxy_port: provider.proxy_config?.proxy_port ?? null,
                         },
-                      })
-                    }
+                      });
+                    }}
                     options={[
+                      { label: t('settings.proxyFollow'), value: 'follow' },
                       { label: t('settings.proxyNone'), value: 'none' },
                       { label: t('settings.proxySystem'), value: 'system' },
-                      { label: 'HTTP', value: 'http' },
-                      { label: 'SOCKS5', value: 'socks5' },
+                      { label: t('settings.proxyHttp'), value: 'http' },
+                      { label: t('settings.proxySocks5'), value: 'socks5', disabled: isBedrock },
                     ]}
                   />
                 </Form.Item>
@@ -1698,7 +1997,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                       })
                     }
                     placeholder="127.0.0.1"
-                    disabled={provider.proxy_config?.proxy_type === 'system'}
+                    disabled={!needsProxyAddress}
                   />
                 </Form.Item>
                 <Form.Item label={t('settings.proxyPort')} style={{ marginBottom: 0 }}>
@@ -1718,7 +2017,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                     min={1}
                     max={65535}
                     style={{ width: '100%' }}
-                    disabled={provider.proxy_config?.proxy_type === 'system'}
+                    disabled={!needsProxyAddress}
                   />
                 </Form.Item>
               </Form>
@@ -1729,7 +2028,15 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
 
       {/* Add Key Modal */}
       <Modal
-        title={t(keyModalMode === 'add' ? 'settings.addKey' : 'settings.editKey')}
+        title={t(
+          isBedrock
+            ? keyModalMode === 'add'
+              ? 'settings.addAwsCredentials'
+              : 'settings.editAwsCredentials'
+            : keyModalMode === 'add'
+              ? 'settings.addKey'
+              : 'settings.editKey',
+        )}
         open={keyModalOpen}
         mask={{ enabled: true, blur: true }}
         onOk={handleSubmitKey}
@@ -1744,11 +2051,53 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             <Spin size="small" />
           </div>
         ) : (
-          <Input
-            value={keyValue}
-            onChange={(e) => setKeyValue(e.target.value)}
-            placeholder="sk-..."
-          />
+          isBedrock ? (
+            <Form layout="vertical">
+              <Form.Item label={t('settings.awsAccessKeyId')} required>
+                <Input
+                  value={bedrockCredentials.access_key_id}
+                  onChange={(event) =>
+                    setBedrockCredentials((current) => ({
+                      ...current,
+                      access_key_id: event.target.value,
+                    }))
+                  }
+                  placeholder="AKIA..."
+                  autoComplete="off"
+                />
+              </Form.Item>
+              <Form.Item label={t('settings.awsSecretAccessKey')} required>
+                <Input.Password
+                  value={bedrockCredentials.secret_access_key}
+                  onChange={(event) =>
+                    setBedrockCredentials((current) => ({
+                      ...current,
+                      secret_access_key: event.target.value,
+                    }))
+                  }
+                  autoComplete="new-password"
+                />
+              </Form.Item>
+              <Form.Item label={t('settings.awsSessionToken')} style={{ marginBottom: 0 }}>
+                <Input.Password
+                  value={bedrockCredentials.session_token ?? ''}
+                  onChange={(event) =>
+                    setBedrockCredentials((current) => ({
+                      ...current,
+                      session_token: event.target.value,
+                    }))
+                  }
+                  autoComplete="off"
+                />
+              </Form.Item>
+            </Form>
+          ) : (
+            <Input
+              value={keyValue}
+              onChange={(e) => setKeyValue(e.target.value)}
+              placeholder="sk-..."
+            />
+          )
         )}
       </Modal>
 
@@ -1762,14 +2111,23 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
           setAddModelName('');
           setAddModelGroupName('');
           setAddModelType('Chat');
+          setAddModelPreview(null);
+          addModelTypeDirty.current = false;
         }}
         onOk={handleAddModel}
         okText={t('settings.addModel')}
         cancelText={t('common.cancel')}
+        okButtonProps={{
+          disabled: addModelInferring,
+        }}
         destroyOnHidden
       >
         <Form layout="vertical">
-          <Form.Item label={t('settings.modelId')} required>
+          <Form.Item
+            label={t('settings.modelId')}
+            required
+            help={isBedrock ? t('settings.bedrockManualModelHelp') : undefined}
+          >
             <Input
               value={addModelId}
               onChange={(e) => {
@@ -1809,13 +2167,55 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
           <Form.Item label={t('settings.modelType.title')} style={{ marginBottom: 0 }}>
             <Select
               value={addModelType}
-              onChange={(value) => setAddModelType(value as ModelType)}
-              options={(Object.keys(MODEL_TYPE_CONFIG) as ModelType[]).map((type_) => ({
+              onChange={(value) => {
+                addModelTypeDirty.current = true;
+                setAddModelType(value as ModelType);
+              }}
+              options={(isBedrock
+                ? (['Chat'] as ModelType[])
+                : (Object.keys(MODEL_TYPE_CONFIG) as ModelType[])
+              ).map((type_) => ({
                 value: type_,
                 label: t(`settings.modelType.${type_}`, MODEL_TYPE_LABEL_KEYS[type_]),
               }))}
             />
           </Form.Item>
+          <div style={{ marginTop: 12 }}>
+            {addModelInferring ? (
+              <Space size="small"><Spin size="small" />{t('settings.inferringMetadata')}</Space>
+            ) : addModelPreview ? (
+              <Space wrap size={[4, 4]}>
+                <Tag color="blue">{t(`settings.modelType.${addModelType}`)}</Tag>
+                {addModelPreview.proposed_model.capabilities.map((capability) => (
+                  <Tag key={capability}>{t(`settings.capability.${capability}`)}</Tag>
+                ))}
+                {addModelPreview.proposed_model.context_window != null && (
+                  <Tooltip title={t('settings.contextWindow')}>
+                    <Tag aria-label={t('settings.contextWindow')}>
+                      {formatTokenCount(addModelPreview.proposed_model.context_window)}
+                    </Tag>
+                  </Tooltip>
+                )}
+                {addModelPreview.proposed_model.max_output_tokens != null && (
+                  <Tooltip title={t('settings.modelMaxOutputTokens')}>
+                    <Tag aria-label={t('settings.modelMaxOutputTokens')}>
+                      {formatTokenCount(addModelPreview.proposed_model.max_output_tokens)}
+                    </Tag>
+                  </Tooltip>
+                )}
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => {
+                    addModelTypeDirty.current = false;
+                    setAddModelType(addModelPreview.proposed_model.model_type);
+                  }}
+                >
+                  {t('settings.restoreAutomatic')}
+                </Button>
+              </Space>
+            ) : null}
+          </div>
         </Form>
       </Modal>
 
@@ -1825,8 +2225,10 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         open={settingsModalOpen}
         mask={{ enabled: true, blur: true }}
         onCancel={() => {
+          setMetadataSyncModalOpen(false);
           setSettingsModalOpen(false);
           setEditingModel(null);
+          setEditAliasInput('');
         }}
         onOk={handleSaveSettings}
         okText={t('common.save')}
@@ -1860,7 +2262,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 size={32}
                 showModelIcons
                 showClear={!!iconOverrides[editingModel.model_id]}
-                defaultIcon={<ModelIcon model={editingModel.model_id} size={32} type="avatar" />}
+                defaultIcon={<SmartModelIcon modelId={editingModel.model_id} provider={provider} size={32} type="avatar" />}
               />
               <div className="flex items-center gap-1.5 min-w-0 flex-1">
                 <span className="font-medium truncate">{editingModel.name || editingModel.model_id}</span>
@@ -1873,6 +2275,89 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                   successMessage={t('common.copySuccess')}
                   className="shrink-0"
                 />
+                <Tag color={editMetadataDirty.size > 0 || hasUserMetadata(editingModel.metadata_state) ? 'gold' : 'blue'}>
+                  {t(editMetadataDirty.size > 0 || hasUserMetadata(editingModel.metadata_state)
+                    ? 'settings.metadataManual'
+                    : 'settings.metadataAutomatic')}
+                </Tag>
+                <Tooltip title={t('settings.syncModelMetadata')}>
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<RefreshCw size={14} />}
+                    aria-label={t('settings.syncModelMetadata')}
+                    loading={metadataSyncLoading}
+                    onClick={handleOpenMetadataSync}
+                  />
+                </Tooltip>
+              </div>
+            </div>
+
+            <Divider className="!my-2" />
+
+            {/* Gateway model aliases */}
+            <div>
+              <div className="font-medium mb-1.5 flex items-center gap-1" style={{ fontSize: 13 }}>
+                <span>{t('settings.modelAliases')}</span>
+                <Tooltip title={t('settings.modelAliasesHelp')}>
+                  <CircleHelp
+                    size={14}
+                    style={{ color: token.colorTextSecondary, cursor: 'help', flexShrink: 0 }}
+                  />
+                </Tooltip>
+              </div>
+              <div
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: 6,
+                  alignItems: 'center',
+                  minHeight: 32,
+                  padding: '1px 11px',
+                  borderRadius: token.borderRadius,
+                  border: `1px solid ${token.colorBorder}`,
+                  background: token.colorBgContainer,
+                }}
+              >
+                {editAliases.map((alias) => (
+                  <Tag
+                    key={alias}
+                    closable
+                    onClose={(e) => {
+                      e.preventDefault();
+                      setEditAliases((prev) => prev.filter((item) => item !== alias));
+                    }}
+                    style={{ marginInlineEnd: 0 }}
+                  >
+                    {alias}
+                  </Tag>
+                ))}
+                <Input
+                  variant="borderless"
+                  placeholder={editAliases.length === 0 ? t('settings.modelAliasesPlaceholder') : undefined}
+                  value={editAliasInput}
+                  onChange={(e) => setEditAliasInput(e.target.value)}
+                  onPressEnter={(e) => {
+                    e.preventDefault();
+                    const next = editAliasInput.trim();
+                    if (!next || next === editingModel.model_id) {
+                      setEditAliasInput('');
+                      return;
+                    }
+                    setEditAliases((prev) => (prev.includes(next) ? prev : [...prev, next]));
+                    setEditAliasInput('');
+                  }}
+                  onBlur={() => {
+                    const next = editAliasInput.trim();
+                    if (!next || next === editingModel.model_id) {
+                      setEditAliasInput('');
+                      return;
+                    }
+                    setEditAliases((prev) => (prev.includes(next) ? prev : [...prev, next]));
+                    setEditAliasInput('');
+                  }}
+                  style={{ flex: 1, minWidth: 120, paddingInline: 0 }}
+                />
               </div>
             </div>
 
@@ -1880,7 +2365,9 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
 
             {/* Model Type */}
             <div>
-              <div className="font-medium mb-1.5" style={{ fontSize: 13 }}>{t('settings.modelType.title')}</div>
+              <div className="font-medium mb-1.5" style={{ fontSize: 13 }}>
+                {t('settings.modelType.title')}
+              </div>
               <div className="flex gap-2 flex-wrap">
                 {(Object.keys(MODEL_TYPE_CONFIG) as ModelType[]).map((type_) => (
                   <Tag
@@ -1890,6 +2377,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                     onClick={() => {
                       setEditModelType(type_);
                       setEditCapabilities((current) => sanitizeModelCapabilities(type_, current));
+                      markMetadataManual('model_type', 'capabilities');
                     }}
                   >
                     {MODEL_TYPE_CONFIG[type_].icon}
@@ -1899,13 +2387,27 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
               </div>
             </div>
 
+            {editModelType === 'Image' && (
+              <>
+                <Divider className="!my-2" />
+                <ImageProtocolEditor
+                  value={editImageConfig}
+                  providerType={provider?.provider_type ?? 'custom'}
+                  modelId={editingModel.model_id}
+                  onChange={setEditImageConfig}
+                />
+              </>
+            )}
+
             {editModelType === 'Chat' && (
               <>
                 <Divider className="!my-2" />
 
                 {/* Capabilities as clickable tags */}
                 <div>
-                  <div className="font-medium mb-1.5" style={{ fontSize: 13 }}>{t('settings.modelAbilities')}</div>
+                  <div className="font-medium mb-1.5" style={{ fontSize: 13 }}>
+                    {t('settings.modelAbilities')}
+                  </div>
                   <div className="flex gap-2 flex-wrap">
                     {getEditableCapabilities(editModelType).map((cap) => {
                       const selected = editCapabilities.includes(cap);
@@ -1919,6 +2421,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                               ? editCapabilities.filter((c) => c !== cap)
                               : [...editCapabilities, cap];
                             setEditCapabilities(sanitizeModelCapabilities(editModelType, next));
+                            markMetadataManual('capabilities');
                           }}
                         >
                           {CAPABILITY_ICONS[cap]}
@@ -1931,36 +2434,80 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
               </>
             )}
 
-            <Divider className="!my-2" />
+            {editModelType !== 'Image' && (
+              <>
+                <Divider className="!my-2" />
 
-            {/* Parameters — horizontal label-control layout */}
-            <div>
-              <div className="font-medium mb-2" style={{ fontSize: 13 }}>{t('settings.modelParams')}</div>
-              <div className="space-y-3">
+                {/* Parameters — horizontal label-control layout */}
+                <div>
+                  <div className="font-medium mb-2" style={{ fontSize: 13 }}>{t('settings.modelParams')}</div>
+                  <div className="space-y-3">
                 {/* Context Window */}
                 <div>
                   <div className="flex items-center justify-between" style={{ padding: '8px 0' }}>
                     <span className="text-sm shrink-0" style={{ color: token.colorText }}>{t('settings.contextWindow')}</span>
-                    <InputNumber
-                      value={editMaxTokens}
-                      onChange={(v) => v != null && setEditMaxTokens(v)}
-                      min={1024}
-                      step={1024}
-                      style={{ width: 110 }}
-                      size="small"
-                      formatter={(v) => v ? `${Number(v).toLocaleString()}` : ''}
+                    <Switch
+                      aria-label={t('settings.contextWindow')}
+                      checked={editContextWindow != null}
+                      onChange={(enabled) => {
+                        setEditContextWindow(enabled ? 128000 : null);
+                        markMetadataManual('context_window');
+                      }}
                     />
                   </div>
-                  <div style={{ paddingBottom: 8 }}>
-                    <Slider
-                      min={1024}
-                      max={1048576}
-                      step={1024}
-                      marks={{ 1024: '', 32768: '32K', 131072: '128K', 524288: '512K', 1048576: '1M' }}
-                      value={Math.min(editMaxTokens ?? 128000, 1048576)}
-                      onChange={(v) => setEditMaxTokens(v)}
-                    />
+                  {editContextWindow != null && (
+                    <>
+                      <div className="flex justify-end" style={{ paddingBottom: 4 }}>
+                        <InputNumber
+                          value={editContextWindow}
+                          onChange={(value) => {
+                            if (value != null) setEditContextWindow(value);
+                            markMetadataManual('context_window');
+                          }}
+                          min={1024}
+                          max={10000000}
+                          step={1024}
+                          style={{ width: 120 }}
+                          formatter={(value) => value ? `${Number(value).toLocaleString()}` : ''}
+                        />
+                      </div>
+                      <div style={{ paddingBottom: 8 }}>
+                        <Slider
+                          min={1024}
+                          max={1048576}
+                          step={1024}
+                          marks={{ 1024: '', 32768: '32K', 131072: '128K', 524288: '512K', 1048576: '1M' }}
+                          value={Math.min(editContextWindow, 1048576)}
+                          onChange={(value) => {
+                            setEditContextWindow(value);
+                            markMetadataManual('context_window');
+                          }}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                <div className="flex items-center justify-between" style={{ padding: '8px 0' }}>
+                  <div>
+                    <div className="text-sm" style={{ color: token.colorText }}>
+                      {t('settings.modelMaxOutputTokens')}
+                    </div>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      {t('settings.modelMaxOutputTokensHint')}
+                    </Text>
                   </div>
+                  <InputNumber
+                    value={editMaxOutputTokens}
+                    onChange={(value) => {
+                      setEditMaxOutputTokens(value);
+                      markMetadataManual('max_output_tokens');
+                    }}
+                    min={1}
+                    max={10000000}
+                    placeholder={t('settings.automatic')}
+                    style={{ width: 120 }}
+                  />
                 </div>
 
                 <ModelParamSliders
@@ -1973,10 +2520,15 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                   onChange={(v) => {
                     if ('temperature' in v) setEditTemperature(v.temperature!);
                     if ('topP' in v) setEditTopP(v.topP!);
-                    if ('maxTokens' in v) setEditMaxTokensParam(v.maxTokens!);
+                    if ('maxTokens' in v) {
+                      setEditMaxTokensParam(v.maxTokens == null
+                        ? null
+                        : Math.min(v.maxTokens, editMaxOutputTokens ?? v.maxTokens));
+                    }
                     if ('frequencyPenalty' in v) setEditFreqPenalty(v.frequencyPenalty!);
                   }}
                   showDividers={false}
+                  maxTokensMax={editMaxOutputTokens ?? 1048576}
                 />
 
                 <Divider className="!my-2" />
@@ -1984,20 +2536,37 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 {/* Switches — horizontal */}
                 <div className="flex items-center justify-between">
                   <span className="text-sm" style={{ color: token.colorText }}>{t('settings.useMaxCompletionTokens')}</span>
-                  <Switch size="small" checked={editUseMaxCompletionTokens} onChange={setEditUseMaxCompletionTokens} />
+                  <Switch checked={editUseMaxCompletionTokens} onChange={setEditUseMaxCompletionTokens} />
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm" style={{ color: token.colorText }}>{t('settings.noSystemRole')}</span>
-                  <Switch size="small" checked={editNoSystemRole} onChange={setEditNoSystemRole} />
+                  <Switch
+                    checked={editNoSystemRole ?? false}
+                    onChange={(value) => {
+                      setEditNoSystemRole(value);
+                      markMetadataManual('no_system_role');
+                    }}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm" style={{ color: token.colorText }}>
+                    {t('settings.omitSamplingParams')}
+                  </span>
+                  <Switch
+                    checked={editOmitSamplingParams ?? false}
+                    onChange={(value) => {
+                      setEditOmitSamplingParams(value);
+                      markMetadataManual('omit_sampling_params');
+                    }}
+                  />
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm" style={{ color: token.colorText }}>{t('settings.forceMaxTokens')}</span>
-                  <Switch size="small" checked={editForceMaxTokens} onChange={setEditForceMaxTokens} />
+                  <Switch checked={editForceMaxTokens} onChange={setEditForceMaxTokens} />
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-sm" style={{ color: token.colorText }}>{t('settings.thinkingParamStyle')}</span>
                   <Select
-                    size="small"
                     style={{ width: REASONING_PROFILE_SELECT_WIDTH }}
                     popupMatchSelectWidth={REASONING_PROFILE_POPUP_WIDTH}
                     value={editThinkingParamStyle}
@@ -2028,12 +2597,24 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                     {editExtraBodyError ? t(editExtraBodyError) : t('settings.extraBodyHint')}
                   </Text>
                 </div>
-              </div>
-            </div>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
           </div>
         )}
       </Modal>
+
+      <ModelMetadataSyncModal
+        open={metadataSyncModalOpen}
+        loading={metadataSyncLoading}
+        currentModel={metadataSyncCurrent}
+        inferredModel={metadataSyncCandidate?.proposed_model ?? null}
+        unsupportedReason={metadataSyncCandidate?.unsupported_reason}
+        onCancel={() => setMetadataSyncModalOpen(false)}
+        onApply={handleApplyMetadataSync}
+      />
 
       {/* Batch Edit Modal */}
       <Modal
@@ -2046,7 +2627,7 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         cancelText={t('common.cancel')}
         width={520}
         destroyOnHidden
-        okButtonProps={{ disabled: ![batchModelTypeEnabled, batchCapabilitiesEnabled, batchMaxTokensEnabled, batchTemperatureEnabled, batchTopPEnabled, batchMaxTokensParamEnabled, batchFreqPenaltyEnabled, batchUseMaxCompletionTokensEnabled, batchNoSystemRoleEnabled, batchForceMaxTokensEnabled, batchThinkingParamStyleEnabled].some(Boolean) }}
+        okButtonProps={{ disabled: ![batchModelTypeEnabled, batchCapabilitiesEnabled, batchContextWindowEnabled, batchTemperatureEnabled, batchTopPEnabled, batchMaxTokensParamEnabled, batchFreqPenaltyEnabled, batchUseMaxCompletionTokensEnabled, batchNoSystemRoleEnabled, batchForceMaxTokensEnabled, batchThinkingParamStyleEnabled].some(Boolean) }}
       >
         <div data-os-scrollbar style={{ maxHeight: '70vh', overflowY: 'auto', paddingRight: 4 }}>
         <div className="space-y-3">
@@ -2080,10 +2661,12 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
             </div>
           </div>
 
-          <Divider className="!my-2" />
+          {!batchEditIsImageMode && (
+            <>
+              <Divider className="!my-2" />
 
-          {/* Capabilities */}
-          <div>
+              {/* Capabilities */}
+              <div>
             <div className="flex items-center justify-between mb-1.5">
               <div className="font-medium" style={{ fontSize: 13 }}>{t('settings.modelAbilities')}</div>
               <Switch size="small" checked={batchCapabilitiesEnabled} onChange={setBatchCapabilitiesEnabled} />
@@ -2109,22 +2692,23 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 );
               })}
             </div>
-          </div>
+              </div>
 
-          <Divider className="!my-2" />
+              <Divider className="!my-2" />
 
-          {/* Context Window */}
-          <div>
+              {/* Context Window */}
+              <div>
             <div className="flex items-center justify-between mb-1.5">
               <span className="font-medium" style={{ fontSize: 13 }}>{t('settings.contextWindow')}</span>
-              <Switch size="small" checked={batchMaxTokensEnabled} onChange={setBatchMaxTokensEnabled} />
+              <Switch size="small" checked={batchContextWindowEnabled} onChange={setBatchContextWindowEnabled} />
             </div>
-            <div style={{ opacity: batchMaxTokensEnabled ? 1 : 0.4, pointerEvents: batchMaxTokensEnabled ? 'auto' : 'none' }}>
+            <div style={{ opacity: batchContextWindowEnabled ? 1 : 0.4, pointerEvents: batchContextWindowEnabled ? 'auto' : 'none' }}>
               <div className="flex items-center justify-between" style={{ padding: '4px 0' }}>
                 <InputNumber
-                  value={batchMaxTokens}
-                  onChange={(v) => v != null && setBatchMaxTokens(v)}
+                  value={batchContextWindow}
+                  onChange={(v) => v != null && setBatchContextWindow(v)}
                   min={1024}
+                  max={10000000}
                   step={1024}
                   style={{ width: 110 }}
                   size="small"
@@ -2136,14 +2720,14 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 max={1048576}
                 step={1024}
                 marks={{ 1024: '', 32768: '32K', 131072: '128K', 524288: '512K', 1048576: '1M' }}
-                value={Math.min(batchMaxTokens, 1048576)}
-                onChange={(v) => setBatchMaxTokens(v)}
+                value={Math.min(batchContextWindow, 1048576)}
+                onChange={setBatchContextWindow}
               />
             </div>
-          </div>
+              </div>
 
-          {/* Parameters */}
-          <div>
+              {/* Parameters */}
+              <div>
             <div className="font-medium mb-2" style={{ fontSize: 13 }}>{t('settings.modelParams')}</div>
             <div>
               <ModelParamSliders
@@ -2217,7 +2801,9 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 />
               </div>
             </div>
-          </div>
+              </div>
+            </>
+          )}
         </div>
         </div>
       </Modal>
@@ -2276,185 +2862,15 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
       </Modal>
 
       {/* Model picker modal */}
-      <Modal
-        title={t('settings.syncModels')}
+      <ModelSyncPickerModal
         open={pickerOpen}
+        entries={pickerModels}
+        catalog={pickerCatalog}
+        localModels={provider.models}
+        provider={provider}
         onCancel={() => setPickerOpen(false)}
-        onOk={handlePickerConfirm}
-        okText={t('settings.applyModelSync')}
-        cancelText={t('common.cancel')}
-        okButtonProps={{ disabled: pickerSelected.size === 0 }}
-        width={560}
-        styles={{ body: { padding: 0 } }}
-        afterOpenChange={(open) => { if (open) pickerVirtualizer.measure(); }}
-      >
-        {(() => {
-          const { filtered } = pickerGroups;
-          const allFilteredChecked = filtered.length > 0 && filtered.every(({ model }) => pickerSelected.has(model.model_id));
-          const someFilteredChecked = filtered.some(({ model }) => pickerSelected.has(model.model_id));
-          return (
-            <>
-              <div style={{ position: 'sticky', top: 0, zIndex: 1, background: 'inherit', padding: '8px 24px', borderBottom: `1px solid ${token.colorBorderSecondary}`, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Checkbox
-                  checked={allFilteredChecked}
-                  indeterminate={someFilteredChecked && !allFilteredChecked}
-                  onChange={(e) => {
-                    setPickerSelected((prev) => {
-                      const next = new Set(prev);
-                      for (const { model } of filtered) {
-                        if (e.target.checked) next.add(model.model_id);
-                        else next.delete(model.model_id);
-                      }
-                      return next;
-                    });
-                  }}
-                  style={{ whiteSpace: 'nowrap' }}
-                >
-                  {t('common.selectAll')} ({pickerSelected.size}/{pickerModels.length})
-                </Checkbox>
-                <Input
-                  placeholder={t('settings.searchModels')}
-                  prefix={<Search size={14} />}
-                  value={pickerSearch}
-                  onChange={(e) => setPickerSearch(e.target.value)}
-                  allowClear
-                  size="small"
-                  style={{ flex: 1 }}
-                />
-                <Tooltip title={pickerCollapsed.size === 0 ? t('settings.collapseAll') : t('settings.expandAll')}>
-                  <Button
-                    size="small"
-                    type="text"
-                    icon={pickerCollapsed.size === 0 ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                    onClick={() => {
-                      if (pickerCollapsed.size === 0) {
-                        setPickerCollapsed(new Set(pickerGroups.entries.map(([g]) => g)));
-                      } else {
-                        setPickerCollapsed(new Set());
-                      }
-                    }}
-                  />
-                </Tooltip>
-              </div>
-              <div
-                ref={pickerListParentRef}
-                className="model-picker-list"
-                data-os-scrollbar
-                style={{ maxHeight: 420, overflow: 'auto', padding: '8px 16px 12px' }}
-              >
-                <div style={{ height: pickerVirtualizer.getTotalSize(), position: 'relative' }}>
-                  {pickerVirtualizer.getVirtualItems().map((virtualRow) => {
-                    const row = flatPickerRows[virtualRow.index];
-                    if (row.type === 'spacer') {
-                      return (
-                        <div
-                          key={virtualRow.key}
-                          data-index={virtualRow.index}
-                          ref={pickerVirtualizer.measureElement}
-                          style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: 8, transform: `translateY(${virtualRow.start}px)` }}
-                        />
-                      );
-                    }
-                    if (row.type === 'group') {
-                      const { group, models } = row;
-                      const allChecked = models.every(({ model }) => pickerSelected.has(model.model_id));
-                      const someChecked = models.some(({ model }) => pickerSelected.has(model.model_id));
-                      const collapsed = pickerCollapsed.has(group);
-                      return (
-                        <div
-                          key={`g-${group}`}
-                          data-index={virtualRow.index}
-                          ref={pickerVirtualizer.measureElement}
-                          style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${virtualRow.start}px)` }}
-                        >
-                          <div
-                            className="flex items-center gap-2 px-2 py-1.5 rounded-md"
-                            style={{ cursor: 'pointer', userSelect: 'none', background: 'var(--ant-color-fill-quaternary, rgba(0,0,0,0.02))' }}
-                            onClick={() => setPickerCollapsed((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(group)) next.delete(group); else next.add(group);
-                              return next;
-                            })}
-                          >
-                            {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-                            <div onClick={(e) => e.stopPropagation()}>
-                              <Checkbox
-                                checked={allChecked}
-                                indeterminate={someChecked && !allChecked}
-                                onChange={(e) => {
-                                  setPickerSelected((prev) => {
-                                    const next = new Set(prev);
-                                    for (const { model } of models) {
-                                      if (e.target.checked) next.add(model.model_id);
-                                      else next.delete(model.model_id);
-                                    }
-                                    return next;
-                                  });
-                                }}
-                              />
-                            </div>
-                            <ModelIcon model={models[0]?.model.model_id ?? group} size={20} type="avatar" />
-                            <Text style={{ fontWeight: 600 }}>{group}</Text>
-                            <Tag style={{ fontSize: 11, lineHeight: '18px', padding: '0 6px', margin: 0 }}>{models.length}</Tag>
-                          </div>
-                        </div>
-                      );
-                    }
-                    // model row
-                    const { item } = row;
-                    const { model: m } = item;
-                    return (
-                      <div
-                        key={`m-${m.model_id}`}
-                        data-index={virtualRow.index}
-                        ref={pickerVirtualizer.measureElement}
-                        style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${virtualRow.start}px)` }}
-                      >
-                        <div
-                          className="flex items-center gap-2 px-2 py-1.5 rounded-md"
-                          style={{ paddingLeft: 36 }}
-                        >
-                          <Checkbox
-                            checked={pickerSelected.has(m.model_id)}
-                            aria-label={m.model_id}
-                            onChange={(e) => {
-                              setPickerSelected((prev) => {
-                                const next = new Set(prev);
-                                if (e.target.checked) next.add(m.model_id);
-                                else next.delete(m.model_id);
-                                return next;
-                              });
-                            }}
-                          />
-                          <ModelIcon model={m.model_id} size={20} type="avatar" />
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-1 flex-wrap">
-                              <span>{m.name || m.model_id}</span>
-                              {m.name && m.name !== m.model_id && (
-                                <Text type="secondary" style={{ fontSize: 11 }}>({m.model_id})</Text>
-                              )}
-                              {item.status === 'local-only' && (
-                                <Tag color={MODEL_SYNC_STATUS_CONFIG['local-only'].color} style={{ marginInlineStart: 4 }}>
-                                  {t(MODEL_SYNC_STATUS_CONFIG['local-only'].labelKey)}
-                                </Tag>
-                              )}
-                            </div>
-                            {item.localModel && item.remoteModel && item.localModel.name !== item.remoteModel.name && (
-                              <Text type="secondary" style={{ fontSize: 11 }}>
-                                {t('settings.remoteName')}: {item.remoteModel.name}
-                              </Text>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </>
-          );
-        })()}
-      </Modal>
+        onApply={handlePickerApply}
+      />
 
       {/* Provider Edit Modal */}
       <Modal
@@ -2464,9 +2880,20 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
         onOk={() => {
           const trimmed = editProviderName.trim();
           if (!trimmed) return;
+          if (editProviderType === 'bedrock' && !editAwsRegion.trim()) {
+            message.error(t('settings.awsRegionRequired'));
+            return;
+          }
           const updates: Record<string, unknown> = {};
           if (trimmed !== provider.name) updates.name = trimmed;
           if (editProviderType !== provider.provider_type) updates.provider_type = editProviderType;
+          if (editProviderType === 'bedrock') {
+            updates.aws_region = editAwsRegion.trim();
+            updates.api_host = '';
+          } else if (provider.provider_type === 'bedrock') {
+            updates.aws_region = null;
+            updates.api_host = DEFAULT_HOSTS[editProviderType];
+          }
           if (Object.keys(updates).length > 0) {
             updateProvider(providerId, updates);
           }
@@ -2501,12 +2928,31 @@ export function ProviderDetail({ providerId }: ProviderDetailProps) {
                 { label: 'Jina', value: 'jina' },
                 { label: 'Cohere', value: 'cohere' },
                 { label: 'Voyage', value: 'voyage' },
+                { label: 'AWS Bedrock', value: 'bedrock' },
                 { label: t('settings.custom'), value: 'custom' },
-              ]}
+              ].map((option) => ({
+                ...option,
+                disabled: option.value === 'bedrock'
+                  ? provider.provider_type !== 'bedrock'
+                  : provider.provider_type === 'bedrock',
+              }))}
               popupMatchSelectWidth={false}
               style={{ width: '100%' }}
             />
           </Form.Item>
+          {editProviderType === 'bedrock' && (
+            <Form.Item label={t('settings.awsRegion')} required style={{ marginBottom: 0 }}>
+              <AutoComplete
+                value={editAwsRegion}
+                options={AWS_REGION_OPTIONS}
+                onChange={setEditAwsRegion}
+                placeholder="us-east-1"
+                filterOption={(input, option) =>
+                  String(option?.value ?? '').toLowerCase().includes(input.toLowerCase())
+                }
+              />
+            </Form.Item>
+          )}
         </Form>
       </Modal>
     </div>

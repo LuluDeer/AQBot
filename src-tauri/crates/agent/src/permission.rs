@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub enum RiskLevel {
     ReadOnly,
     Write,
+    /// MCP tools retain execute-level UI risk while following session-mode approval rules.
+    Mcp,
     Execute,
 }
 
@@ -34,9 +36,16 @@ pub enum PermissionAction {
     HardDeny,
 }
 
+/// Agent-facing alias prefix for tools backed by selected MCP servers.
+pub const MCP_TOOL_ALIAS_PREFIX: &str = "mcp__";
+
 /// Classify a tool's risk level based on its name
 pub fn classify_tool_risk(tool_name: &str) -> RiskLevel {
     let name_lower = tool_name.to_lowercase();
+
+    if name_lower.starts_with(MCP_TOOL_ALIAS_PREFIX) {
+        return RiskLevel::Mcp;
+    }
 
     // Execute-level tools
     if matches!(
@@ -86,8 +95,8 @@ pub fn decide_permission(
     risk: RiskLevel,
     is_always_allowed: bool,
 ) -> PermissionAction {
-    // If tool was previously approved with "always allow", auto-allow
-    if is_always_allowed {
+    // Cached "always allow" never covers MCP or Execute tools.
+    if is_always_allowed && allows_persistent_approval(risk) {
         return PermissionAction::AutoAllow;
     }
 
@@ -95,14 +104,87 @@ pub fn decide_permission(
         // Default mode: only read is auto-allowed
         (PermissionMode::Default, RiskLevel::ReadOnly) => PermissionAction::AutoAllow,
         (PermissionMode::Default, RiskLevel::Write) => PermissionAction::RequireApproval,
+        (PermissionMode::Default, RiskLevel::Mcp) => PermissionAction::RequireApproval,
         (PermissionMode::Default, RiskLevel::Execute) => PermissionAction::RequireApproval,
 
-        // Accept edits: read + write auto-allowed
+        // Accept edits: read, write, and selected MCP tools auto-allowed
         (PermissionMode::AcceptEdits, RiskLevel::ReadOnly) => PermissionAction::AutoAllow,
         (PermissionMode::AcceptEdits, RiskLevel::Write) => PermissionAction::AutoAllow,
+        (PermissionMode::AcceptEdits, RiskLevel::Mcp) => PermissionAction::AutoAllow,
         (PermissionMode::AcceptEdits, RiskLevel::Execute) => PermissionAction::RequireApproval,
 
         // Full access: everything auto-allowed
         (PermissionMode::FullAccess, _) => PermissionAction::AutoAllow,
+    }
+}
+
+/// Whether "always allow" may be persisted for this risk.
+pub fn allows_persistent_approval(risk: RiskLevel) -> bool {
+    !matches!(risk, RiskLevel::Mcp | RiskLevel::Execute)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_and_shell_are_execute() {
+        assert_eq!(classify_tool_risk("Bash"), RiskLevel::Execute);
+        assert_eq!(classify_tool_risk("shell"), RiskLevel::Execute);
+        assert_eq!(classify_tool_risk("run_command"), RiskLevel::Execute);
+    }
+
+    #[test]
+    fn default_and_accept_edits_require_approval_for_execute() {
+        assert_eq!(
+            decide_permission(PermissionMode::Default, RiskLevel::Execute, false),
+            PermissionAction::RequireApproval
+        );
+        assert_eq!(
+            decide_permission(PermissionMode::AcceptEdits, RiskLevel::Execute, false),
+            PermissionAction::RequireApproval
+        );
+    }
+
+    #[test]
+    fn full_access_auto_allows_execute() {
+        assert_eq!(
+            decide_permission(PermissionMode::FullAccess, RiskLevel::Execute, false),
+            PermissionAction::AutoAllow
+        );
+    }
+
+    #[test]
+    fn execute_cannot_use_persistent_allow_or_cached_always_allowed() {
+        assert!(!allows_persistent_approval(RiskLevel::Execute));
+        assert!(allows_persistent_approval(RiskLevel::Write));
+        assert_eq!(
+            decide_permission(PermissionMode::Default, RiskLevel::Execute, true),
+            PermissionAction::RequireApproval
+        );
+        assert_eq!(
+            decide_permission(PermissionMode::Default, RiskLevel::Write, true),
+            PermissionAction::AutoAllow
+        );
+    }
+
+    #[test]
+    fn mcp_tools_follow_session_mode_and_never_persistently_approve() {
+        let risk = classify_tool_risk("mcp__server_query__0123456789abcdef");
+
+        assert_eq!(risk, RiskLevel::Mcp);
+        assert_eq!(
+            decide_permission(PermissionMode::Default, risk, true),
+            PermissionAction::RequireApproval
+        );
+        assert_eq!(
+            decide_permission(PermissionMode::AcceptEdits, risk, true),
+            PermissionAction::AutoAllow
+        );
+        assert_eq!(
+            decide_permission(PermissionMode::FullAccess, risk, true),
+            PermissionAction::AutoAllow
+        );
+        assert!(!allows_persistent_approval(risk));
     }
 }

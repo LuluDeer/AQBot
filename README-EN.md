@@ -2,6 +2,7 @@
 
 [![AQBot](https://socialify.git.ci/AQBot-Desktop/AQBot/image?description=1&font=JetBrains+Mono&forks=1&issues=1&logo=https%3A%2F%2Fgithub.com%2FAQBot-Desktop%2FAQBot%2Fblob%2Fmain%2Fsrc%2Fassets%2Fimage%2Flogo.png%3Fraw%3Dtrue&name=1&owner=1&pattern=Floating+Cogs&pulls=1&stargazers=1&theme=Auto)](https://github.com/AQBot-Desktop/AQBot)
 
+AQBot is a local-first desktop AI workspace that brings multi-provider chat, ACP agents, knowledge bases, MCP tools and an API gateway together while keeping app data and user files under your control.
 
 ## Screenshots
 
@@ -36,9 +37,13 @@
 
 ### AI Agent
 
-- **Agent mode** — Let the model read and edit files, run commands and analyze code inside a controlled desktop workflow.
-- **Permission control** — Choose standard review, auto-accept edits or full-access mode while keeping working-directory sandbox checks active.
-- **Approval and cost UI** — Review tool calls in real time, remember allow decisions and track token/cost usage for each agent session.
+- **Two ways to use agents** — AQBot provides both a built-in agent inside Chat and a separate ACP agent workbench. The first uses your configured provider APIs; the second connects to external ACP-compatible agent processes, so you can choose the right path for each model and workflow.
+- **Chat agent (provider API)** — Switch a regular conversation to Agent mode and use any configured provider and model API to read or edit files, run commands and analyze code in a chosen working directory. That directory is the process starting CWD, not a filesystem sandbox.
+- **Chat agent controls** — Choose permission modes such as ask every time, accept edits or full access, review tool calls and approvals in real time, and track token and cost usage for each run.
+- **ACP agent workbench** — Run compatible coding agents through [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) in a dedicated workbench, with streaming responses, reasoning and tool calls.
+- **ACP Registry and custom integrations** — Add agents such as Codex, Claude Agent, Gemini CLI, Cline, OpenCode and Grok Build from the Registry, or configure a custom command, arguments, environment variables and icon; agents can be enabled and reordered freely.
+- **ACP projects and direct chats** — Organize threads by project, pin important sessions and restore your last workspace automatically, or start a direct chat without selecting a project in an isolated working directory.
+- **Complete ACP session interaction** — Switch models, modes and options exposed by each agent, and work with attachments, questionnaires, plan reviews, plan progress and persisted state across reloads; tool requests can be allowed once or set to “Always Allow” for the current session.
 
 ### Roles
 

@@ -16,6 +16,7 @@ use aqbot_core::types::{
 use aqbot_providers::{ProviderAdapter, ProviderRequestContext};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Bridge between AQBot providers and the open-agent-sdk LLMProvider interface.
 pub struct AQBotProviderBridge {
@@ -23,8 +24,11 @@ pub struct AQBotProviderBridge {
     ctx: ProviderRequestContext,
     api_type: ApiType,
     model_param_overrides: Option<ModelParamOverrides>,
+    model_max_output_tokens: Option<u32>,
     app: Option<tauri::AppHandle>,
     conversation_id: Option<String>,
+    first_packet_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 impl AQBotProviderBridge {
@@ -57,8 +61,11 @@ impl AQBotProviderBridge {
             ctx,
             api_type,
             model_param_overrides: None,
+            model_max_output_tokens: None,
             app: None,
             conversation_id: None,
+            first_packet_timeout: Some(Duration::from_secs(180)),
+            idle_timeout: Some(Duration::from_secs(90)),
         })
     }
 
@@ -67,10 +74,25 @@ impl AQBotProviderBridge {
         self
     }
 
+    pub fn with_model_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.model_max_output_tokens = max_output_tokens;
+        self
+    }
+
     /// Attach a Tauri AppHandle for streaming text chunks to the frontend.
     pub fn with_app(mut self, app: tauri::AppHandle, conversation_id: String) -> Self {
         self.app = Some(app);
         self.conversation_id = Some(conversation_id);
+        self
+    }
+
+    pub fn with_stream_timeouts(
+        mut self,
+        first_packet: Option<Duration>,
+        idle: Option<Duration>,
+    ) -> Self {
+        self.first_packet_timeout = first_packet;
+        self.idle_timeout = idle;
         self
     }
 }
@@ -86,23 +108,59 @@ impl LLMProvider for AQBotProviderBridge {
         request: ProviderRequest<'_>,
         stream_tx: Option<tokio::sync::mpsc::Sender<SDKMessage>>,
     ) -> Result<ProviderResponse, ApiError> {
-        let chat_request = convert_request(request, self.model_param_overrides.as_ref());
+        let chat_request = convert_request(
+            request,
+            self.model_param_overrides.as_ref(),
+            self.model_max_output_tokens,
+        );
 
         let mut stream = self.adapter.chat_stream(&self.ctx, chat_request);
         let mut accumulated_text = String::new();
         let mut accumulated_thinking = String::new();
         let mut final_tool_calls: Option<Vec<ToolCall>> = None;
         let mut final_usage: Option<TokenUsage> = None;
+        let mut emitted_delta = false;
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(chunk) => {
+        if let Some(ref tx) = stream_tx {
+            let _ = tx.try_send(SDKMessage::Stage {
+                stage: "waiting_model".to_string(),
+                retry_attempt: None,
+                retry_wait_ms: None,
+            });
+        }
+
+        loop {
+            let timeout = if emitted_delta {
+                self.idle_timeout
+            } else {
+                self.first_packet_timeout
+            };
+            let next = match timeout {
+                Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        let phase = if emitted_delta {
+                            "idle"
+                        } else {
+                            "first_packet"
+                        };
+                        return Err(ApiError::StreamTimeout {
+                            phase: phase.to_string(),
+                            timeout_secs: limit.as_secs(),
+                        });
+                    }
+                },
+                None => stream.next().await,
+            };
+
+            match next {
+                Some(Ok(chunk)) => {
+                    let mut chunk_has_delta = false;
                     if let Some(ref text) = chunk.content {
                         if !text.is_empty() {
+                            chunk_has_delta = true;
                             accumulated_text.push_str(text);
 
-                            // Emit streaming text delta via SDK channel
-                            // (agent.rs will forward to frontend as agent-stream-text)
                             if let Some(ref tx) = stream_tx {
                                 let _ = tx.try_send(SDKMessage::TextDelta { text: text.clone() });
                             }
@@ -111,10 +169,9 @@ impl LLMProvider for AQBotProviderBridge {
 
                     if let Some(ref thinking) = chunk.thinking {
                         if !thinking.is_empty() {
+                            chunk_has_delta = true;
                             accumulated_thinking.push_str(thinking);
 
-                            // Emit streaming thinking delta via SDK channel
-                            // (agent.rs will forward to frontend as agent-stream-thinking)
                             if let Some(ref tx) = stream_tx {
                                 let _ = tx.try_send(SDKMessage::ThinkingDelta {
                                     thinking: thinking.clone(),
@@ -123,7 +180,8 @@ impl LLMProvider for AQBotProviderBridge {
                         }
                     }
 
-                    if chunk.tool_calls.is_some() {
+                    if chunk.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                        chunk_has_delta = true;
                         final_tool_calls.clone_from(&chunk.tool_calls);
                     }
 
@@ -131,13 +189,28 @@ impl LLMProvider for AQBotProviderBridge {
                         final_usage.clone_from(&chunk.usage);
                     }
 
+                    if chunk_has_delta && !emitted_delta {
+                        emitted_delta = true;
+                        if let Some(ref tx) = stream_tx {
+                            let _ = tx.try_send(SDKMessage::Stage {
+                                stage: "streaming".to_string(),
+                                retry_attempt: None,
+                                retry_wait_ms: None,
+                            });
+                        }
+                    }
+
                     if chunk.done {
                         break;
                     }
                 }
-                Err(e) => {
-                    return Err(classify_provider_error(e));
+                Some(Err(error)) => {
+                    if emitted_delta {
+                        return Err(ApiError::StreamInterrupted(error.to_string()));
+                    }
+                    return Err(classify_provider_error(error));
                 }
+                None => break,
             }
         }
 
@@ -171,6 +244,7 @@ impl LLMProvider for AQBotProviderBridge {
 fn convert_request(
     request: ProviderRequest<'_>,
     model_param_overrides: Option<&ModelParamOverrides>,
+    model_max_output_tokens: Option<u32>,
 ) -> ChatRequest {
     let messages: Vec<ChatMessage> = request
         .messages
@@ -203,7 +277,15 @@ fn convert_request(
     let mut final_messages = Vec::new();
     if let Some(sys) = system_text {
         final_messages.push(ChatMessage {
-            role: "system".to_string(),
+            role: if model_param_overrides
+                .and_then(|overrides| overrides.no_system_role)
+                == Some(true)
+            {
+                "user"
+            } else {
+                "system"
+            }
+            .to_string(),
             content: ChatContent::Text(sys),
             reasoning_content: None,
             tool_calls: None,
@@ -212,10 +294,9 @@ fn convert_request(
     }
     final_messages.extend(messages);
 
-    let force_model_max_tokens = model_param_overrides
-        .and_then(|overrides| overrides.force_max_tokens)
-        == Some(true);
-    let max_tokens = if request.max_tokens > 0 {
+    let force_model_max_tokens =
+        model_param_overrides.and_then(|overrides| overrides.force_max_tokens) == Some(true);
+    let configured_max_tokens = if request.max_tokens > 0 {
         Some(request.max_tokens as u32)
     } else if force_model_max_tokens {
         model_param_overrides
@@ -223,6 +304,17 @@ fn convert_request(
             .or(Some(4096))
     } else {
         None
+    };
+    let max_tokens = match (configured_max_tokens, model_max_output_tokens) {
+        (Some(configured), Some(limit)) if configured > limit => {
+            tracing::warn!(
+                configured_max_tokens = configured,
+                model_max_output_tokens = limit,
+                "Clamped agent output tokens to the model metadata limit"
+            );
+            Some(limit)
+        }
+        (configured, _) => configured,
     };
 
     ChatRequest {
@@ -491,6 +583,7 @@ mod tests {
             frequency_penalty: None,
             use_max_completion_tokens: Some(false),
             no_system_role: None,
+            omit_sampling_params: None,
             force_max_tokens: None,
             thinking_param_style: Some("enable_thinking".to_string()),
             reasoning_profile: Some("siliconflow_enable_thinking".to_string()),
@@ -517,7 +610,7 @@ mod tests {
             thinking: None,
         };
 
-        let converted = convert_request(request, Some(&param_overrides()));
+        let converted = convert_request(request, Some(&param_overrides()), None);
 
         assert_eq!(converted.max_tokens, None);
         assert_eq!(
@@ -550,7 +643,7 @@ mod tests {
         let mut overrides = param_overrides();
         overrides.force_max_tokens = Some(true);
 
-        let converted = convert_request(request, Some(&overrides));
+        let converted = convert_request(request, Some(&overrides), None);
 
         assert_eq!(converted.max_tokens, Some(2048));
     }
@@ -572,9 +665,31 @@ mod tests {
             thinking: None,
         };
 
-        let converted = convert_request(request, Some(&param_overrides()));
+        let converted = convert_request(request, Some(&param_overrides()), None);
 
         assert_eq!(converted.max_tokens, Some(8192));
+    }
+
+    #[test]
+    fn convert_request_clamps_sdk_max_tokens_to_model_limit() {
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let request = ProviderRequest {
+            model: "deepseek-reasoner",
+            max_tokens: 8192,
+            messages: &messages,
+            system: None,
+            tools: None,
+            thinking: None,
+        };
+
+        let converted = convert_request(request, Some(&param_overrides()), Some(4096));
+
+        assert_eq!(converted.max_tokens, Some(4096));
     }
 
     #[test]
@@ -605,5 +720,166 @@ mod tests {
             Some("hidden reasoning")
         );
         assert!(converted[0].tool_calls.is_some());
+    }
+
+    struct PendingAdapter;
+
+    #[async_trait::async_trait]
+    impl aqbot_providers::ProviderAdapter for PendingAdapter {
+        async fn chat(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::ChatRequest,
+        ) -> aqbot_core::error::Result<aqbot_core::types::ChatResponse> {
+            Err(aqbot_core::error::AQBotError::Provider("unused".into()))
+        }
+
+        fn chat_stream(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = aqbot_core::error::Result<aqbot_core::types::ChatStreamChunk>>
+                    + Send,
+            >,
+        > {
+            Box::pin(futures::stream::pending())
+        }
+
+        async fn list_models(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+        ) -> aqbot_core::error::Result<Vec<aqbot_core::types::Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn embed(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::EmbedRequest,
+        ) -> aqbot_core::error::Result<aqbot_core::types::EmbedResponse> {
+            Err(aqbot_core::error::AQBotError::Provider("unused".into()))
+        }
+    }
+
+    struct PartialThenErrorAdapter;
+
+    #[async_trait::async_trait]
+    impl aqbot_providers::ProviderAdapter for PartialThenErrorAdapter {
+        async fn chat(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::ChatRequest,
+        ) -> aqbot_core::error::Result<aqbot_core::types::ChatResponse> {
+            Err(aqbot_core::error::AQBotError::Provider("unused".into()))
+        }
+
+        fn chat_stream(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::ChatRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = aqbot_core::error::Result<aqbot_core::types::ChatStreamChunk>>
+                    + Send,
+            >,
+        > {
+            Box::pin(futures::stream::iter([
+                Ok(aqbot_core::types::ChatStreamChunk {
+                    content: Some("partial".to_string()),
+                    thinking: None,
+                    done: false,
+                    is_final: None,
+                    usage: None,
+                    tool_calls: None,
+                }),
+                Err(aqbot_core::error::AQBotError::Provider("boom".into())),
+            ]))
+        }
+
+        async fn list_models(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+        ) -> aqbot_core::error::Result<Vec<aqbot_core::types::Model>> {
+            Ok(Vec::new())
+        }
+
+        async fn embed(
+            &self,
+            _ctx: &aqbot_providers::ProviderRequestContext,
+            _request: aqbot_core::types::EmbedRequest,
+        ) -> aqbot_core::error::Result<aqbot_core::types::EmbedResponse> {
+            Err(aqbot_core::error::AQBotError::Provider("unused".into()))
+        }
+    }
+
+    fn dummy_ctx() -> aqbot_providers::ProviderRequestContext {
+        aqbot_providers::ProviderRequestContext {
+            api_key: String::new(),
+            key_id: String::new(),
+            provider_id: "p".to_string(),
+            base_url: None,
+            api_path: None,
+            aws_region: None,
+            proxy_config: None,
+            custom_headers: None,
+        }
+    }
+
+    fn user_request(messages: &[Message]) -> ProviderRequest<'_> {
+        ProviderRequest {
+            model: "test-model",
+            max_tokens: 16,
+            messages,
+            system: None,
+            tools: None,
+            thinking: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn first_packet_timeout_is_not_retryable() {
+        let bridge = AQBotProviderBridge::new(std::sync::Arc::new(PendingAdapter), dummy_ctx(), "openai")
+            .unwrap()
+            .with_stream_timeouts(Some(Duration::from_millis(50)), Some(Duration::from_secs(1)));
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let error = bridge
+            .create_message(user_request(&messages), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::StreamTimeout { ref phase, .. } if phase == "first_packet"
+        ));
+        assert!(!open_agent_sdk::utils::retry::is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_delta_is_stream_interrupted() {
+        let bridge = AQBotProviderBridge::new(
+            std::sync::Arc::new(PartialThenErrorAdapter),
+            dummy_ctx(),
+            "openai",
+        )
+        .unwrap()
+        .with_stream_timeouts(None, None);
+        let messages = vec![Message {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let error = bridge
+            .create_message(user_request(&messages), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::StreamInterrupted(_)));
+        assert!(!open_agent_sdk::utils::retry::is_retryable(&error));
     }
 }
