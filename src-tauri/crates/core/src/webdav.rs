@@ -422,9 +422,9 @@ pub fn extract_backup_zip(zip_path: &Path, dest_dir: &Path) -> Result<BackupZipC
                 "Unsafe ZIP entry path: {raw_name}"
             )));
         }
-        let enclosed = entry.enclosed_name().ok_or_else(|| {
-            AQBotError::Gateway(format!("Unsafe ZIP entry path: {raw_name}"))
-        })?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| AQBotError::Gateway(format!("Unsafe ZIP entry path: {raw_name}")))?;
         if enclosed
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
@@ -588,8 +588,8 @@ pub fn verify_backup_media_manifest(
         }
         return Ok(());
     };
-    let entries: Vec<BackupMediaManifestEntry> = serde_json::from_value(manifest.clone())
-        .map_err(|error| {
+    let entries: Vec<BackupMediaManifestEntry> =
+        serde_json::from_value(manifest.clone()).map_err(|error| {
             AQBotError::Validation(format!("Backup media manifest is invalid: {error}"))
         })?;
     let documents_root = extraction_root.join("documents");
@@ -616,7 +616,10 @@ pub fn verify_backup_media_manifest(
             )));
         }
         let mut file = std::fs::File::open(&path).map_err(|error| {
-            AQBotError::Gateway(format!("Failed to read backup media {}: {error}", entry.path))
+            AQBotError::Gateway(format!(
+                "Failed to read backup media {}: {error}",
+                entry.path
+            ))
         })?;
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
@@ -725,11 +728,20 @@ fn collect_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<()> 
     if !dir.is_dir() {
         return Ok(());
     }
+    if dir.file_name().and_then(|name| name.to_str()) == Some(".aqbot-skills-runtime") {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)
         .map_err(|e| AQBotError::Gateway(format!("Failed to read directory: {}", e)))?
     {
         let entry = entry.map_err(|e| AQBotError::Gateway(format!("Dir entry error: {}", e)))?;
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| AQBotError::Gateway(format!("Dir entry error: {}", e)))?;
+        if file_type.is_symlink() {
+            continue;
+        }
         if path.is_dir() {
             collect_files(&path, files)?;
         } else {
@@ -821,9 +833,7 @@ fn split_xml_responses(xml: &str) -> Vec<String> {
 /// later 200 value.
 fn extract_xml_value(xml: &str, tag_local_name: &str) -> Option<String> {
     let tag = regex::escape(&tag_local_name.to_lowercase());
-    let pattern = format!(
-        r"(?is)<(?:[\w.-]+:)?{tag}(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?{tag}>"
-    );
+    let pattern = format!(r"(?is)<(?:[\w.-]+:)?{tag}(?:\s[^>]*)?>(.*?)</(?:[\w.-]+:)?{tag}>");
     let re = regex::Regex::new(&pattern).ok()?;
 
     let mut first_empty: Option<String> = None;
@@ -1146,6 +1156,23 @@ mod tests {
         let files = parse_propfind_response(xml).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].size, 7777);
+    }
+
+    #[test]
+    fn collect_files_skips_skill_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("keep.txt"), "ok").unwrap();
+        let runtime = root.path().join(".aqbot-skills-runtime/session");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("skill.md"), "secret").unwrap();
+        let mut files = Vec::new();
+        collect_files(root.path(), &mut files).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert!(names.contains(&"keep.txt"));
+        assert!(!names.contains(&"skill.md"));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use open_agent_sdk::skills::SkillRuntimeMap;
 use open_agent_sdk::PermissionDecision;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -87,86 +88,112 @@ pub fn validate_path_within_cwd(path: &str, cwd: &str) -> Result<PathBuf, String
 /// Check if a tool's path arguments are safe (within cwd).
 /// Returns Some(PermissionDecision::Deny(reason)) if unsafe, None if safe or not applicable.
 pub fn check_path_safety(tool_name: &str, input: &Value, cwd: &str) -> Option<PermissionDecision> {
-    let name_lower = tool_name.to_lowercase();
+    check_path_safety_with_runtime(tool_name, input, cwd, None, true)
+}
 
-    match name_lower.as_str() {
-        // Single-file path tools
+pub fn check_path_safety_with_runtime(
+    tool_name: &str,
+    input: &Value,
+    cwd: &str,
+    runtime: Option<&SkillRuntimeMap>,
+    enforce_cwd: bool,
+) -> Option<PermissionDecision> {
+    let name_lower = tool_name.to_lowercase();
+    if matches!(
+        name_lower.as_str(),
+        "bash" | "shell" | "run_command" | "execute"
+    ) {
+        return None;
+    }
+
+    let write = is_mutating_tool(&name_lower);
+    let paths = collect_tool_paths(&name_lower, input);
+    if paths.is_empty() {
+        return None;
+    }
+
+    for path in paths {
+        if let Some(runtime) = runtime {
+            match runtime.authorize(&path, cwd, write) {
+                Some(Err(reason)) => return Some(PermissionDecision::Deny(reason)),
+                Some(Ok(())) => continue,
+                None => {}
+            }
+        }
+        if enforce_cwd {
+            if let Err(reason) = validate_path_within_cwd(&path, cwd) {
+                return Some(PermissionDecision::Deny(reason));
+            }
+        }
+    }
+    None
+}
+
+fn is_mutating_tool(name_lower: &str) -> bool {
+    matches!(
+        name_lower,
+        "write"
+            | "write_file"
+            | "edit"
+            | "edit_file"
+            | "create"
+            | "create_file"
+            | "delete"
+            | "delete_file"
+            | "rename"
+            | "move"
+            | "mkdir"
+            | "remove"
+            | "patch"
+    ) || name_lower.contains("write")
+        || name_lower.contains("edit")
+        || name_lower.contains("delete")
+        || name_lower.contains("patch")
+}
+
+fn collect_tool_paths(name_lower: &str, input: &Value) -> Vec<String> {
+    match name_lower {
         "read" | "read_file" | "write" | "write_file" | "edit" | "edit_file" | "create"
         | "create_file" | "delete" | "delete_file" | "rename" | "list_dir" | "listdir" => {
-            check_single_path(input, cwd)
+            let mut paths = Vec::new();
+            if let Some(path) = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .or_else(|| input.get("file"))
+                .and_then(|value| value.as_str())
+            {
+                paths.push(path.to_string());
+            }
+            if let Some(path) = input.get("new_path").and_then(|value| value.as_str()) {
+                paths.push(path.to_string());
+            }
+            paths
         }
-
-        // Glob tool — check base directory of pattern
-        "glob" | "glob_search" => check_glob_path(input, cwd),
-
-        // Grep tool — optional path
-        "grep" | "search" | "ripgrep" => check_grep_path(input, cwd),
-
-        // Bash/shell — no path checking (cwd is injected, but cd escape is Phase 4)
-        "bash" | "shell" | "run_command" | "execute" => None,
-
-        // Unknown tools — don't block
-        _ => None,
-    }
-}
-
-fn check_single_path(input: &Value, cwd: &str) -> Option<PermissionDecision> {
-    // Try common field names for path
-    let path_str = input
-        .get("path")
-        .or_else(|| input.get("file_path"))
-        .or_else(|| input.get("file"))
-        .and_then(|v| v.as_str());
-
-    if let Some(path) = path_str {
-        if let Err(reason) = validate_path_within_cwd(path, cwd) {
-            return Some(PermissionDecision::Deny(reason));
+        "glob" | "glob_search" => {
+            let mut paths = Vec::new();
+            if let Some(path) = input.get("path").and_then(|value| value.as_str()) {
+                paths.push(path.to_string());
+            }
+            if let Some(pattern) = input
+                .get("pattern")
+                .or_else(|| input.get("glob"))
+                .and_then(|value| value.as_str())
+            {
+                let base_dir = extract_glob_base(pattern);
+                if !base_dir.is_empty() {
+                    paths.push(base_dir);
+                }
+            }
+            paths
         }
+        "grep" | "search" | "ripgrep" => input
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
     }
-
-    // Also check "new_path" for rename operations
-    if let Some(new_path) = input.get("new_path").and_then(|v| v.as_str()) {
-        if let Err(reason) = validate_path_within_cwd(new_path, cwd) {
-            return Some(PermissionDecision::Deny(reason));
-        }
-    }
-
-    None
-}
-
-fn check_glob_path(input: &Value, cwd: &str) -> Option<PermissionDecision> {
-    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-        if let Err(reason) = validate_path_within_cwd(path, cwd) {
-            return Some(PermissionDecision::Deny(reason));
-        }
-    }
-
-    let pattern = input
-        .get("pattern")
-        .or_else(|| input.get("glob"))
-        .and_then(|v| v.as_str())?;
-
-    // Extract base directory from glob pattern (non-wildcard prefix)
-    let base_dir = extract_glob_base(pattern);
-
-    if !base_dir.is_empty() {
-        if let Err(reason) = validate_path_within_cwd(&base_dir, cwd) {
-            return Some(PermissionDecision::Deny(reason));
-        }
-    }
-    // Empty base_dir means pattern starts with wildcard → relative to cwd → safe
-
-    None
-}
-
-fn check_grep_path(input: &Value, cwd: &str) -> Option<PermissionDecision> {
-    // Grep path is optional — if not specified, defaults to cwd (safe)
-    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-        if let Err(reason) = validate_path_within_cwd(path, cwd) {
-            return Some(PermissionDecision::Deny(reason));
-        }
-    }
-    None
 }
 
 /// Extract the non-wildcard prefix from a glob pattern as a base directory.
@@ -186,4 +213,69 @@ fn extract_glob_base(pattern: &str) -> String {
         parts.push(segment);
     }
     parts.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use open_agent_sdk::skills::{load_skill_from_dir, sync_skill_runtime};
+    use open_agent_sdk::types::SkillSource;
+    use serde_json::json;
+    use std::fs;
+
+    fn mapped_runtime() -> (tempfile::TempDir, SkillRuntimeMap, String) {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let source = root.path().join("skill");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: test\n---\n\n# Demo\n",
+        )
+        .unwrap();
+        let skill = load_skill_from_dir(&source, SkillSource::AQBot).unwrap();
+        let map = sync_skill_runtime(&workspace, "11111111-1111-4111-8111-111111111111", &[skill])
+            .unwrap();
+        let cwd = workspace.to_string_lossy().into_owned();
+        (root, map, cwd)
+    }
+
+    #[test]
+    fn read_mapped_skill_is_allowed() {
+        let (_root, map, cwd) = mapped_runtime();
+        let path = map.mapped_dir_for("demo").unwrap().join("SKILL.md");
+        let decision = check_path_safety_with_runtime(
+            "Read",
+            &json!({"file_path": path.to_str().unwrap()}),
+            &cwd,
+            Some(&map),
+            true,
+        );
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn write_mapped_skill_is_denied_without_cwd_enforcement() {
+        let (_root, map, cwd) = mapped_runtime();
+        let path = map.mapped_dir_for("demo").unwrap().join("SKILL.md");
+        let decision = check_path_safety_with_runtime(
+            "Write",
+            &json!({"file_path": path.to_str().unwrap()}),
+            &cwd,
+            Some(&map),
+            false,
+        );
+        assert!(matches!(decision, Some(PermissionDecision::Deny(_))));
+    }
+
+    #[test]
+    fn outside_workspace_read_is_denied() {
+        let decision = check_path_safety(
+            "Read",
+            &json!({"file_path": "/etc/passwd"}),
+            std::env::temp_dir().to_str().unwrap(),
+        );
+        assert!(matches!(decision, Some(PermissionDecision::Deny(_))));
+    }
 }

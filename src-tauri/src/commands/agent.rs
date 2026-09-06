@@ -2,7 +2,7 @@ use crate::AppState;
 use aqbot_agent::permission::{
     allows_persistent_approval, classify_tool_risk, decide_permission, PermissionAction,
 };
-use aqbot_agent::security::check_path_safety;
+use aqbot_agent::security::check_path_safety_with_runtime;
 use aqbot_core::inline_media::{InlineDataStreamCapture, InlineDataStreamFilter};
 use aqbot_core::repo::{agent_session, conversation, message, provider, tool_execution};
 use aqbot_core::types::{
@@ -1075,8 +1075,9 @@ pub async fn agent_query(
     let retrieval_tag =
         super::conversations::build_memory_retrieval_tag(&rag_result.source_results);
     if !retrieval_tag.is_empty() {
-        let _ = message::update_message_content(&state.sea_db, &assistant_message_id, &retrieval_tag)
-            .await;
+        let _ =
+            message::update_message_content(&state.sea_db, &assistant_message_id, &retrieval_tag)
+                .await;
     }
     if !rag_result.errors.is_empty() {
         let message = rag_result
@@ -1150,6 +1151,39 @@ pub async fn agent_query(
         )
         .with_app(app.clone(), conversation_id.clone());
 
+    super::agent_status::emit_agent_stage(
+        &app,
+        &conversation_id,
+        &run_id,
+        super::agent_status::AgentWaitStage::PreparingSkills,
+    );
+    let inject_skills_summary = should_inject_skills_summary(
+        global_settings.agent_allowed_tools_enabled,
+        &global_settings.agent_allowed_tools,
+    );
+    let disabled = aqbot_core::repo::skill::get_disabled_skills(&state.sea_db)
+        .await
+        .map_err(|e| e.to_string())?;
+    let home = dirs::home_dir().unwrap_or_default();
+    let session_id_for_skills = session.id.clone();
+    let workspace_for_skills = session.cwd.clone().map(PathBuf::from);
+    let prepared_skills = tokio::task::spawn_blocking(move || {
+        super::agent_skills::prepare_agent_skills(
+            &home,
+            disabled,
+            inject_skills_summary,
+            workspace_for_skills.as_deref(),
+            &session_id_for_skills,
+        )
+    })
+    .await
+    .map_err(|error| format!("Failed to prepare skills: {error}"))?
+    .map_err(|error| format!("Failed to prepare skills: {error}"))?;
+    if cancel_token.is_cancelled() {
+        return Err("Agent cancelled during initialization".to_string());
+    }
+    let skill_runtime = prepared_skills.runtime.clone().map(Arc::new);
+
     // 8. Build permission callback (CanUseToolFn)
     let permission_mode =
         aqbot_agent::permission::PermissionMode::from_str(&session.permission_mode);
@@ -1179,17 +1213,26 @@ pub async fn agent_query(
         let db = db_for_perm.clone();
         let cancel_token = cancel_token_for_perm.clone();
         let mcp_display_names = mcp_display_names_for_perm.clone();
+        let skill_runtime = skill_runtime.clone();
 
         Box::pin(async move {
             if cancel_token.is_cancelled() {
                 return PermissionDecision::Deny("Agent cancelled".to_string());
             }
 
-            // 1. CWD safety check (hard deny, skipped in FullAccess mode)
-            if permission_mode != aqbot_agent::permission::PermissionMode::FullAccess
-                && !cwd.is_empty()
-            {
-                if let Some(deny) = check_path_safety(&tool_name, &input, &cwd) {
+            // Skill runtime writes are denied even in FullAccess. Other path
+            // checks stay skipped in FullAccess.
+            let enforce_cwd = permission_mode
+                != aqbot_agent::permission::PermissionMode::FullAccess
+                && !cwd.is_empty();
+            if skill_runtime.is_some() || enforce_cwd {
+                if let Some(deny) = check_path_safety_with_runtime(
+                    &tool_name,
+                    &input,
+                    &cwd,
+                    skill_runtime.as_deref(),
+                    enforce_cwd,
+                ) {
                     return deny;
                 }
             }
@@ -1319,28 +1362,6 @@ pub async fn agent_query(
         .await
         .map_err(|e| e.to_string())?;
 
-    super::agent_status::emit_agent_stage(
-        &app,
-        &conversation_id,
-        &run_id,
-        super::agent_status::AgentWaitStage::PreparingSkills,
-    );
-    let inject_skills_summary = should_inject_skills_summary(
-        global_settings.agent_allowed_tools_enabled,
-        &global_settings.agent_allowed_tools,
-    );
-    let disabled = aqbot_core::repo::skill::get_disabled_skills(&state.sea_db)
-        .await
-        .map_err(|e| e.to_string())?;
-    let home = dirs::home_dir().unwrap_or_default();
-    let prepared_skills = tokio::task::spawn_blocking(move || {
-        super::agent_skills::prepare_agent_skills(&home, disabled, inject_skills_summary)
-    })
-    .await
-    .map_err(|error| format!("Failed to prepare skills: {error}"))?;
-    if cancel_token.is_cancelled() {
-        return Err("Agent cancelled during initialization".to_string());
-    }
     let skills_summary = prepared_skills.summary;
     let mut custom_tools = mcp_tools;
     if inject_skills_summary {
@@ -1352,10 +1373,9 @@ pub async fn agent_query(
     }
     let memory_tool_scope_bound = memory_tool_scope.is_some();
     if let Some(scope) = memory_tool_scope {
-        custom_tools.push(std::sync::Arc::new(super::agent_memory_tool::AgentMemoryTool::new(
-            state.sea_db.clone(),
-            scope,
-        )));
+        custom_tools.push(std::sync::Arc::new(
+            super::agent_memory_tool::AgentMemoryTool::new(state.sea_db.clone(), scope),
+        ));
     }
 
     // Build ask_fn for AskUserQuestion tool
@@ -2494,7 +2514,10 @@ pub async fn agent_cancel(
 
     let tokens = state.agent_cancel_tokens.lock().await;
     if let Some(entry) = tokens.get(&conversation_id) {
-        let matches_run = match stream_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+        let matches_run = match stream_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
         {
             None => true,
             Some(id) => id == entry.run_id,
