@@ -899,6 +899,7 @@ mod tests {
             temperature: Some(0.2),
             top_p: Some(0.7),
             max_tokens: Some(9000),
+            result_pinned_by_default: None,
         }
     }
 

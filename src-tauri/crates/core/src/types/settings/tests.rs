@@ -4,8 +4,8 @@ use super::{
     ModelCatalogSourcePreference, MultiModelExecutionMode, MultiModelSideBySideWidthMode,
     SelectionToolbarAiConfig, SelectionToolbarAppEntry, SelectionToolbarAppFilterMode,
     SelectionToolbarBuiltinAiKey, SelectionToolbarDisplayMode, SelectionToolbarPlacement,
-    SelectionToolbarSettings, SelectionToolbarTool, SelectionToolbarTriggerMode,
-    SettingsSidebarDensity, TrayIconStyle, DEFAULT_EXPLAIN_PROMPT,
+    SelectionToolbarResultPinningMode, SelectionToolbarSettings, SelectionToolbarTool,
+    SelectionToolbarTriggerMode, SettingsSidebarDensity, TrayIconStyle, DEFAULT_EXPLAIN_PROMPT,
     DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS, DEFAULT_SELECTION_TOOLBAR_SEARCH_URL,
     DEFAULT_SELECTION_TOOLBAR_SHORTCUT, DEFAULT_TRANSLATE_PROMPT,
 };
@@ -149,6 +149,10 @@ fn selection_toolbar_defaults_are_backward_compatible_and_valid() {
     );
     assert!(!settings.selection_toolbar.result_pinned_by_default);
     assert_eq!(
+        settings.selection_toolbar.result_pinning_mode,
+        SelectionToolbarResultPinningMode::Global
+    );
+    assert_eq!(
         settings.selection_toolbar.trigger_mode,
         SelectionToolbarTriggerMode::Selection
     );
@@ -258,6 +262,7 @@ fn selection_toolbar_rejects_invalid_ai_configuration() {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                result_pinned_by_default: None,
             },
         }],
         ..SelectionToolbarSettings::default()
@@ -328,6 +333,7 @@ fn selection_toolbar_rejects_invalid_ai_configuration() {
                 temperature: None,
                 top_p: None,
                 max_tokens: None,
+                result_pinned_by_default: None,
             },
         });
     assert!(invalid_custom_id.validate().is_err());
@@ -419,6 +425,7 @@ fn selection_toolbar_accepts_any_kebab_case_lucide_icon() {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            result_pinned_by_default: None,
         },
     });
     custom
@@ -457,6 +464,10 @@ fn selection_toolbar_placement_and_pin_default_are_backward_compatible() {
         .expect("missing placement and pin preference should deserialize");
     assert_eq!(legacy.placement, SelectionToolbarPlacement::Below);
     assert!(!legacy.result_pinned_by_default);
+    assert_eq!(
+        legacy.result_pinning_mode,
+        SelectionToolbarResultPinningMode::Global
+    );
 
     let configured: SelectionToolbarSettings = serde_json::from_value(json!({
         "placement": "above",
@@ -465,15 +476,69 @@ fn selection_toolbar_placement_and_pin_default_are_backward_compatible() {
     .expect("placement and pin preference should deserialize");
     assert_eq!(configured.placement, SelectionToolbarPlacement::Above);
     assert!(configured.result_pinned_by_default);
+    assert_eq!(
+        configured.result_pinning_mode,
+        SelectionToolbarResultPinningMode::Global
+    );
 
     let serialized = serde_json::to_value(configured).expect("settings should serialize");
     assert_eq!(serialized["placement"], json!("above"));
     assert_eq!(serialized["result_pinned_by_default"], json!(true));
+    assert_eq!(serialized["result_pinning_mode"], json!("global"));
 
     let invalid = serde_json::from_value::<SelectionToolbarSettings>(json!({
         "placement": "automatic"
     }));
     assert!(invalid.is_err(), "unknown placements must be rejected");
+}
+
+#[test]
+fn selection_toolbar_per_tool_pin_is_optional_and_resolves_by_mode() {
+    let legacy: SelectionToolbarAiConfig = serde_json::from_value(json!({
+        "prompt": "Explain {selection}"
+    }))
+    .expect("legacy tool config should deserialize");
+    assert_eq!(legacy.result_pinned_by_default, None);
+
+    let configured: SelectionToolbarAiConfig = serde_json::from_value(json!({
+        "prompt": "Explain {selection}",
+        "result_pinned_by_default": true
+    }))
+    .expect("explicit per-tool pin should deserialize");
+    assert_eq!(configured.result_pinned_by_default, Some(true));
+    let serialized = serde_json::to_value(&configured).expect("ai config should serialize");
+    assert_eq!(serialized["result_pinned_by_default"], json!(true));
+
+    let omitted = serde_json::to_value(&legacy).expect("legacy ai config should serialize");
+    assert!(omitted.get("result_pinned_by_default").is_none());
+
+    let invalid_mode = serde_json::from_value::<SelectionToolbarSettings>(json!({
+        "result_pinning_mode": "per_row"
+    }));
+    assert!(
+        invalid_mode.is_err(),
+        "unknown pinning modes must be rejected"
+    );
+
+    let mut settings = SelectionToolbarSettings::default();
+    let translate = &settings.tools[0];
+    let explain = &settings.tools[1];
+    assert!(!settings.resolved_result_pinned(translate));
+    assert!(!settings.resolved_result_pinned(explain));
+
+    settings.result_pinned_by_default = true;
+    assert!(settings.resolved_result_pinned(translate));
+
+    settings.result_pinning_mode = SelectionToolbarResultPinningMode::Custom;
+    if let SelectionToolbarTool::BuiltinAi { ai, .. } = &mut settings.tools[0] {
+        ai.result_pinned_by_default = Some(false);
+    }
+    if let SelectionToolbarTool::BuiltinAi { ai, .. } = &mut settings.tools[1] {
+        ai.result_pinned_by_default = Some(true);
+    }
+    assert!(!settings.resolved_result_pinned(&settings.tools[0].clone()));
+    assert!(settings.resolved_result_pinned(&settings.tools[1].clone()));
+    assert!(settings.resolved_result_pinned(&settings.tools[2].clone()));
 }
 
 #[test]

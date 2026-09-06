@@ -377,6 +377,33 @@ export const useSelectionToolbarStore = create<SelectionToolbarState>((set, get)
       if (previousToolId && previousToolId !== tool.id) {
         set({ selectedModelTarget: null });
       }
+      if (
+        previousToolId !== tool.id
+        && typeof tool.result_pinned === 'boolean'
+        && session.pinned !== tool.result_pinned
+      ) {
+        const pinRevision = ++operationRevision;
+        set({ busy: true, error: null });
+        try {
+          const effectivePinned = await invoke<boolean>('selection_toolbar_set_pinned', {
+            selectionId: session.selection_id,
+            pinned: tool.result_pinned,
+          });
+          if (pinRevision !== operationRevision) return;
+          if (get().session?.selection_id !== session.selection_id) return;
+          set((state) => ({
+            session: state.session?.selection_id === session.selection_id
+              ? { ...state.session, pinned: effectivePinned }
+              : state.session,
+            busy: false,
+            error: null,
+          }));
+        } catch (error) {
+          if (pinRevision !== operationRevision) return;
+          set({ error: String(error), busy: false });
+          return;
+        }
+      }
     }
     if (tool.kind === 'ai' && tool.direct_send !== false) {
       const pending = get().pendingRequest;
@@ -743,16 +770,19 @@ export const useSelectionToolbarStore = create<SelectionToolbarState>((set, get)
 
   setPinned: async (pinned) => {
     const session = get().session;
-    if (!session || session.pinned === pinned) return;
+    if (!session || session.pinned === pinned || get().busy) return;
+    const revision = operationRevision;
     try {
       const effectivePinned = await invoke<boolean>('selection_toolbar_set_pinned', {
         selectionId: session.selection_id,
         pinned,
       });
+      if (revision !== operationRevision) return;
       set((state) => state.session?.selection_id === session.selection_id
         ? { session: { ...state.session, pinned: effectivePinned }, error: null }
         : {});
     } catch (error) {
+      if (revision !== operationRevision) return;
       set({ error: String(error) });
     }
   },

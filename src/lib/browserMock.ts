@@ -597,6 +597,7 @@ const DEFAULT_SETTINGS = {
   selection_toolbar: {
     placement: 'below',
     result_pinned_by_default: false,
+    result_pinning_mode: 'global',
   },
   send_on_enter: true,
   stream_response: true,

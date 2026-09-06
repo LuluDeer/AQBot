@@ -88,6 +88,7 @@ const mocks = vi.hoisted(() => {
       display_mode: 'full' as const,
       placement: 'below' as const,
       result_pinned_by_default: false,
+      result_pinning_mode: 'global' as const,
       trigger_mode: 'selection' as const,
       trigger_shortcut: 'CmdOrCtrl+Shift+E',
       screenshot_shortcut: '',
@@ -156,6 +157,7 @@ beforeEach(() => {
     display_mode: 'full',
     placement: 'below',
     result_pinned_by_default: false,
+    result_pinning_mode: 'global',
     trigger_mode: 'selection',
     trigger_shortcut: 'CmdOrCtrl+Shift+E',
     screenshot_shortcut: '',
@@ -303,13 +305,89 @@ describe('SelectionToolbarSettings', () => {
     const user = userEvent.setup();
     render(<SelectionToolbarSettings />);
 
-    await user.click(screen.getByRole('switch', {
-      name: 'settings.selectionToolbar.resultPinnedByDefault',
-    }));
+    await user.click(screen.getByText('settings.selectionToolbar.resultPinningKeepAll'));
 
     await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledWith({
-      selection_toolbar: expect.objectContaining({ result_pinned_by_default: true }),
+      selection_toolbar: expect.objectContaining({
+        result_pinning_mode: 'global',
+        result_pinned_by_default: true,
+      }),
     }));
+  });
+
+  it('fills unconfigured AI tools when entering custom pinning', async () => {
+    mocks.toolbar.value = {
+      ...mocks.toolbar.value,
+      result_pinned_by_default: true,
+    };
+    const user = userEvent.setup();
+    render(<SelectionToolbarSettings />);
+
+    await user.click(screen.getByText('settings.selectionToolbar.resultPinningCustom'));
+
+    await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledWith({
+      selection_toolbar: expect.objectContaining({
+        result_pinning_mode: 'custom',
+        tools: expect.arrayContaining([
+          expect.objectContaining({
+            builtin_key: 'translate',
+            ai: expect.objectContaining({ result_pinned_by_default: true }),
+          }),
+          expect.objectContaining({
+            builtin_key: 'explain',
+            ai: expect.objectContaining({ result_pinned_by_default: true }),
+          }),
+        ]),
+      }),
+    }));
+  });
+
+  it('lets custom mode pin a single AI tool without changing enablement', async () => {
+    mocks.toolbar.value = {
+      ...mocks.toolbar.value,
+      result_pinning_mode: 'custom',
+      tools: mocks.defaultTools.map((tool) => (
+        tool.kind === 'builtin_action'
+          ? tool
+          : {
+              ...tool,
+              ai: { ...tool.ai, result_pinned_by_default: tool.builtin_key === 'explain' },
+            }
+      )),
+    };
+    const user = userEvent.setup();
+    render(<SelectionToolbarSettings />);
+
+    const translatePin = screen.getByRole('button', {
+      name: 'settings.selectionToolbar.tools.translate settings.selectionToolbar.toolKeepResult',
+    });
+    const copyPin = screen.queryByRole('button', {
+      name: 'settings.selectionToolbar.tools.copy settings.selectionToolbar.toolKeepResult',
+    });
+    expect(copyPin).not.toBeInTheDocument();
+    expect(translatePin).toHaveAttribute('aria-pressed', 'false');
+    await user.click(translatePin);
+
+    await waitFor(() => expect(mocks.saveSettings).toHaveBeenCalledWith({
+      selection_toolbar: expect.objectContaining({
+        tools: expect.arrayContaining([
+          expect.objectContaining({
+            builtin_key: 'translate',
+            enabled: true,
+            ai: expect.objectContaining({ result_pinned_by_default: true }),
+          }),
+        ]),
+      }),
+    }));
+  });
+
+  it('locks per-tool pins in global pinning mode', () => {
+    render(<SelectionToolbarSettings />);
+
+    expect(screen.getByRole('button', {
+      name: 'settings.selectionToolbar.tools.translate settings.selectionToolbar.toolKeepResult',
+    })).toBeDisabled();
+    expect(screen.getByText('settings.selectionToolbar.resultPinningLockedHint')).toBeInTheDocument();
   });
 
   it('shows shortcut recording only in shortcut trigger mode and persists capture', async () => {

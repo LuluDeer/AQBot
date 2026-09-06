@@ -80,6 +80,9 @@ pub struct SelectionToolbarAiConfig {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// `None` means this tool has not been customized yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_pinned_by_default: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -207,6 +210,14 @@ pub enum SelectionToolbarPlacement {
     Below,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionToolbarResultPinningMode {
+    #[default]
+    Global,
+    Custom,
+}
+
 /// A single app entry in the selection-toolbar allow/block list.
 ///
 /// `id` is the stable key matched against `SelectionObservation.source_app`
@@ -231,6 +242,9 @@ pub struct SelectionToolbarSettings {
     /// Whether a newly opened result window stays visible by default.
     #[serde(default)]
     pub result_pinned_by_default: bool,
+    /// Whether the default pin applies to every AI tool or each tool stores its own.
+    #[serde(default)]
+    pub result_pinning_mode: SelectionToolbarResultPinningMode,
     /// Whether selecting text shows the toolbar immediately or waits for a
     /// configured global shortcut.
     #[serde(default)]
@@ -324,6 +338,7 @@ impl SelectionToolbarSettings {
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
+                    result_pinned_by_default: None,
                 },
             };
             let insert_at = self
@@ -456,6 +471,15 @@ impl SelectionToolbarSettings {
         }
         Ok(())
     }
+
+    pub fn resolved_result_pinned(&self, tool: &SelectionToolbarTool) -> bool {
+        if self.result_pinning_mode == SelectionToolbarResultPinningMode::Custom {
+            if let Some(pinned) = tool.ai().and_then(|ai| ai.result_pinned_by_default) {
+                return pinned;
+            }
+        }
+        self.result_pinned_by_default
+    }
 }
 
 impl Default for SelectionToolbarSettings {
@@ -469,6 +493,7 @@ impl Default for SelectionToolbarSettings {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            result_pinned_by_default: None,
         };
         Self {
             enabled: false,
@@ -476,6 +501,7 @@ impl Default for SelectionToolbarSettings {
             display_mode: SelectionToolbarDisplayMode::Full,
             placement: SelectionToolbarPlacement::Below,
             result_pinned_by_default: false,
+            result_pinning_mode: SelectionToolbarResultPinningMode::Global,
             trigger_mode: SelectionToolbarTriggerMode::Selection,
             trigger_shortcut: DEFAULT_SELECTION_TOOLBAR_SHORTCUT.into(),
             screenshot_shortcut: String::new(),

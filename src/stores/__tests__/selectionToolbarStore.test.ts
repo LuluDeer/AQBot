@@ -631,6 +631,140 @@ describe('selection toolbar store', () => {
     expect(useSelectionToolbarStore.getState().session?.pinned).toBe(false);
   });
 
+  it('applies a tool pin policy when switching tools and keeps it on retry', async () => {
+    const translate = {
+      id: 'translate',
+      kind: 'ai' as const,
+      icon: 'languages',
+      builtin_key: 'translate' as const,
+      name: null,
+      result_pinned: false,
+    };
+    const explain = {
+      id: 'explain',
+      kind: 'ai' as const,
+      icon: 'lightbulb',
+      builtin_key: 'explain' as const,
+      name: null,
+      result_pinned: true,
+    };
+    invokeMock.mockImplementation(async (command: string, args?: { pinned?: boolean }) => {
+      if (command === 'selection_toolbar_get_snapshot') {
+        return {
+          runtime: {
+            state: 'running',
+            platform: 'macos',
+            permission: 'granted',
+            last_error: null,
+            global_dismissal_supported: true,
+          },
+          session: {
+            selection_id: 'selection-1',
+            tools: [translate, explain],
+            theme: 'light',
+            language: 'en-US',
+            pinned: true,
+          },
+          run: null,
+        };
+      }
+      if (command === 'selection_toolbar_set_pinned') return args?.pinned ?? false;
+      if (command === 'selection_toolbar_execute_tool') return receipt('request-pin');
+      return undefined;
+    });
+    const { useSelectionToolbarStore } = await import('../selectionToolbarStore');
+    await useSelectionToolbarStore.getState().initialize();
+
+    await useSelectionToolbarStore.getState().executeTool(translate);
+    expect(invokeMock).toHaveBeenCalledWith('selection_toolbar_set_pinned', {
+      selectionId: 'selection-1',
+      pinned: false,
+    });
+    expect(invokeMock).toHaveBeenCalledWith('selection_toolbar_execute_tool', {
+      selectionId: 'selection-1',
+      toolId: 'translate',
+      options: { source_language: 'auto', target_language: null },
+    });
+    expect(useSelectionToolbarStore.getState().session?.pinned).toBe(false);
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (command: string, args?: { pinned?: boolean }) => {
+      if (command === 'selection_toolbar_set_pinned') return args?.pinned ?? false;
+      if (command === 'selection_toolbar_execute_tool') return receipt('request-pin-2');
+      return undefined;
+    });
+    await useSelectionToolbarStore.getState().executeTool(explain);
+    expect(invokeMock).toHaveBeenCalledWith('selection_toolbar_set_pinned', {
+      selectionId: 'selection-1',
+      pinned: true,
+    });
+    expect(useSelectionToolbarStore.getState().session?.pinned).toBe(true);
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (command: string) => (
+      command === 'selection_toolbar_execute_tool' ? receipt('request-pin-3') : undefined
+    ));
+    await useSelectionToolbarStore.getState().executeTool(explain);
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      'selection_toolbar_set_pinned',
+      expect.anything(),
+    );
+    expect(invokeMock).toHaveBeenCalledWith('selection_toolbar_execute_tool', {
+      selectionId: 'selection-1',
+      toolId: 'explain',
+      options: null,
+    });
+  });
+
+  it('blocks sending when applying a tool pin policy fails', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'selection_toolbar_get_snapshot') {
+        return {
+          runtime: {
+            state: 'running',
+            platform: 'macos',
+            permission: 'granted',
+            last_error: null,
+            global_dismissal_supported: true,
+          },
+          session: {
+            selection_id: 'selection-1',
+            tools: [],
+            theme: 'light',
+            language: 'en-US',
+            pinned: true,
+          },
+          run: null,
+        };
+      }
+      if (command === 'selection_toolbar_set_pinned') {
+        throw new Error('pin failed');
+      }
+      return undefined;
+    });
+    const { useSelectionToolbarStore } = await import('../selectionToolbarStore');
+    await useSelectionToolbarStore.getState().initialize();
+
+    await useSelectionToolbarStore.getState().executeTool({
+      id: 'translate',
+      kind: 'ai',
+      icon: 'languages',
+      builtin_key: 'translate',
+      name: null,
+      result_pinned: false,
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      'selection_toolbar_execute_tool',
+      expect.anything(),
+    );
+    expect(useSelectionToolbarStore.getState()).toMatchObject({
+      busy: false,
+      error: 'Error: pin failed',
+      run: null,
+    });
+  });
+
   it('keeps the current answer available when a follow-up command fails', async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'selection_toolbar_get_snapshot') {

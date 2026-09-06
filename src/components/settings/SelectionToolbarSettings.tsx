@@ -17,7 +17,7 @@ import {
   theme,
   type InputRef,
 } from 'antd';
-import { AlertTriangle, AppWindow, GripVertical, Plus, RotateCcw, Trash2 } from 'lucide-react';
+import { AlertTriangle, AppWindow, GripVertical, Pin, Plus, RotateCcw, Trash2 } from 'lucide-react';
 import {
   DndContext,
   PointerSensor,
@@ -58,16 +58,20 @@ import {
 import {
   createDefaultSelectionToolbarSettings,
   matchSelectionToolbarSearchPreset,
+  resolvedSelectionToolbarToolPinned,
   SELECTION_TOOLBAR_DEFAULT_SEARCH_URL,
   SELECTION_TOOLBAR_DEFAULT_SHORTCUT,
   SELECTION_TOOLBAR_MAX_VISIBLE_TOOLS,
   SELECTION_TOOLBAR_SEARCH_PRESETS,
+  selectionToolbarPinningChoice,
+  withSelectionToolbarPinningChoice,
   type SelectionToolbarAppEntry,
   type SelectionToolbarAppFilterMode,
   type SelectionToolbarDisplayMode,
   type SelectionToolbarInstalledApp,
   type SelectionToolbarPlacement,
   type SelectionToolbarPermissionSettingsOutcome,
+  type SelectionToolbarResultPinningChoice,
   type SelectionToolbarRuntimeStatus,
   type SelectionToolbarSearchPresetId,
   type SelectionToolbarSettings as SelectionToolbarConfig,
@@ -377,14 +381,59 @@ function AppFilterConfirmModal({
   );
 }
 
+function ToolKeepPin({
+  pressed,
+  locked,
+  label,
+  onToggle,
+}: {
+  pressed: boolean;
+  locked: boolean;
+  label: string;
+  onToggle: (keep: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  const { token } = theme.useToken();
+  const title = locked
+    ? t('settings.selectionToolbar.resultPinningLockedHint')
+    : pressed
+      ? t('settings.selectionToolbar.toolKeepResultOn')
+      : t('settings.selectionToolbar.toolKeepResultOff');
+  return (
+    <Tooltip title={title}>
+      <span>
+        <Button
+          aria-label={label}
+          aria-pressed={pressed}
+          disabled={locked}
+          icon={<Pin size={14} fill={pressed ? 'currentColor' : 'none'} />}
+          size="small"
+          type="text"
+          style={{
+            background: pressed ? token.colorPrimaryBg : undefined,
+            color: pressed ? token.colorPrimary : token.colorTextQuaternary,
+          }}
+          onClick={() => onToggle(!pressed)}
+        />
+      </span>
+    </Tooltip>
+  );
+}
+
 function SortableToolRow({
   tool,
+  keepResult,
+  keepLocked,
+  onToggleKeep,
   onToggle,
   onEdit,
   onReset,
   onDelete,
 }: {
   tool: SelectionToolbarTool;
+  keepResult: boolean | null;
+  keepLocked: boolean;
+  onToggleKeep: (keep: boolean) => void;
   onToggle: (enabled: boolean) => void;
   onEdit: () => void;
   onReset: () => void;
@@ -449,6 +498,14 @@ function SortableToolRow({
         <Tooltip title={t('common.delete')}>
           <Button aria-label={t('common.delete')} danger icon={<Trash2 size={14} />} size="small" type="text" onClick={onDelete} />
         </Tooltip>
+      )}
+      {keepResult !== null && (
+        <ToolKeepPin
+          pressed={keepResult}
+          locked={keepLocked}
+          label={`${toolName(tool, t)} ${t('settings.selectionToolbar.toolKeepResult')}`}
+          onToggle={onToggleKeep}
+        />
       )}
       <Switch aria-label={toolName(tool, t)} checked={tool.enabled} size="small" onChange={onToggle} />
     </div>
@@ -890,6 +947,10 @@ export function SelectionToolbarSettings() {
   const displayMode: SelectionToolbarDisplayMode = settings.display_mode ?? 'full';
   const placement: SelectionToolbarPlacement = settings.placement ?? 'below';
   const resultPinnedByDefault = settings.result_pinned_by_default ?? false;
+  const pinningChoice = selectionToolbarPinningChoice({
+    result_pinning_mode: settings.result_pinning_mode ?? 'global',
+    result_pinned_by_default: resultPinnedByDefault,
+  });
   const triggerMode: SelectionToolbarTriggerMode = settings.trigger_mode ?? 'selection';
   const triggerShortcut = settings.trigger_shortcut ?? SELECTION_TOOLBAR_DEFAULT_SHORTCUT;
   const screenshotShortcut = settings.screenshot_shortcut ?? '';
@@ -1111,6 +1172,7 @@ export function SelectionToolbarSettings() {
         temperature: null,
         top_p: null,
         max_tokens: null,
+        result_pinned_by_default: pinningChoice === 'custom' ? false : null,
       },
     });
   };
@@ -1286,21 +1348,40 @@ export function SelectionToolbarSettings() {
           />
         </div>
         <Divider style={{ margin: 0 }} />
-        <div style={{ alignItems: 'center', display: 'flex', gap: 12, justifyContent: 'space-between', padding: '12px 0 4px' }}>
-          <div style={{ minWidth: 0 }}>
-            <div>{t('settings.selectionToolbar.resultPinnedByDefault')}</div>
-            <div style={{ color: token.colorTextDescription, fontSize: 12 }}>
-              {t('settings.selectionToolbar.resultPinnedByDefaultHint')}
-            </div>
+        <div style={{ padding: '12px 0 4px' }}>
+          <div>{t('settings.selectionToolbar.resultPinnedByDefault')}</div>
+          <div style={{ color: token.colorTextDescription, fontSize: 12 }}>
+            {t('settings.selectionToolbar.resultPinnedByDefaultHint')}
           </div>
-          <Switch
+          <Segmented
+            block
             aria-label={t('settings.selectionToolbar.resultPinnedByDefault')}
-            checked={resultPinnedByDefault}
-            onChange={(result_pinned_by_default) => persist({
-              ...settings,
-              result_pinned_by_default,
-            })}
+            style={{ marginTop: 10 }}
+            options={[
+              {
+                value: 'keep',
+                label: t('settings.selectionToolbar.resultPinningKeepAll'),
+              },
+              {
+                value: 'auto_hide',
+                label: t('settings.selectionToolbar.resultPinningAutoHide'),
+              },
+              {
+                value: 'custom',
+                label: t('settings.selectionToolbar.resultPinningCustom'),
+              },
+            ]}
+            value={pinningChoice}
+            onChange={(value) => persist(withSelectionToolbarPinningChoice(
+              settings,
+              value as SelectionToolbarResultPinningChoice,
+            ))}
           />
+          {pinningChoice !== 'custom' && (
+            <div style={{ color: token.colorTextDescription, fontSize: 12, marginTop: 8 }}>
+              {t('settings.selectionToolbar.resultPinningLockedHint')}
+            </div>
+          )}
         </div>
       </SettingsGroup>
 
@@ -1435,22 +1516,37 @@ export function SelectionToolbarSettings() {
                 {index > 0 && <Divider style={{ margin: 0 }} />}
                 <SortableToolRow
                   tool={tool}
+                  keepResult={resolvedSelectionToolbarToolPinned(settings, tool)}
+                  keepLocked={pinningChoice !== 'custom'}
                   onDelete={() => persist({ ...settings, tools: settings.tools.filter((item) => toolId(item) !== toolId(tool)) })}
                   onEdit={() => setEditing(tool)}
                   onReset={() => {
                     const defaults = createDefaultSelectionToolbarSettings();
                     const defaultTool = defaults.tools.find((item) => toolId(item) === toolId(tool));
                     if (!defaultTool) return;
+                    const resetTool = defaultTool.kind === 'builtin_action'
+                      ? defaultTool
+                      : {
+                          ...defaultTool,
+                          ai: { ...defaultTool.ai, result_pinned_by_default: false },
+                        };
                     if (tool.kind === 'builtin_action' && tool.builtin_key === 'search') {
                       void persist({
                         ...settings,
                         tools: settings.tools.map((item) =>
-                          toolId(item) === toolId(tool) ? defaultTool : item),
+                          toolId(item) === toolId(tool) ? resetTool : item),
                         search_url: defaults.search_url,
                       });
                       return;
                     }
-                    replaceTool(defaultTool);
+                    replaceTool(resetTool);
+                  }}
+                  onToggleKeep={(keep) => {
+                    if (tool.kind === 'builtin_action') return;
+                    replaceTool({
+                      ...tool,
+                      ai: { ...tool.ai, result_pinned_by_default: keep },
+                    });
                   }}
                   onToggle={(enabled) => replaceTool({ ...tool, enabled })}
                 />

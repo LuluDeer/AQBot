@@ -11,6 +11,8 @@ export type SelectionToolbarTriggerMode = 'selection' | 'shortcut';
 export type SelectionToolbarDisplayMode = 'full' | 'compact';
 export type SelectionToolbarPlacement = 'above' | 'below';
 export type SelectionToolbarOverflowDirection = 'above' | 'below';
+export type SelectionToolbarResultPinningMode = 'global' | 'custom';
+export type SelectionToolbarResultPinningChoice = 'keep' | 'auto_hide' | 'custom';
 
 export const SELECTION_TOOLBAR_DEFAULT_SHORTCUT = 'CmdOrCtrl+Shift+E';
 export const SELECTION_TOOLBAR_DEFAULT_SEARCH_URL = 'https://www.google.com/search?q=%s';
@@ -41,6 +43,8 @@ export interface SelectionToolbarAiConfig {
   temperature: number | null;
   top_p: number | null;
   max_tokens: number | null;
+  /** Null/omitted means this tool has not been customized yet. */
+  result_pinned_by_default?: boolean | null;
 }
 
 export type SelectionToolbarTool =
@@ -84,6 +88,8 @@ export interface SelectionToolbarSettings {
   placement: SelectionToolbarPlacement;
   /** Keep a newly opened result window visible until explicitly dismissed. */
   result_pinned_by_default: boolean;
+  /** Global pin default, or a per-tool pin stored on each AI config. */
+  result_pinning_mode: SelectionToolbarResultPinningMode;
   /** Automatic selection or an explicit global shortcut. */
   trigger_mode: SelectionToolbarTriggerMode;
   /** Global accelerator used when `trigger_mode` is `shortcut`. */
@@ -151,6 +157,7 @@ export function createDefaultSelectionToolbarSettings(): SelectionToolbarSetting
     display_mode: 'full',
     placement: 'below',
     result_pinned_by_default: false,
+    result_pinning_mode: 'global',
     trigger_mode: 'selection',
     trigger_shortcut: SELECTION_TOOLBAR_DEFAULT_SHORTCUT,
     screenshot_shortcut: '',
@@ -226,6 +233,8 @@ export interface SelectionToolbarToolView {
   icon: string;
   /** Missing on older snapshots, which retain direct-send behavior. */
   direct_send?: boolean;
+  /** Resolved keep-result preference for AI tools. */
+  result_pinned?: boolean;
 }
 
 export interface SelectionToolbarSessionView {
@@ -309,3 +318,50 @@ export type SelectionToolbarRunEvent =
   | { kind: 'completed'; request_id: string; selection_id: string; output?: string | null }
   | { kind: 'stopped'; request_id: string; selection_id: string; output?: string | null }
   | { kind: 'error'; request_id: string; selection_id: string; error: string };
+
+export function selectionToolbarPinningChoice(
+  settings: Pick<SelectionToolbarSettings, 'result_pinning_mode' | 'result_pinned_by_default'>,
+): SelectionToolbarResultPinningChoice {
+  if (settings.result_pinning_mode === 'custom') return 'custom';
+  return settings.result_pinned_by_default ? 'keep' : 'auto_hide';
+}
+
+export function withSelectionToolbarPinningChoice(
+  settings: SelectionToolbarSettings,
+  choice: SelectionToolbarResultPinningChoice,
+): SelectionToolbarSettings {
+  if (choice !== 'custom') {
+    return {
+      ...settings,
+      result_pinning_mode: 'global',
+      result_pinned_by_default: choice === 'keep',
+    };
+  }
+  return {
+    ...settings,
+    result_pinning_mode: 'custom',
+    tools: settings.tools.map((tool) => {
+      if (tool.kind === 'builtin_action' || tool.ai.result_pinned_by_default != null) {
+        return tool;
+      }
+      return {
+        ...tool,
+        ai: {
+          ...tool.ai,
+          result_pinned_by_default: settings.result_pinned_by_default,
+        },
+      };
+    }),
+  };
+}
+
+export function resolvedSelectionToolbarToolPinned(
+  settings: Pick<SelectionToolbarSettings, 'result_pinning_mode' | 'result_pinned_by_default'>,
+  tool: SelectionToolbarTool,
+): boolean | null {
+  if (tool.kind === 'builtin_action') return null;
+  if (settings.result_pinning_mode === 'custom' && tool.ai.result_pinned_by_default != null) {
+    return tool.ai.result_pinned_by_default;
+  }
+  return settings.result_pinned_by_default;
+}

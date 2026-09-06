@@ -308,6 +308,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
                   ?? DEFAULT_SETTINGS.selection_toolbar.placement,
                 result_pinned_by_default: fetched.selection_toolbar?.result_pinned_by_default
                   ?? DEFAULT_SETTINGS.selection_toolbar.result_pinned_by_default,
+                result_pinning_mode: fetched.selection_toolbar?.result_pinning_mode
+                  ?? DEFAULT_SETTINGS.selection_toolbar.result_pinning_mode,
               },
             },
             loading: false,

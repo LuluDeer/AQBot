@@ -121,6 +121,8 @@ pub struct ToolbarToolView {
     pub icon: String,
     #[serde(default = "direct_send_default")]
     pub direct_send: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_pinned: Option<bool>,
 }
 
 fn direct_send_default() -> bool {
@@ -136,6 +138,7 @@ impl ToolbarToolView {
             name: None,
             icon: icon.into(),
             direct_send: true,
+            result_pinned: None,
         }
     }
 
@@ -147,6 +150,7 @@ impl ToolbarToolView {
             name: name.map(str::to_string),
             icon: icon.into(),
             direct_send: true,
+            result_pinned: None,
         }
     }
 }

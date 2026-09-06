@@ -24,6 +24,7 @@ describe('selection toolbar settings', () => {
       display_mode: 'full',
       placement: 'below',
       result_pinned_by_default: false,
+      result_pinning_mode: 'global',
       trigger_mode: 'selection',
       trigger_shortcut: 'CmdOrCtrl+Shift+E',
       screenshot_shortcut: '',
@@ -65,6 +66,7 @@ describe('selection toolbar settings', () => {
     expect(useSettingsStore.getState().settings.selection_toolbar).toMatchObject({
       placement: 'below',
       result_pinned_by_default: false,
+      result_pinning_mode: 'global',
       screenshot_shortcut: '',
     });
     const translate = useSettingsStore.getState().settings.selection_toolbar.tools[0];

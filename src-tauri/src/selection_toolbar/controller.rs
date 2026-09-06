@@ -1377,8 +1377,39 @@ mod tests {
         let image = toolbar_tool_views(&settings, ToolbarInputKind::Screenshot);
         assert!(!text[0].direct_send);
         assert!(image[0].direct_send);
+        assert_eq!(text[0].result_pinned, Some(false));
         assert!(text.iter().any(|tool| tool.kind == "action"));
         assert!(image.iter().all(|tool| tool.kind == "ai"));
+        assert!(text
+            .iter()
+            .filter(|tool| tool.kind == "action")
+            .all(|tool| tool.result_pinned.is_none()));
+    }
+
+    #[test]
+    fn tool_views_resolve_per_tool_result_pin() {
+        use aqbot_core::types::SelectionToolbarResultPinningMode;
+
+        let mut settings = AppSettings::default();
+        settings.selection_toolbar.result_pinning_mode =
+            SelectionToolbarResultPinningMode::Custom;
+        settings.selection_toolbar.result_pinned_by_default = true;
+        if let SelectionToolbarTool::BuiltinAi { ai, .. } =
+            &mut settings.selection_toolbar.tools[0]
+        {
+            ai.result_pinned_by_default = Some(false);
+        }
+        if let SelectionToolbarTool::BuiltinAi { ai, .. } =
+            &mut settings.selection_toolbar.tools[1]
+        {
+            ai.result_pinned_by_default = Some(true);
+        }
+        let views = toolbar_tool_views(&settings, ToolbarInputKind::Text);
+        assert_eq!(views[0].id, "translate");
+        assert_eq!(views[0].result_pinned, Some(false));
+        assert_eq!(views[1].id, "explain");
+        assert_eq!(views[1].result_pinned, Some(true));
+        assert_eq!(views[2].result_pinned, Some(true));
     }
 
     fn observation(text: &str, source_app: &str) -> SelectionObservation {
@@ -1732,6 +1763,8 @@ fn toolbar_tool_views(
                     ToolbarInputKind::Text => ai.text_direct_send,
                     ToolbarInputKind::Screenshot => ai.screenshot_direct_send,
                 };
+                view.result_pinned =
+                    Some(settings.selection_toolbar.resolved_result_pinned(tool));
             }
             view
         })
