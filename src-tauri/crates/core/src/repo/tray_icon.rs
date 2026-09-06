@@ -7,6 +7,7 @@ use crate::error::{AQBotError, Result};
 use crate::file_store::SavedFile;
 
 pub const FILE_ID_KEY: &str = "tray_icon_file_id";
+pub const SCOPE_KEY: &str = "use_tray_icon_as_app_icon";
 
 pub async fn file_id<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
     let row = settings::Entity::find_by_id(FILE_ID_KEY).one(db).await?;
@@ -16,6 +17,36 @@ pub async fn file_id<C: ConnectionTrait>(db: &C) -> Result<Option<String>> {
             AQBotError::Validation(format!("Invalid tray icon reference: {error}"))
         }),
     }
+}
+
+pub async fn use_as_app_icon<C: ConnectionTrait>(db: &C) -> Result<bool> {
+    let row = settings::Entity::find_by_id(SCOPE_KEY).one(db).await?;
+    match row {
+        None => Ok(false),
+        Some(row) => serde_json::from_str(&row.value).map_err(|error| {
+            AQBotError::Validation(format!("Invalid tray icon app scope: {error}"))
+        }),
+    }
+}
+
+async fn upsert_setting<C: ConnectionTrait>(
+    db: &C,
+    key: &str,
+    value: &str,
+) -> std::result::Result<(), String> {
+    settings::Entity::insert(settings::ActiveModel {
+        key: Set(key.to_string()),
+        value: Set(value.to_string()),
+    })
+    .on_conflict(
+        OnConflict::column(settings::Column::Key)
+            .update_column(settings::Column::Value)
+            .to_owned(),
+    )
+    .exec(db)
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub struct NewIcon<'a> {
@@ -50,18 +81,12 @@ pub async fn commit_change(
             .await
             .map_err(|error| error.to_string())?;
         }
-        settings::Entity::insert(settings::ActiveModel {
-            key: Set(FILE_ID_KEY.to_string()),
-            value: Set(serde_json::to_string(&new_id).map_err(|error| error.to_string())?),
-        })
-        .on_conflict(
-            OnConflict::column(settings::Column::Key)
-                .update_column(settings::Column::Value)
-                .to_owned(),
+        upsert_setting(
+            &txn,
+            FILE_ID_KEY,
+            &serde_json::to_string(&new_id).map_err(|error| error.to_string())?,
         )
-        .exec(&txn)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
         let candidates: HashSet<String> = previous.into_iter().collect();
         let paths = super::stored_file::delete_unreferenced_candidates(&txn, &candidates)
             .await
@@ -76,6 +101,38 @@ pub async fn commit_change(
                 .await
                 .map_err(|error| format!("Tray icon commit failed: {error}"))?;
             Ok(paths)
+        }
+        Err(error) => match txn.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(format!("{error}; database rollback failed: {rollback}")),
+        },
+    }
+}
+
+/// Caller holds the file-reference lock and restores native icons if this errors.
+pub async fn commit_scope(
+    db: &DatabaseConnection,
+    enabled: bool,
+    apply_native: impl FnOnce() -> std::result::Result<(), String>,
+) -> std::result::Result<(), String> {
+    let txn = db.begin().await.map_err(|error| error.to_string())?;
+    let operation = async {
+        upsert_setting(
+            &txn,
+            SCOPE_KEY,
+            &serde_json::to_string(&enabled).map_err(|error| error.to_string())?,
+        )
+        .await?;
+        apply_native()?;
+        Ok::<_, String>(())
+    }
+    .await;
+    match operation {
+        Ok(()) => {
+            txn.commit()
+                .await
+                .map_err(|error| format!("Tray icon commit failed: {error}"))?;
+            Ok(())
         }
         Err(error) => match txn.rollback().await {
             Ok(()) => Err(error),

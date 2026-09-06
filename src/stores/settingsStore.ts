@@ -109,6 +109,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   tray_enabled: true,
   tray_icon_style: 'color',
   tray_icon_file_id: null,
+  use_tray_icon_as_app_icon: false,
   global_shortcuts_enabled: true,
   shortcut_registration_logs_enabled: false,
   shortcut_trigger_toast_enabled: false,
@@ -365,6 +366,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       ...previous,
       ...partial,
       tray_icon_file_id: previous.tray_icon_file_id,
+      use_tray_icon_as_app_icon: previous.use_tray_icon_as_app_icon,
       chat_input_actions_scale: normalizeChatInputActionsScale(
         partial.chat_input_actions_scale ?? previous.chat_input_actions_scale,
       ),
@@ -384,6 +386,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
         multi_model_side_by_side_width_mode: _mainWidthMode,
         multi_model_popout_side_by_side_width_mode: _popoutWidthMode,
         tray_icon_file_id: _trayIconFileId,
+        use_tray_icon_as_app_icon: _useTrayIconAsAppIcon,
         ...settingsWithoutLayoutModes
       } = merged;
       const result = await invoke<{ saved?: boolean; warnings?: string[] } | void>('save_settings', {
@@ -392,7 +395,11 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
       return result && typeof result === 'object' ? result.warnings ?? [] : [];
     } catch (e) {
       set((state) => ({
-        settings: { ...previous, tray_icon_file_id: state.settings.tray_icon_file_id },
+        settings: {
+          ...previous,
+          tray_icon_file_id: state.settings.tray_icon_file_id,
+          use_tray_icon_as_app_icon: state.settings.use_tray_icon_as_app_icon,
+        },
         error: String(e),
         settingsMeta: {
           ...state.settingsMeta,

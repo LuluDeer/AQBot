@@ -15,7 +15,19 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 
 const prefix = 'settings.customTrayIcon.';
 let serverRevision = 0;
-const status = (id: string | null, applied = true) => ({ revision: serverRevision++, trayIconFileId: id, applied, error: null, warnings: [] });
+const status = (
+  id: string | null,
+  applied = true,
+  extra: { useAsAppIcon?: boolean; appIconState?: 'default' | 'applied' | 'deferred' | 'unsupported' } = {},
+) => ({
+  revision: serverRevision++,
+  trayIconFileId: id,
+  applied,
+  useAsAppIcon: extra.useAsAppIcon ?? false,
+  appIconState: extra.appIconState ?? 'default',
+  error: null,
+  warnings: [],
+});
 function choose() {
   fireEvent.change(screen.getByLabelText(prefix + 'choose'), {
     target: { files: [new File(['image bytes'], 'tray.png', { type: 'image/png' })] },
@@ -41,7 +53,13 @@ describe('custom tray icon', () => {
     });
     useSettingsStore.setState((state) => ({
       trayIconRevision: -1,
-      settings: { ...state.settings, tray_icon_file_id: null, tray_enabled: true, tray_icon_style: 'color' },
+      settings: {
+        ...state.settings,
+        tray_icon_file_id: null,
+        use_tray_icon_as_app_icon: false,
+        tray_enabled: true,
+        tray_icon_style: 'color',
+      },
     }));
   });
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -147,5 +165,47 @@ describe('custom tray icon', () => {
     act(() => mocks.listen.mock.calls[0][1]({ payload: newer }));
     await act(async () => finish(older));
     expect(useSettingsStore.getState().settings.tray_icon_file_id).toBe('newer-icon');
+  });
+
+  it('presets the app icon scope before an image is uploaded', async () => {
+    render(<TrayIconSettings monochrome={false} />);
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    mocks.invoke.mockResolvedValueOnce(status(null, false, { useAsAppIcon: true }));
+    fireEvent.click(screen.getByText(prefix + 'scopeTrayAndApp'));
+    await waitFor(() => expect(mocks.invoke).toHaveBeenLastCalledWith('set_tray_icon_app_scope', { enabled: true }));
+    expect(useSettingsStore.getState().settings.use_tray_icon_as_app_icon).toBe(true);
+    expect(screen.getByText(prefix + 'scopePresetHint')).toBeInTheDocument();
+  });
+
+  it('switches between tray-only and tray-plus-app immediately', async () => {
+    mocks.invoke.mockResolvedValueOnce(status('icon', true, { useAsAppIcon: false }));
+    render(<TrayIconSettings monochrome={false} />);
+    await waitFor(() => expect(useSettingsStore.getState().settings.tray_icon_file_id).toBe('icon'));
+    mocks.invoke.mockResolvedValueOnce(status('icon', true, { useAsAppIcon: true, appIconState: 'applied' }));
+    fireEvent.click(screen.getByText(prefix + 'scopeTrayAndApp'));
+    await waitFor(() => expect(screen.getByText(prefix + 'appIconApplied')).toBeInTheDocument());
+    mocks.invoke.mockResolvedValueOnce(status('icon', true, { useAsAppIcon: false }));
+    fireEvent.click(screen.getByText(prefix + 'scopeTrayOnly'));
+    await waitFor(() => expect(useSettingsStore.getState().settings.use_tray_icon_as_app_icon).toBe(false));
+  });
+
+  it('keeps the scope preference after restoring the default image', async () => {
+    useSettingsStore.setState((state) => ({
+      settings: { ...state.settings, tray_icon_file_id: 'icon', use_tray_icon_as_app_icon: true },
+    }));
+    mocks.invoke.mockResolvedValueOnce(status('icon', true, { useAsAppIcon: true, appIconState: 'applied' }));
+    render(<TrayIconSettings monochrome={false} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: prefix + 'reset' })).not.toBeDisabled());
+    mocks.invoke.mockResolvedValueOnce(status(null, true, { useAsAppIcon: true }));
+    fireEvent.click(screen.getByText(prefix + 'reset'));
+    await waitFor(() => expect(useSettingsStore.getState().settings.tray_icon_file_id).toBeNull());
+    expect(useSettingsStore.getState().settings.use_tray_icon_as_app_icon).toBe(true);
+  });
+
+  it('shows a Wayland unsupported status without disabling the tray controls', async () => {
+    mocks.invoke.mockResolvedValueOnce(status('icon', true, { useAsAppIcon: true, appIconState: 'unsupported' }));
+    render(<TrayIconSettings monochrome={false} />);
+    await waitFor(() => expect(screen.getByText(prefix + 'appIconUnsupported')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: prefix + 'choose' })).not.toBeDisabled();
   });
 });

@@ -1836,7 +1836,16 @@
       "loadFailed": "The configured tray icon could not be loaded; upload it again or restore the default",
       "cleanupFailed": "Icon saved, but the old image could not be cleaned up; check the logs",
       "notificationFailed": "Icon saved, but window synchronization failed; reopen settings",
-      "inUse": "This image is the current tray icon; replace it or restore the default first"
+      "inUse": "This image is the current tray icon; replace it or restore the default first",
+      "scopeLabel": "Icon application scope",
+      "scopeTrayOnly": "Tray only",
+      "scopeTrayAndApp": "Tray + Dock / taskbar",
+      "scopePresetHint": "You can choose the scope before uploading; it takes effect after an image is applied",
+      "runtimeOnlyHint": "This only affects AQBot while it is running; shortcuts and pinned icons after quit stay unchanged",
+      "appIconApplied": "Applied to the Dock / taskbar",
+      "appIconDeferred": "Saved; the taskbar icon will apply when a window is created",
+      "appIconUnsupported": "This Linux desktop session cannot replace the window icon; the tray icon still works",
+      "trayClosedAppIconActive": "The tray is off; the Dock / taskbar icon remains active"
     }
   },
   "backup": {

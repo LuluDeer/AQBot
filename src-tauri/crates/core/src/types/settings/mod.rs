@@ -712,6 +712,8 @@ pub struct AppSettings {
     pub tray_icon_style: TrayIconStyle,
     /// Managed image used by the system tray; None keeps the built-in style.
     pub tray_icon_file_id: Option<String>,
+    /// When true, the same custom image also replaces the running Dock / taskbar icon.
+    pub use_tray_icon_as_app_icon: bool,
     pub global_shortcuts_enabled: bool,
     pub shortcut_registration_logs_enabled: bool,
     pub shortcut_trigger_toast_enabled: bool,
@@ -899,6 +901,7 @@ impl Default for AppSettings {
             tray_enabled: true,
             tray_icon_style: TrayIconStyle::Color,
             tray_icon_file_id: None,
+            use_tray_icon_as_app_icon: false,
             global_shortcuts_enabled: true,
             shortcut_registration_logs_enabled: false,
             shortcut_trigger_toast_enabled: false,
@@ -950,7 +953,8 @@ impl Default for AppSettings {
             show_image_models_in_model_selector: false,
             multi_model_display_mode: "tabs".to_string(),
             multi_model_execution_mode: MultiModelExecutionMode::Parallel,
-            multi_model_sequential_interval_seconds: DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS,
+            multi_model_sequential_interval_seconds:
+                DEFAULT_MULTI_MODEL_SEQUENTIAL_INTERVAL_SECONDS,
             multi_model_side_by_side_width_mode: MultiModelSideBySideWidthMode::Scroll,
             multi_model_popout_side_by_side_width_mode: MultiModelSideBySideWidthMode::Scroll,
             render_user_markdown: false,

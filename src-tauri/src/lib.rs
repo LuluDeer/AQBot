@@ -59,11 +59,11 @@ pub struct AppState {
     pub tray_available: Arc<AtomicBool>,
 }
 
+mod app_icon;
 mod commands;
-mod conversation_run;
 mod context_manager;
-pub mod multi_model_run;
 mod conversation_popout;
+mod conversation_run;
 mod crash_diagnostics;
 mod diagnostic_log;
 mod diagnostics;
@@ -77,6 +77,7 @@ mod media_protocol;
 mod model_catalog;
 #[doc(hidden)]
 pub mod model_catalog_tools;
+pub mod multi_model_run;
 mod onnxruntime_dylib;
 mod paths;
 mod selection_toolbar;
@@ -355,6 +356,7 @@ pub fn run() {
         commands::settings::save_settings,
         commands::tray_icon::set_custom_tray_icon,
         commands::tray_icon::reset_tray_icon,
+        commands::tray_icon::set_tray_icon_app_scope,
         commands::tray_icon::get_tray_icon_status,
         commands::settings::get_multi_model_column_layout,
         commands::settings::set_multi_model_side_by_side_width_mode,

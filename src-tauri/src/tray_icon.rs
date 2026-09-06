@@ -11,11 +11,13 @@ use crate::tray::{self, TrayIconAppearance};
 pub(crate) struct AppliedIcon {
     pub fingerprint: String,
     pub appearance: TrayIconAppearance,
+    pub png: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
 pub(crate) struct TrayRuntime {
     pub applied: Option<AppliedIcon>,
+    pub use_as_app_icon: bool,
     pub error: Option<String>,
     pub revision: u64,
 }
@@ -31,6 +33,7 @@ pub(crate) fn builtin(settings: &AppSettings) -> Result<AppliedIcon, String> {
     Ok(AppliedIcon {
         fingerprint: format!("builtin:{}", appearance.is_template),
         appearance,
+        png: None,
     })
 }
 
@@ -38,9 +41,10 @@ pub(crate) fn custom(bytes: &[u8], id: &str) -> Result<AppliedIcon, String> {
     Ok(AppliedIcon {
         fingerprint: format!("{id}:{}", FileStore::hash_bytes(bytes)),
         appearance: TrayIconAppearance {
-            image: crate::tray_icon_image::stored_image(bytes)?,
+            image: crate::tray_icon_image::tray_image(bytes)?,
             is_template: false,
         },
+        png: Some(bytes.to_vec()),
     })
 }
 
@@ -74,7 +78,16 @@ pub(crate) fn apply_native(
     app: &AppHandle,
     settings: &AppSettings,
     icon: &AppliedIcon,
+    use_as_app_icon: bool,
 ) -> Result<(), String> {
+    apply_tray(app, settings, icon)?;
+    crate::app_icon::apply(
+        app,
+        use_as_app_icon.then_some(icon.png.as_deref()).flatten(),
+    )
+}
+
+fn apply_tray(app: &AppHandle, settings: &AppSettings, icon: &AppliedIcon) -> Result<(), String> {
     if !settings.tray_enabled {
         return Ok(());
     }
@@ -89,13 +102,23 @@ pub(crate) fn restore_native(
     app: &AppHandle,
     settings: &AppSettings,
     previous: Option<&AppliedIcon>,
+    previous_use_as_app_icon: bool,
 ) -> Result<(), String> {
-    match previous {
-        Some(icon) => apply_native(app, settings, icon),
+    let tray = match previous {
+        Some(icon) => apply_tray(app, settings, icon),
         None => {
             tray::destroy_tray(app);
             Ok(())
         }
+    };
+    let png = previous
+        .filter(|_| previous_use_as_app_icon)
+        .and_then(|icon| icon.png.as_deref());
+    let app_icon = crate::app_icon::apply(app, png);
+    match (tray, app_icon) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(tray), Err(app_icon)) => Err(format!("{tray}; {app_icon}")),
     }
 }
 
@@ -115,46 +138,58 @@ pub(crate) async fn reconcile_locked(
     settings: &AppSettings,
     runtime: &mut TrayRuntime,
 ) -> Result<(), String> {
-    if !settings.tray_enabled {
-        if tray::tray_exists(app) {
-            tray::destroy_tray(app);
-            crate::window_lifecycle::restore_main_window(app);
-        }
-        runtime.applied = None;
-        runtime.error = None;
-        runtime.revision += 1;
-        update_availability(app);
-        return Ok(());
-    }
     let _file_guard = aqbot_core::repo::stored_file::lock_file_references().await;
     let operation = async {
         let state = app.state::<crate::AppState>();
         let file_id = aqbot_core::repo::tray_icon::file_id(&state.sea_db)
             .await
             .map_err(|error| error.to_string())?;
+        let use_as_app_icon = aqbot_core::repo::tray_icon::use_as_app_icon(&state.sea_db)
+            .await
+            .map_err(|error| error.to_string())?;
         let desired = match file_id {
             Some(id) => load_custom(app, &id).await?,
             None => builtin(settings)?,
         };
-        if runtime.error.is_none()
-            && tray::tray_exists(app)
-            && runtime
-                .applied
-                .as_ref()
-                .is_some_and(|old| old.fingerprint == desired.fingerprint)
-        {
-            tray::request_tray_menu_sync(app);
+        if !settings.tray_enabled && tray::tray_exists(app) {
+            tray::destroy_tray(app);
+            crate::window_lifecycle::restore_main_window(app);
+        }
+        let tray_unchanged = runtime.error.is_none()
+            && (!settings.tray_enabled
+                || (tray::tray_exists(app)
+                    && runtime
+                        .applied
+                        .as_ref()
+                        .is_some_and(|old| old.fingerprint == desired.fingerprint)));
+        let app_unchanged = runtime.use_as_app_icon == use_as_app_icon
+            && runtime.applied.as_ref().map(|icon| icon.png.as_deref())
+                == Some(desired.png.as_deref());
+        if tray_unchanged && app_unchanged {
+            if settings.tray_enabled {
+                tray::request_tray_menu_sync(app);
+            }
+            runtime.applied = Some(desired);
+            runtime.use_as_app_icon = use_as_app_icon;
             return Ok(());
         }
-        if let Err(error) = apply_native(app, settings, &desired) {
-            let rollback = restore_native(app, settings, runtime.applied.as_ref());
+        if let Err(error) = apply_native(app, settings, &desired, use_as_app_icon) {
+            let rollback = restore_native(
+                app,
+                settings,
+                runtime.applied.as_ref(),
+                runtime.use_as_app_icon,
+            );
             return Err(match rollback {
                 Ok(()) => error,
                 Err(rollback) => format!("{error}; native rollback failed: {rollback}"),
             });
         }
         runtime.applied = Some(desired);
-        tray::request_tray_menu_sync(app);
+        runtime.use_as_app_icon = use_as_app_icon;
+        if settings.tray_enabled {
+            tray::request_tray_menu_sync(app);
+        }
         Ok(())
     }
     .await;

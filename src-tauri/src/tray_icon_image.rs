@@ -5,7 +5,8 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, Limits, RgbaImage};
 
 pub const MAX_BYTES: usize = 5 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 4096;
-const ICON_SIZE: u32 = 64;
+pub const STORE_SIZE: u32 = 512;
+pub const TRAY_SIZE: u32 = 64;
 
 fn limits() -> Limits {
     let mut limits = Limits::default();
@@ -78,33 +79,56 @@ pub fn normalize(data: &str, mime_type: &str) -> Result<Vec<u8>, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|error| format!("tray_icon_invalid: {error}"))?;
-    let image = decode_static(&bytes, mime_type)?;
+    encode_png(&fit_square(decode_static(&bytes, mime_type)?, STORE_SIZE))
+}
+
+pub fn stored_rgba(bytes: &[u8]) -> Result<RgbaImage, String> {
+    Ok(decode_static(bytes, "image/png")?.to_rgba8())
+}
+
+pub fn rasterize(bytes: &[u8], size: u32) -> Result<RgbaImage, String> {
+    let image = stored_rgba(bytes)?;
+    if image.dimensions() == (size, size) {
+        return Ok(image);
+    }
+    Ok(fit_square(DynamicImage::ImageRgba8(image), size))
+}
+
+pub fn tray_image(bytes: &[u8]) -> Result<tauri::image::Image<'static>, String> {
+    tauri_image(&rasterize(bytes, TRAY_SIZE)?)
+}
+
+pub fn app_icon_image(bytes: &[u8]) -> Result<tauri::image::Image<'static>, String> {
+    tauri_image(&rasterize(bytes, STORE_SIZE)?)
+}
+
+fn fit_square(image: DynamicImage, size: u32) -> RgbaImage {
     let resized = image
-        .resize(ICON_SIZE, ICON_SIZE, image::imageops::FilterType::Lanczos3)
+        .resize(size, size, image::imageops::FilterType::Lanczos3)
         .to_rgba8();
-    let mut square = RgbaImage::new(ICON_SIZE, ICON_SIZE);
+    let mut square = RgbaImage::new(size, size);
     image::imageops::overlay(
         &mut square,
         &resized,
-        ((ICON_SIZE - resized.width()) / 2).into(),
-        ((ICON_SIZE - resized.height()) / 2).into(),
+        ((size - resized.width()) / 2).into(),
+        ((size - resized.height()) / 2).into(),
     );
-    let mut output = Cursor::new(Vec::new());
     square
+}
+
+fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, String> {
+    let mut output = Cursor::new(Vec::new());
+    image
         .write_to(&mut output, ImageFormat::Png)
         .map_err(|error| error.to_string())?;
     Ok(output.into_inner())
 }
 
-pub fn stored_image(bytes: &[u8]) -> Result<tauri::image::Image<'static>, String> {
-    let image = decode_static(bytes, "image/png")?.to_rgba8();
-    if image.dimensions() != (ICON_SIZE, ICON_SIZE) {
-        return Err("tray_icon_invalid: stored image must be 64x64".into());
-    }
+fn tauri_image(image: &RgbaImage) -> Result<tauri::image::Image<'static>, String> {
     Ok(tauri::image::Image::new_owned(
-        image.into_raw(),
-        ICON_SIZE,
-        ICON_SIZE,
+        image.clone().into_raw(),
+        image.width(),
+        image.height(),
     ))
 }
 

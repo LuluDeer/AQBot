@@ -24,6 +24,8 @@ pub fn configure_main_window(app: &tauri::AppHandle, main_window: &WebviewWindow
         let _ = main_window.set_maximizable(true);
     }
 
+    crate::app_icon::apply_snapshot_to_window(app, main_window);
+
     let state = app.state::<AppState>();
     if let Some(saved_state) = window_state::load_window_state(&state.app_data_dir) {
         let restored_state = if let Ok(Some(monitor)) = main_window.current_monitor() {
@@ -183,6 +185,9 @@ pub(crate) fn set_app_dock_visibility(app: &tauri::AppHandle, visible: bool) {
                 "Failed to update macOS activation policy for tray lifecycle"
             );
         }
+        if visible {
+            crate::app_icon::reconfirm_after_dock_visible(app);
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -272,7 +277,8 @@ pub(crate) fn effective_release_webview(
     minimize_to_tray: bool,
     release_webview_on_tray: bool,
 ) -> bool {
-    effective_close_to_tray(tray_enabled, tray_available, minimize_to_tray) && release_webview_on_tray
+    effective_close_to_tray(tray_enabled, tray_available, minimize_to_tray)
+        && release_webview_on_tray
 }
 
 fn should_release_webview(app: &tauri::AppHandle) -> bool {

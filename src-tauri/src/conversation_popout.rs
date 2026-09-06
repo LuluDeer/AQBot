@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use tauri::{AppHandle, LogicalSize, Manager, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{
+    AppHandle, LogicalSize, Manager, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
@@ -67,7 +69,10 @@ fn popout_size_from_main(app: &AppHandle) -> (f64, f64) {
         return (1080.0, 720.0);
     };
     let scale = main.scale_factor().unwrap_or(1.0).max(0.1);
-    popout_inner_size(physical.width as f64 / scale, physical.height as f64 / scale)
+    popout_inner_size(
+        physical.width as f64 / scale,
+        physical.height as f64 / scale,
+    )
 }
 
 fn apply_popout_bounds(app: &AppHandle, window: &WebviewWindow) {
@@ -108,7 +113,7 @@ pub fn open_or_focus(app: &AppHandle, conversation_id: &str) -> Result<bool, Str
     }
 
     let window = builder.build().map_err(|err| err.to_string())?;
-    configure_popout_window(&window);
+    configure_popout_window(app, &window);
     apply_popout_bounds(app, &window);
     Ok(false)
 }
@@ -151,10 +156,7 @@ pub async fn open_or_focus_and_wait(app: &AppHandle, conversation_id: &str) -> R
     Ok(())
 }
 
-fn configure_popout_window(window: &tauri::WebviewWindow) {
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    let _ = window;
-
+fn configure_popout_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     #[cfg(target_os = "linux")]
     if let Err(error) = crate::linux_webkit::enable_input_method_preedit(window) {
         tracing::warn!(
@@ -169,6 +171,8 @@ fn configure_popout_window(window: &tauri::WebviewWindow) {
         let _ = window.set_minimizable(true);
         let _ = window.set_maximizable(true);
     }
+
+    crate::app_icon::apply_snapshot_to_window(app, window);
 }
 
 #[cfg(test)]

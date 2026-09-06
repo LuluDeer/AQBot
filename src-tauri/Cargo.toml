@@ -88,12 +88,14 @@ tauri-plugin-single-instance = { version = "=2.4.0", features = ["deep-link"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", features = ["relax-sign-encoding"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
     "NSBitmapImageRep",
     "NSGraphics",
     "NSGraphicsContext",
     "NSImage",
     "NSImageRep",
     "NSPasteboard",
+    "NSResponder",
     "NSRunningApplication",
     "NSWindow",
     "NSWorkspace",

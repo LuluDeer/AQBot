@@ -884,6 +884,8 @@ export interface AppSettings {
   /** macOS menu-bar icon appearance. Ignored on Windows and Linux. */
   tray_icon_style: TrayIconStyle;
   tray_icon_file_id: string | null;
+  /** When true, the same custom image also replaces the running Dock / taskbar icon. */
+  use_tray_icon_as_app_icon: boolean;
   global_shortcuts_enabled?: boolean;
   shortcut_registration_logs_enabled?: boolean;
   shortcut_trigger_toast_enabled?: boolean;

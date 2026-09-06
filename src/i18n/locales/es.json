@@ -1836,7 +1836,16 @@
       "loadFailed": "No se pudo cargar el icono configurado; vuelva a cargarlo o restaure el predeterminado",
       "cleanupFailed": "Icono guardado, pero no se pudo eliminar la imagen anterior; revise los registros",
       "notificationFailed": "Icono guardado, pero falló la sincronización de ventanas; vuelva a abrir los ajustes",
-      "inUse": "Esta imagen es el icono de bandeja actual; reemplácela o restaure primero el predeterminado"
+      "inUse": "Esta imagen es el icono de bandeja actual; reemplácela o restaure primero el predeterminado",
+      "scopeLabel": "Ámbito del icono",
+      "scopeTrayOnly": "Solo bandeja",
+      "scopeTrayAndApp": "Bandeja + Dock/barra de tareas",
+      "scopePresetHint": "Puede elegir el ámbito antes de subir la imagen; se aplicará al confirmarla",
+      "runtimeOnlyHint": "Solo afecta a AQBot mientras está en ejecución; los accesos directos y los iconos anclados tras salir no cambian",
+      "appIconApplied": "Aplicado al Dock/barra de tareas",
+      "appIconDeferred": "Guardado; el icono de la barra de tareas se aplicará al crear una ventana",
+      "appIconUnsupported": "Esta sesión de escritorio Linux no puede sustituir el icono de ventana; el de la bandeja sigue funcionando",
+      "trayClosedAppIconActive": "La bandeja está desactivada; el icono del Dock/barra de tareas sigue activo"
     }
   },
   "backup": {

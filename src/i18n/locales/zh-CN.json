@@ -1836,7 +1836,16 @@
       "loadFailed": "无法加载已配置的托盘图标，请重新上传或恢复默认",
       "cleanupFailed": "图标已保存，但旧图片清理失败，请查看日志",
       "notificationFailed": "图标已保存，但窗口同步失败，请重新打开设置",
-      "inUse": "此图片正用作托盘图标，请先替换图标或恢复默认"
+      "inUse": "此图片正用作托盘图标，请先替换图标或恢复默认",
+      "scopeLabel": "图标应用范围",
+      "scopeTrayOnly": "仅托盘",
+      "scopeTrayAndApp": "托盘 + Dock／任务栏",
+      "scopePresetHint": "没有自定义图片时也可预先选择，将在上传后生效",
+      "runtimeOnlyHint": "仅影响 AQBot 运行期间，不会更改快捷方式或退出后的固定图标",
+      "appIconApplied": "已应用到 Dock／任务栏",
+      "appIconDeferred": "已保存，将在窗口创建后应用到任务栏",
+      "appIconUnsupported": "当前 Linux 桌面环境不支持替换窗口图标，托盘图标仍可使用",
+      "trayClosedAppIconActive": "托盘已关闭，Dock／任务栏图标仍会生效"
     }
   },
   "backup": {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Alert, App, Button, Image, Space } from 'antd';
+import { Alert, App, Button, Image, Segmented, Space } from 'antd';
 import { useTranslation } from 'react-i18next';
 import { invoke, isTauri, listen } from '@/lib/invoke';
 import { buildStoredMediaUrl } from '@/lib/storedMedia';
@@ -7,10 +7,14 @@ import { useSettingsStore } from '@/stores/settingsStore';
 import colorIcon from '../../../src-tauri/icons/64x64.png';
 import monochromeIcon from '../../../src-tauri/icons/tray-monochrome.png';
 
+type AppIconState = 'default' | 'applied' | 'deferred' | 'unsupported';
+
 interface TrayIconStatus {
   revision: number;
   trayIconFileId: string | null;
   applied: boolean;
+  useAsAppIcon: boolean;
+  appIconState: AppIconState;
   error: string | null;
   warnings: string[];
 }
@@ -33,12 +37,22 @@ function readImage(file: File): Promise<string> {
 
 function acceptStatus(status: TrayIconStatus) {
   if (status.revision < useSettingsStore.getState().trayIconRevision) return false;
-  useSettingsStore.setState((state) => ({
-    trayIconRevision: status.revision,
-    settings: { ...state.settings, tray_icon_file_id: status.trayIconFileId },
-    settingsMeta: { ...state.settingsMeta, revision: state.settingsMeta.revision
-      + Number(state.settings.tray_icon_file_id !== status.trayIconFileId) },
-  }));
+  useSettingsStore.setState((state) => {
+    const fileChanged = state.settings.tray_icon_file_id !== status.trayIconFileId;
+    const scopeChanged = state.settings.use_tray_icon_as_app_icon !== status.useAsAppIcon;
+    return {
+      trayIconRevision: status.revision,
+      settings: {
+        ...state.settings,
+        tray_icon_file_id: status.trayIconFileId,
+        use_tray_icon_as_app_icon: status.useAsAppIcon,
+      },
+      settingsMeta: {
+        ...state.settingsMeta,
+        revision: state.settingsMeta.revision + Number(fileChanged || scopeChanged),
+      },
+    };
+  });
   return true;
 }
 
@@ -104,6 +118,28 @@ export function TrayIconSettings({ monochrome }: { monochrome: boolean }) {
     setPending({ file, url: URL.createObjectURL(file) });
   };
 
+  const setScope = async (enabled: boolean) => {
+    if (busyRef.current || enabled === settings.use_tray_icon_as_app_icon) return;
+    busyRef.current = true;
+    setBusy(true);
+    setErrorKey(null);
+    try {
+      const value = await invoke<TrayIconStatus>('set_tray_icon_app_scope', { enabled });
+      const accepted = acceptStatus(value);
+      if (!mounted.current) return;
+      if (accepted) setStatus(value);
+      if (value.warnings.includes('tray_icon_notification_failed')) {
+        message.warning(t('settings.customTrayIcon.notificationFailed'));
+      }
+    } catch (error) {
+      console.error('[trayIcon] scope update failed', error);
+      if (mounted.current) setErrorKey('settings.customTrayIcon.failed');
+    } finally {
+      busyRef.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  };
+
   const apply = async (reset: boolean) => {
     if (busyRef.current || (!reset && !pending)) return;
     busyRef.current = true;
@@ -143,6 +179,7 @@ export function TrayIconSettings({ monochrome }: { monochrome: boolean }) {
   const fileId = settings.tray_icon_file_id;
   const preview = pending?.url ?? (fileId ? buildStoredMediaUrl(fileId) : monochrome ? monochromeIcon : colorIcon);
   const visibleError = errorKey ?? (status?.error ? 'settings.customTrayIcon.loadFailed' : null);
+  const appIconState = status?.appIconState ?? 'default';
 
   return (
     <div className="flex flex-col gap-2" style={{ padding: '4px 0' }}>
@@ -153,7 +190,15 @@ export function TrayIconSettings({ monochrome }: { monochrome: boolean }) {
             {t('settings.customTrayIcon.hint')}
           </div>
           {fileId && <div>{t('settings.customTrayIcon.originalColors')}</div>}
-          {!settings.tray_enabled && <div>{t('settings.customTrayIcon.deferred')}</div>}
+          {!settings.tray_enabled && !settings.use_tray_icon_as_app_icon && (
+            <div>{t('settings.customTrayIcon.deferred')}</div>
+          )}
+          {!settings.tray_enabled && settings.use_tray_icon_as_app_icon && fileId && (
+            <div>{t('settings.customTrayIcon.trayClosedAppIconActive')}</div>
+          )}
+          <div style={{ color: 'var(--ant-color-text-secondary)', fontSize: 12 }}>
+            {t('settings.customTrayIcon.runtimeOnlyHint')}
+          </div>
         </div>
         <Image key={preview} src={preview} width={48} height={48}
           style={{ objectFit: 'contain' }} alt={t('settings.customTrayIcon.preview')}
@@ -171,6 +216,31 @@ export function TrayIconSettings({ monochrome }: { monochrome: boolean }) {
         </>}
         <Button disabled={!desktop || busy || !fileId} onClick={() => void apply(true)}>{t('settings.customTrayIcon.reset')}</Button>
       </Space>
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div>{t('settings.customTrayIcon.scopeLabel')}</div>
+          {!fileId && (
+            <div style={{ color: 'var(--ant-color-text-secondary)', fontSize: 12 }}>
+              {t('settings.customTrayIcon.scopePresetHint')}
+            </div>
+          )}
+        </div>
+        <Segmented
+          value={settings.use_tray_icon_as_app_icon ? 'app' : 'tray'}
+          disabled={!desktop || busy}
+          aria-label={t('settings.customTrayIcon.scopeLabel')}
+          onChange={(value) => void setScope(value === 'app')}
+          options={[
+            { label: t('settings.customTrayIcon.scopeTrayOnly'), value: 'tray' },
+            { label: t('settings.customTrayIcon.scopeTrayAndApp'), value: 'app' },
+          ]}
+        />
+      </div>
+      {appIconState === 'applied' && <div>{t('settings.customTrayIcon.appIconApplied')}</div>}
+      {appIconState === 'deferred' && <div>{t('settings.customTrayIcon.appIconDeferred')}</div>}
+      {appIconState === 'unsupported' && (
+        <Alert type="info" showIcon title={t('settings.customTrayIcon.appIconUnsupported')} />
+      )}
       {visibleError && <Alert type="error" showIcon title={t(visibleError)} />}
     </div>
   );

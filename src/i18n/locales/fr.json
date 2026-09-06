@@ -1836,7 +1836,16 @@
       "loadFailed": "Impossible de charger l’icône configurée ; importez-la à nouveau ou rétablissez l’icône par défaut",
       "cleanupFailed": "Icône enregistrée, mais l’ancienne image n’a pas pu être supprimée ; consultez les journaux",
       "notificationFailed": "Icône enregistrée, mais la synchronisation des fenêtres a échoué ; rouvrez les paramètres",
-      "inUse": "Cette image sert d’icône de notification ; remplacez-la ou rétablissez d’abord l’icône par défaut"
+      "inUse": "Cette image sert d’icône de notification ; remplacez-la ou rétablissez d’abord l’icône par défaut",
+      "scopeLabel": "Portée de l’icône",
+      "scopeTrayOnly": "Zone de notification uniquement",
+      "scopeTrayAndApp": "Notification + Dock/barre des tâches",
+      "scopePresetHint": "Vous pouvez choisir la portée avant l’envoi ; elle s’applique après validation de l’image",
+      "runtimeOnlyHint": "Cela n’affecte AQBot que pendant son exécution ; les raccourcis et icônes épinglées après la fermeture restent inchangés",
+      "appIconApplied": "Appliqué au Dock/à la barre des tâches",
+      "appIconDeferred": "Enregistré ; l’icône de la barre des tâches s’appliquera à la création d’une fenêtre",
+      "appIconUnsupported": "Cette session Linux ne peut pas remplacer l’icône de fenêtre ; l’icône de notification reste disponible",
+      "trayClosedAppIconActive": "La zone de notification est désactivée ; l’icône Dock/barre des tâches reste active"
     }
   },
   "backup": {

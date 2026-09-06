@@ -1836,7 +1836,16 @@
       "loadFailed": "Das konfigurierte Symbol konnte nicht geladen werden; laden Sie es erneut hoch oder stellen Sie den Standard wieder her",
       "cleanupFailed": "Symbol gespeichert, aber das alte Bild konnte nicht entfernt werden; prüfen Sie die Protokolle",
       "notificationFailed": "Symbol gespeichert, aber die Fenstersynchronisierung ist fehlgeschlagen; öffnen Sie die Einstellungen erneut",
-      "inUse": "Dieses Bild wird als Infobereichsymbol verwendet; ersetzen Sie es zuerst oder stellen Sie den Standard wieder her"
+      "inUse": "Dieses Bild wird als Infobereichsymbol verwendet; ersetzen Sie es zuerst oder stellen Sie den Standard wieder her",
+      "scopeLabel": "Anwendungsbereich des Symbols",
+      "scopeTrayOnly": "Nur Infobereich",
+      "scopeTrayAndApp": "Infobereich + Dock/Taskleiste",
+      "scopePresetHint": "Der Bereich lässt sich schon vor dem Hochladen wählen und gilt nach dem Übernehmen",
+      "runtimeOnlyHint": "Wirkt nur, solange AQBot läuft; Verknüpfungen und angeheftete Symbole nach dem Beenden bleiben unverändert",
+      "appIconApplied": "Auf Dock/Taskleiste angewendet",
+      "appIconDeferred": "Gespeichert; das Taskleistensymbol wird beim nächsten Fenster angewendet",
+      "appIconUnsupported": "Diese Linux-Desktop-Sitzung kann das Fenstersymbol nicht ersetzen; das Infobereichsymbol bleibt nutzbar",
+      "trayClosedAppIconActive": "Der Infobereich ist aus; das Dock-/Taskleistensymbol bleibt aktiv"
     }
   },
   "backup": {

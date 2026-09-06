@@ -2,6 +2,7 @@ use aqbot_core::{file_store::FileStore, repo::tray_icon as repo};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::app_icon::AppIconState;
 use crate::tray_icon::{self, TrayRuntime};
 
 const CHANGED_EVENT: &str = "aqbot:tray-icon-changed";
@@ -12,6 +13,8 @@ pub struct TrayIconStatus {
     revision: u64,
     tray_icon_file_id: Option<String>,
     applied: bool,
+    use_as_app_icon: bool,
+    app_icon_state: AppIconState,
     error: Option<String>,
     warnings: Vec<String>,
 }
@@ -21,16 +24,24 @@ async fn status(app: &AppHandle, runtime: &TrayRuntime) -> Result<TrayIconStatus
     let id = repo::file_id(&state.sea_db)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(current_status(app, runtime, id))
+    let use_as_app_icon = repo::use_as_app_icon(&state.sea_db)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(current_status(app, runtime, id, use_as_app_icon))
 }
 
-fn current_status(app: &AppHandle, runtime: &TrayRuntime, id: Option<String>) -> TrayIconStatus {
+fn current_status(
+    app: &AppHandle,
+    runtime: &TrayRuntime,
+    id: Option<String>,
+    use_as_app_icon: bool,
+) -> TrayIconStatus {
     TrayIconStatus {
         revision: runtime.revision,
         tray_icon_file_id: id,
-        applied: runtime.applied.is_some()
-            && runtime.error.is_none()
-            && crate::tray::tray_exists(app),
+        applied: runtime.error.is_none() && crate::tray::tray_exists(app),
+        use_as_app_icon,
+        app_icon_state: crate::app_icon::current_state(app),
         error: runtime.error.clone(),
         warnings: Vec::new(),
     }
@@ -60,6 +71,45 @@ pub async fn reset_tray_icon(app: AppHandle) -> Result<TrayIconStatus, String> {
     change(&app, None).await
 }
 
+#[tauri::command]
+pub async fn set_tray_icon_app_scope(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<TrayIconStatus, String> {
+    let mut runtime = tray_icon::runtime().lock().await;
+    let _file_guard = aqbot_core::repo::stored_file::lock_file_references().await;
+    let state = app.state::<crate::AppState>();
+    let settings = aqbot_core::repo::settings::get_settings(&state.sea_db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let icon = match settings.tray_icon_file_id.as_deref() {
+        Some(id) if enabled => Some(tray_icon::load_custom(&app, id).await?),
+        _ => None,
+    };
+    let mut native_attempted = false;
+    let result = repo::commit_scope(&state.sea_db, enabled, || {
+        native_attempted = true;
+        crate::app_icon::apply(&app, icon.as_ref().and_then(|icon| icon.png.as_deref()))
+    })
+    .await;
+    if let Err(error) = result {
+        let error = if native_attempted {
+            restore_after_error(&app, &settings, &mut runtime, error)
+        } else {
+            error
+        };
+        tracing::error!(%error, "Tray icon app scope change failed");
+        return Err(error);
+    }
+    runtime.use_as_app_icon = enabled;
+    runtime.error = None;
+    runtime.revision += 1;
+    publish(
+        &app,
+        current_status(&app, &runtime, settings.tray_icon_file_id, enabled),
+    )
+}
+
 // Keep this ordered transaction and its compensation in one scope so both
 // locks cover native rollback, database rollback, and physical-file cleanup.
 async fn change(app: &AppHandle, png: Option<Vec<u8>>) -> Result<TrayIconStatus, String> {
@@ -82,15 +132,29 @@ async fn change(app: &AppHandle, png: Option<Vec<u8>>) -> Result<TrayIconStatus,
             Ok(current) => {
                 if current.fingerprint == format!("{current_id}:{}", FileStore::hash_bytes(bytes)) {
                     // A previous failure must not turn an explicit retry into a no-op.
-                    let result = tray_icon::apply_native(app, &settings, &current);
+                    let result = tray_icon::apply_native(
+                        app,
+                        &settings,
+                        &current,
+                        settings.use_tray_icon_as_app_icon,
+                    );
                     if let Err(error) = result {
                         return Err(restore_after_error(app, &settings, &mut runtime, error));
                     }
-                    runtime.applied = settings.tray_enabled.then_some(current);
+                    runtime.applied = Some(current);
+                    runtime.use_as_app_icon = settings.use_tray_icon_as_app_icon;
                     runtime.error = None;
                     runtime.revision += 1;
                     tray_icon::update_availability(app);
-                    return publish(app, current_status(app, &runtime, Some(current_id.clone())));
+                    return publish(
+                        app,
+                        current_status(
+                            app,
+                            &runtime,
+                            Some(current_id.clone()),
+                            settings.use_tray_icon_as_app_icon,
+                        ),
+                    );
                 }
             }
             Err(error) => tracing::warn!(%error, "Replacing an unreadable custom tray image"),
@@ -109,7 +173,7 @@ async fn change(app: &AppHandle, png: Option<Vec<u8>>) -> Result<TrayIconStatus,
     let mut native_attempted = false;
     let result = repo::commit_change(&state.sea_db, new_icon, || {
         native_attempted = true;
-        tray_icon::apply_native(app, &settings, &desired)
+        tray_icon::apply_native(app, &settings, &desired, settings.use_tray_icon_as_app_icon)
     })
     .await;
     let paths = match result {
@@ -142,11 +206,17 @@ async fn change(app: &AppHandle, png: Option<Vec<u8>>) -> Result<TrayIconStatus,
             return Err(error);
         }
     };
-    runtime.applied = settings.tray_enabled.then_some(desired);
+    runtime.applied = Some(desired);
+    runtime.use_as_app_icon = settings.use_tray_icon_as_app_icon;
     runtime.error = None;
     runtime.revision += 1;
     tray_icon::update_availability(app);
-    let mut result = current_status(app, &runtime, png.as_ref().map(|_| id));
+    let mut result = current_status(
+        app,
+        &runtime,
+        png.as_ref().map(|_| id),
+        settings.use_tray_icon_as_app_icon,
+    );
     for path in paths {
         if let Err(error) = store.delete_file(&path) {
             tracing::warn!(%error, %path, "Tray icon saved but old image cleanup failed");
@@ -170,7 +240,12 @@ fn restore_after_error(
     runtime: &mut TrayRuntime,
     error: String,
 ) -> String {
-    let error = match tray_icon::restore_native(app, settings, runtime.applied.as_ref()) {
+    let error = match tray_icon::restore_native(
+        app,
+        settings,
+        runtime.applied.as_ref(),
+        runtime.use_as_app_icon,
+    ) {
         Ok(()) => error,
         Err(rollback) => format!("{error}; native rollback failed: {rollback}"),
     };

@@ -1836,7 +1836,16 @@
       "loadFailed": "無法載入已設定的系統匣圖示，請重新上傳或還原預設",
       "cleanupFailed": "圖示已儲存，但舊圖片清理失敗，請查看記錄",
       "notificationFailed": "圖示已儲存，但視窗同步失敗，請重新開啟設定",
-      "inUse": "此圖片正用作系統匣圖示，請先替換圖示或還原預設"
+      "inUse": "此圖片正用作系統匣圖示，請先替換圖示或還原預設",
+      "scopeLabel": "圖示套用範圍",
+      "scopeTrayOnly": "僅系統匣",
+      "scopeTrayAndApp": "系統匣 + Dock／工作列",
+      "scopePresetHint": "尚未自訂圖片時也可先選擇範圍，上傳後就會生效",
+      "runtimeOnlyHint": "只會影響 AQBot 執行期間，不會更改捷徑或結束後的釘選圖示",
+      "appIconApplied": "已套用到 Dock／工作列",
+      "appIconDeferred": "已儲存，視窗建立後會套用到工作列",
+      "appIconUnsupported": "目前的 Linux 桌面環境無法更換視窗圖示，系統匣圖示仍可使用",
+      "trayClosedAppIconActive": "系統匣已關閉，Dock／工作列圖示仍會生效"
     }
   },
   "backup": {
