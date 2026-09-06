@@ -214,7 +214,7 @@ fn apply_to_window(app: &AppHandle, window: &WebviewWindow, png: &[u8]) -> Resul
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = app;
+        let _ = (app, png);
         windows::apply_window(window)
     }
     #[cfg(target_os = "linux")]

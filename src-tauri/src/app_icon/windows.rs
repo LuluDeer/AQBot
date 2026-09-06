@@ -73,7 +73,9 @@ fn destroy(icons: Option<Icons>) {
 }
 
 fn window_hwnd(window: &WebviewWindow) -> Result<HWND, String> {
-    window.hwnd().map_err(|error| error.to_string())
+    // Tauri's HWND is windows 0.61; this crate uses 0.62. Reconstruct by inner pointer.
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    Ok(HWND(hwnd.0 as _))
 }
 
 fn set_icons(hwnd: HWND, small: Option<HICON>, big: Option<HICON>) {
